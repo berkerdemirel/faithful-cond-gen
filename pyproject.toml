@@ -1,0 +1,7 @@
+[project]
+name = "faithful-cond-gen"
+version = "0.1.0"
+description = "Faithfulness estimation and stress-testing for conditional generative models"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []

@@ -1,0 +1,81 @@
+# -------------------------
+# Python general
+# -------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.eggs/
+*.log
+
+# Virtual environments (uv, venv, conda)
+.venv/
+env/
+venv/
+*.env
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoint
+
+# -------------------------
+# Project-specific outputs
+# -------------------------
+outputs/
+logs/
+wandb/
+tensorboard/
+tb_logs/
+lightning_logs/
+
+# Hydra default outputs
+multirun/
+hydra_output/
+hydra_output*/ 
+# (Hydra typically writes to ./outputs or ./multirun, but these cover custom directories)
+
+# -------------------------
+# Checkpoints, weights, models
+# -------------------------
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# Large generated data (samples, images)
+samples/
+generated/
+figures/
+*.png
+*.jpg
+*.jpeg
+
+# Numpy / temporary artifacts
+*.npy
+*.npz
+*.h5
+*.pkl
+*.pickle
+*.ptl
+
+# -------------------------
+# IDE & editor stuff
+# -------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# -------------------------
+# OS files
+# -------------------------
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Cache directories
+# -------------------------
+.cache/
+__cache__/
+build/
+dist/
