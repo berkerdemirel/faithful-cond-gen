@@ -27,6 +27,7 @@ dependencies = [
   "huggingface_hub",
   "omegaconf",
   "einops",
+  "datasets",
 
   # config / hydra
   "hydra-core",

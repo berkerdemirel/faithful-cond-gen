@@ -206,6 +206,12 @@ class RxRx1Dataset(Dataset):
         self.sirna_ids = self.metadata["sirna_id"].to_numpy()
         self.cell_type_ids = self.metadata["cell_type_id"].to_numpy()
 
+        # Optional composition category (seen / rare / unseen)
+        if "comp_category" in self.metadata.columns:
+            self.comp_categories = self.metadata["comp_category"].astype(str).to_numpy()
+        else:
+            self.comp_categories = None
+
     def __len__(self) -> int:
         return len(self.metadata)
 
@@ -259,6 +265,8 @@ class RxRx1Dataset(Dataset):
             "cell_type_id": cell_type_id,
         }
 
+        if self.comp_categories is not None:
+            conditioning["comp_category"] = self.comp_categories[idx]
         return x, conditioning
 
 
@@ -279,6 +287,8 @@ class RxRx1DataConfig:
     num_workers: int = 4
     val_size: float = 0.1
     seed: int = 1337
+    rare_threshold: int = 50
+    held_out_pairs: Optional[Sequence[Tuple[int, int]]] = None
 
 
 class RxRx1DataModule:
@@ -313,8 +323,15 @@ class RxRx1DataModule:
 
         self.metadata = metadata
 
+        self.held_out_pairs = (
+            set(cfg.held_out_pairs) if cfg.held_out_pairs is not None else None
+        )
+
         # Define splits
         self._make_splits()
+
+        # Add composition categories (seen / rare / unseen)
+        self._add_composition_categories()
 
     def _make_splits(self):
         md = self.metadata
@@ -347,6 +364,46 @@ class RxRx1DataModule:
         else:
             md["test_index"] = False
 
+        if self.held_out_pairs is not None:
+            mask_held_out = md[["cell_type_id", "sirna_id"]].apply(
+                lambda row: (row["cell_type_id"], row["sirna_id"])
+                in self.held_out_pairs,
+                axis=1,
+            )
+            # ensure these never appear in train
+            md.loc[mask_held_out, "train_index"] = False
+
+        self.metadata = md
+
+    def _add_composition_categories(self) -> None:
+        """Tag each (cell_type_id, sirna_id) pair as seen / rare / unseen."""
+        md = self.metadata  # <— this line is required
+
+        if "train_index" not in md.columns:
+            md["comp_category"] = "seen"
+            self.metadata = md
+            return
+
+        train_md = md[md["train_index"]]
+        if len(train_md) == 0:
+            md["comp_category"] = "seen"
+            self.metadata = md
+            return
+
+        counts = train_md.groupby(["cell_type_id", "sirna_id"]).size().to_dict()
+
+        rare_threshold = self.cfg.rare_threshold
+
+        def categorize(row: pd.Series) -> str:
+            key = (row["cell_type_id"], row["sirna_id"])
+            c = counts.get(key, None)
+            if c is None:
+                return "unseen"
+            if c < rare_threshold:
+                return "rare"
+            return "seen"
+
+        md["comp_category"] = md.apply(categorize, axis=1)
         self.metadata = md
 
     def _filtered_metadata(
@@ -433,9 +490,13 @@ class RxRx1DataModule:
         )
 
     def available_conditions(self, split: str = "train") -> pd.DataFrame:
-        """Return a small table of (cell_type_id, sirna_id, count) for the given split."""
+        """Return a small table of (cell_type_id, sirna_id, comp_category, count) for the given split."""
+
         md = self._filtered_metadata(split, None, None)
-        grouped = (
-            md.groupby(["cell_type_id", "sirna_id"]).size().reset_index(name="count")
-        )
+
+        group_cols = ["cell_type_id", "sirna_id"]
+        if "comp_category" in md.columns:
+            group_cols.append("comp_category")
+
+        grouped = md.groupby(group_cols).size().reset_index(name="count")
         return grouped

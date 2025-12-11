@@ -145,6 +145,155 @@ def test_split_leakage(
     )
 
 
+def test_composition_categories(
+    data_dir: str,
+    val_size: float = 0.1,
+) -> None:
+    """Check that comp_category is consistent with train counts and test unseen behavior."""
+    # Base config: no held-out pairs
+    cfg = RxRx1DataConfig(
+        data_dir=data_dir,
+        val_size=val_size,
+        use_numpy=True,
+        use_parquet=False,
+        rare_threshold=16,
+    )
+    dm = RxRx1DataModule(cfg)
+    md = dm.metadata.copy()
+
+    if "comp_category" not in md.columns:
+        raise ValueError(
+            "metadata is missing 'comp_category' column. "
+            "Did you call _add_composition_categories in RxRx1DataModule?"
+        )
+
+    allowed = {"seen", "rare", "unseen"}
+    cats = set(md["comp_category"].unique())
+    if not cats.issubset(allowed):
+        raise AssertionError(
+            f"Unexpected comp_category values: {cats} (allowed: {allowed})"
+        )
+
+    # Build train counts per (cell_type_id, sirna_id)
+    train_md = md[md["train_index"]]
+    pair_counts = train_md.groupby(["cell_type_id", "sirna_id"]).size().to_dict()
+    rare_threshold = cfg.rare_threshold
+
+    # Consistency checks for base config
+    for idx, row in md.iterrows():
+        key = (row["cell_type_id"], row["sirna_id"])
+        cat = row["comp_category"]
+        in_train = bool(row["train_index"])
+
+        c = pair_counts.get(key, None)
+
+        if in_train:
+            # train samples can never be 'unseen'
+            assert cat in {"seen", "rare"}, (
+                f"Train sample at idx={idx} has comp_category='{cat}', "
+                f"expected 'seen' or 'rare'."
+            )
+            if c is None:
+                raise AssertionError(
+                    f"Train sample at idx={idx} has no count entry for key={key}."
+                )
+            expected = "rare" if c < rare_threshold else "seen"
+            assert cat == expected, (
+                f"Train sample at idx={idx} has comp_category='{cat}', "
+                f"expected '{expected}' for count={c}, rare_threshold={rare_threshold}."
+            )
+        else:
+            # non-train samples: if key is absent in train, must be 'unseen'
+            if c is None:
+                assert cat == "unseen", (
+                    f"Non-train sample at idx={idx} with key={key} never seen in train "
+                    f"but comp_category='{cat}', expected 'unseen'."
+                )
+            else:
+                expected = "rare" if c < rare_threshold else "seen"
+                assert cat == expected, (
+                    f"Non-train sample at idx={idx} with key={key} seen in train {c} times "
+                    f"but comp_category='{cat}', expected '{expected}'."
+                )
+
+    # Summary of categories per split (base config)
+    print("[test_composition_categories] Summary per split and category (base):")
+    for split_name, mask_col in [
+        ("train", "train_index"),
+        ("val", "val_index"),
+        ("test", "test_index"),
+    ]:
+        if mask_col not in md.columns:
+            continue
+        split_md = md[md[mask_col]]
+        if len(split_md) == 0:
+            print(f"  {split_name}: 0 samples")
+            continue
+        counts = split_md["comp_category"].value_counts().to_dict()
+        total = len(split_md)
+        pretty = ", ".join(
+            f"{k}={v} ({v/total:.3f})" for k, v in sorted(counts.items())
+        )
+        print(f"  {split_name}: n={total} -> {pretty}")
+
+    # ---- Extra: test 'unseen' behavior via synthetic held-out pair ----
+    # pick a pair that appears in val or test in the base metadata
+    vt_md = md[md["val_index"] | md["test_index"]]
+    if vt_md.empty:
+        print(
+            "[test_composition_categories] No val/test samples; skipping unseen test."
+        )
+        return
+
+    candidate_pair = (
+        int(vt_md.iloc[0]["cell_type_id"]),
+        int(vt_md.iloc[0]["sirna_id"]),
+    )
+    print(
+        f"[test_composition_categories] Testing unseen behavior with held_out_pairs={candidate_pair}"
+    )
+
+    cfg_unseen = RxRx1DataConfig(
+        data_dir=data_dir,
+        val_size=val_size,
+        use_numpy=True,
+        use_parquet=False,
+        held_out_pairs=[candidate_pair],
+    )
+    dm_unseen = RxRx1DataModule(cfg_unseen)
+    md2 = dm_unseen.metadata.copy()
+
+    # sanity: no train samples with this pair
+    train_mask2 = md2["train_index"]
+    train_pair_mask = (md2["cell_type_id"] == candidate_pair[0]) & (
+        md2["sirna_id"] == candidate_pair[1]
+    )
+    n_train_pair = int((train_mask2 & train_pair_mask).sum())
+    assert (
+        n_train_pair == 0
+    ), f"Held-out pair {candidate_pair} still appears in train (n={n_train_pair})."
+
+    # val/test samples for this pair should now be 'unseen'
+    vt_mask2 = md2["val_index"] | md2["test_index"]
+    vt_pair_mask = vt_mask2 & train_pair_mask
+    vt_subset = md2[vt_pair_mask]
+    if len(vt_subset) == 0:
+        print(
+            "[test_composition_categories] WARNING: held-out pair does not appear in "
+            "val/test; skipping unseen assertion."
+        )
+    else:
+        bad = vt_subset[vt_subset["comp_category"] != "unseen"]
+        assert len(bad) == 0, (
+            f"Expected all val/test samples of held-out pair {candidate_pair} "
+            f"to be 'unseen', but found comp_category={bad['comp_category'].unique()}."
+        )
+        print(
+            f"[test_composition_categories] Unseen behavior OK for pair {candidate_pair}: "
+            f"{len(vt_subset)} val/test samples tagged as 'unseen'."
+        )
+
+
 def save_control_examples(
     data_dir: str,
     sirna_id: int = 1138,
@@ -262,7 +411,10 @@ def main():
     # 2) Split leakage
     test_split_leakage(data_dir=data_dir, val_size=args.val_size)
 
-    # 3) Save control examples for visual inspection
+    # 3) Composition categories consistency + summary
+    test_composition_categories(data_dir=data_dir, val_size=args.val_size)
+
+    # 4) Save control examples for visual inspection
     save_control_examples(
         data_dir=data_dir,
         sirna_id=args.sirna_id,
