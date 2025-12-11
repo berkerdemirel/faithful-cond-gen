@@ -1,0 +1,5 @@
+# conf/model/generator.yaml
+
+_target_: faithful_cond_gen.model.generator.GeneratorWrapper
+model_name: "placeholder"
+checkpoint: null

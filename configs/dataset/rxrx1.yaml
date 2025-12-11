@@ -1,0 +1,20 @@
+# conf/dataset/rxrx1.yaml
+
+_target_: faithful_cond_gen.data.rxrx1.RxRx1DataConfig
+
+data_dir: /mnt/pvc/AutoSync/data/rxrx1
+img_size: [512, 512]
+resize: [512, 512]
+reduce_channels: false
+augment_train: false
+normalize: false
+use_numpy: true
+use_parquet: false
+batch_size: 32
+num_workers: 4
+val_size: 0.1
+seed: 1337
+
+# composition logic
+rare_threshold: 20
+held_out_pairs: null

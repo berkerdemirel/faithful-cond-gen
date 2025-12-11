@@ -32,6 +32,7 @@ class CelebaDataConfig:
     # threshold for rare vs seen combinations
     rare_threshold: int = 50
     held_out_combos: Optional[Sequence[Tuple[int, ...]]] = None
+    selected_attrs: Optional[Sequence[str]] = None
 
 
 class CelebaDataset(Dataset):
@@ -111,10 +112,9 @@ class CelebaDataModule:
     def __init__(
         self,
         cfg: CelebaDataConfig,
-        selected_attrs: Optional[Sequence[str]] = None,
     ):
         self.cfg = cfg
-
+        selected_attrs = cfg.selected_attrs
         # load HF splits once; caching handled by datasets
         self.ds_train = load_dataset(
             "flwrlabs/celeba",

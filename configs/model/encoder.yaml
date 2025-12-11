@@ -1,0 +1,6 @@
+# conf/model/encoder.yaml
+
+_target_: faithful_cond_gen.model.encoder.EncoderWrapper
+backbone: dino_v2
+weights: null
+normalize: true

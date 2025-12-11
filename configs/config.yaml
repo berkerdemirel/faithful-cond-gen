@@ -1,0 +1,10 @@
+# conf/config.yaml
+
+defaults:
+  - dataset: celeba
+  - model: generator
+  - eval: rfid
+  - _self_
+
+seed: 1337
+device: cuda

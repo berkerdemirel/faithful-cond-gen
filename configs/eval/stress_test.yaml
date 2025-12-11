@@ -1,0 +1,5 @@
+# conf/eval/stress_test.yaml
+
+stress_test:
+  splits: ["seen", "rare", "unseen"]
+  per_condition_samples: 32

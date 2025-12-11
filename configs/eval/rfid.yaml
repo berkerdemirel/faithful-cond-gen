@@ -1,0 +1,5 @@
+# conf/eval/rdfid.yaml
+
+rfid:
+  batch_size: 64
+  use_kid: true
