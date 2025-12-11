@@ -4,4 +4,48 @@ version = "0.1.0"
 description = "Faithfulness estimation and stress-testing for conditional generative models"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+
+dependencies = [
+  # core numerics
+  "numpy",
+  "scipy",
+  "pandas",
+  "pyarrow",
+  "scikit-learn",
+  "scikit-image",
+
+  # torch + ecosystem
+  "torch",          # or e.g. 'torch==2.5.0+cu121' from extra index if you want
+  "torchvision",
+  "torch-fidelity",
+  "accelerate",
+  "timm",
+
+  # diffusion / transformers stack
+  "diffusers",
+  "transformers",
+  "huggingface_hub",
+  "omegaconf",
+  "einops",
+
+  # config / hydra
+  "hydra-core",
+  "pyyaml",
+
+  # plotting / inspection
+  "matplotlib",
+  "Pillow",
+
+  # misc utils
+  "tqdm",
+  "requests",
+  "wandb",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "black",
+  "ruff",
+  "ipykernel",
+]

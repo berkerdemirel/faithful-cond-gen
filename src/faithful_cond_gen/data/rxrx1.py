@@ -1,28 +1,441 @@
+import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import torch
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms as T
+from torchvision.transforms import functional as TF
+
+# ---- Utilities: intensity, RGB mapping, augmentations ----
+
+
+def rescale_intensity(
+    arr: torch.Tensor, bounds: Tuple[float, float] = (0.5, 99.5), out_range=(0.0, 1.0)
+) -> torch.Tensor:
+    """Percentile-based contrast stretching per image."""
+    arr = arr.float() / 255
+    sample = arr.flatten()[::100]
+    percentiles = torch.quantile(
+        sample, torch.tensor([bounds[0] / 100.0, bounds[1] / 100.0])
+    )
+    arr = torch.clamp(arr, percentiles[0], percentiles[1])
+    arr = (arr - percentiles[0]) / (percentiles[1] - percentiles[0] + 1e-6)
+    arr = arr * (out_range[1] - out_range[0]) + out_range[0]
+    return arr
+
+
+def to_rgb(img: torch.Tensor, dtype=torch.float32) -> torch.Tensor:
+    """Convert 6-channel Cell Painting image to RGB.
+
+    Expects input of shape (B, C, H, W) with C <= 6.
+
+    Reference: https://github.com/recursionpharma/rxrx1-utils/blob/d34b2b0db0af1cb4fe357573bb8de76bd042b34f/rxrx/io.py#L61
+    """
+    num_channels_required = 6
+    b, num_channels, length, width = img.shape  # b x c x l x w
+    prepped_img = torch.zeros(
+        b, num_channels_required, length, width, dtype=img.dtype, device=img.device
+    )
+    if num_channels < num_channels_required:
+        prepped_img[:, :num_channels, :, :] += img
+    elif num_channels > num_channels_required:
+        prepped_img += img[:, :num_channels_required, :, :]
+    else:
+        prepped_img += img
+
+    # fixed color map
+    red = [1, 0, 0]
+    green = [0, 1, 0]
+    blue = [0, 0, 1]
+    yellow = [1, 1, 0]
+    magenta = [1, 0, 1]
+    cyan = [0, 1, 1]
+    rgb_map = torch.tensor(
+        [blue, green, red, cyan, magenta, yellow],
+        dtype=dtype,
+        device=prepped_img.device,
+    )
+    rgb_img: torch.FloatTensor = (
+        torch.einsum(  # type: ignore[assignment]
+            "nchw,ct->nthw",
+            prepped_img.to(dtype=dtype),
+            rgb_map,
+        )
+        / 3.0
+    )
+    return rescale_intensity(rgb_img, bounds=(0.1, 99.9))
+
+
+class RandomExactRotation:
+    """Rotate by given angles with probability p."""
+
+    def __init__(self, angles: Sequence[int], p: float = 0.5):
+        self.angles = list(angles)
+        self.p = float(p)
+
+    def __call__(self, img: torch.Tensor) -> torch.Tensor:
+        if np.random.rand() < self.p:
+            angle = int(np.random.choice(self.angles))
+            return TF.rotate(img, angle)
+        return img
+
+
+class CustomTransform:
+    """Resize + optional flips/rotations + optional per-channel standardization."""
+
+    def __init__(
+        self,
+        augment: bool = False,
+        normalize: bool = False,
+        img_size: Tuple[int, int] = (512, 512),
+        reduce_channels: bool = False,
+    ):
+        self.augment = augment
+        self.normalize = normalize
+        self.resize_shape = img_size
+        self.reduce_channels = reduce_channels
+
+    def self_standardize(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (C, H, W)
+        mean = x.mean(dim=(1, 2), keepdim=True)
+        std = x.std(dim=(1, 2), keepdim=True) + 1e-6
+        return (x - mean) / std
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (C, H, W)
+        t = [T.Resize(self.resize_shape, interpolation=Image.BICUBIC)]
+
+        if self.augment:
+            # choose p so (1-p)^3 ~ 0.5
+            t.append(T.RandomHorizontalFlip(p=0.2))
+            t.append(T.RandomVerticalFlip(p=0.2))
+            t.append(RandomExactRotation(angles=[90, 180, 270], p=0.2))
+
+        transform = T.Compose(t)
+
+        # if not reducing channels, assume raw [0,255], rescale to [0,1]
+        if not self.reduce_channels:
+            x = x / 255.0  # else assume already in [0,1] bc of to_rgb rescaling
+
+        x = transform(x)
+
+        if self.normalize:
+            x = self.self_standardize(x)
+
+        return x
+
+
+# ---- Dataset ----
+
+
+CELL_TYPE_TO_LABEL: Dict[str, int] = {
+    "HEPG2": 0,
+    "HUVEC": 1,
+    "RPE": 2,
+    "U2OS": 3,
+}
+LABEL_TO_CELL_TYPE: Dict[int, str] = {v: k for k, v in CELL_TYPE_TO_LABEL.items()}
 
 
 @dataclass
-class RxRx1Config:
-    root: str
+class RxRx1DatasetConfig:
+    img_size: Tuple[int, int] = (512, 512)
+    resize: Tuple[int, int] = (512, 512)
+    reduce_channels: bool = False
+    augment: bool = False
+    normalize: bool = False
+    use_numpy: bool = True
+    use_parquet: bool = False
     split: str = "train"
-    cell_types: Optional[List[str]] = None
-    perturbations: Optional[List[str]] = None
 
 
-class RxRx1Dataset:
-    """Minimal stub for RxRx1 dataset.
+class RxRx1Dataset(Dataset):
+    """RxRx1 dataset.
 
-    For now this just stores config and an empty list of samples.
-    We'll later load real metadata and implement filtering.
+    Expects metadata with at least:
+      - 'sirna_id' (perturbation id, int)
+      - 'cell_type' (string: HEPG2/HUVEC/RPE/U2OS)
+      - one of:
+          'parquet_path', 'numpy_path', or 'image_paths' (list of 6 PNGs or string repr)
+
+    __getitem__ returns:
+      image: torch.Tensor (C,H,W)
+      conditioning: dict with keys:
+        - 'sirna_id' (int)
+        - 'cell_type_id' (int)
+        - 'cell_type' (str)
     """
 
-    def __init__(self, cfg: RxRx1Config):
+    def __init__(self, metadata: pd.DataFrame, cfg: RxRx1DatasetConfig):
+        self.metadata = metadata.reset_index(drop=True)
         self.cfg = cfg
-        self.samples = []  # placeholder; will hold (path, labels, etc.)
+
+        self.use_numpy = cfg.use_numpy
+        self.use_parquet = cfg.use_parquet
+
+        # Transform
+        if cfg.split == "train":
+            self.transform = CustomTransform(
+                augment=cfg.augment,
+                normalize=cfg.normalize,
+                img_size=cfg.resize,
+                reduce_channels=cfg.reduce_channels,
+            )
+        else:
+            self.transform = CustomTransform(
+                augment=False,
+                normalize=cfg.normalize,
+                img_size=cfg.resize,
+                reduce_channels=cfg.reduce_channels,
+            )
+
+        # Canonicalize cell_type_id column if not present
+        if "cell_type_id" not in self.metadata.columns:
+            self.metadata["cell_type_id"] = self.metadata["cell_type"].map(
+                CELL_TYPE_TO_LABEL
+            )
+
+        # For convenience
+        self.sirna_ids = self.metadata["sirna_id"].to_numpy()
+        self.cell_type_ids = self.metadata["cell_type_id"].to_numpy()
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.metadata)
+
+    def _load_sample_array(self, idx: int) -> np.ndarray:
+        row = self.metadata.iloc[idx]
+
+        if (
+            self.use_parquet
+            and "parquet_path" in row
+            and isinstance(row["parquet_path"], str)
+        ):
+            with pa.memory_map(row["parquet_path"], "r") as source:
+                table = pq.read_table(source)
+                sample = np.array(table.column("data")).reshape(
+                    6, *self.cfg.img_size
+                )  # (C,H,W)
+            return sample
+
+        if (
+            self.use_numpy
+            and "numpy_path" in row
+            and isinstance(row["numpy_path"], str)
+        ):
+            sample = np.load(row["numpy_path"], mmap_mode="r")
+            return np.array(sample)
+
+        # Fallback: stack PNGs from image_paths
+        image_paths = row["image_paths"]
+        if isinstance(image_paths, str):
+            # if stored as string representation of list
+            image_paths = eval(image_paths)
+        images = [np.array(Image.open(p)) for p in image_paths]
+        sample = np.stack(images, axis=0)  # (C,H,W)
+        return sample
 
     def __getitem__(self, idx: int):
-        raise NotImplementedError("RxRx1Dataset.__getitem__ is not implemented yet.")
+        sample_np = self._load_sample_array(idx)  # (C,H,W)
+        x = torch.from_numpy(sample_np).float()
+
+        # If we need to reduce to RGB
+        if self.cfg.reduce_channels:
+            x = to_rgb(x.unsqueeze(0))[0]  # (3,H,W) after RGB mapping
+
+        x = self.transform(x)  # (C,H,W)
+
+        sirna_id = torch.tensor(self.sirna_ids[idx], dtype=torch.long)
+        cell_type_id = torch.tensor(self.cell_type_ids[idx], dtype=torch.long)
+
+        conditioning = {
+            "sirna_id": sirna_id,
+            "cell_type_id": cell_type_id,
+        }
+
+        return x, conditioning
+
+
+# ---- DataModule-like helper ----
+
+
+@dataclass
+class RxRx1DataConfig:
+    data_dir: str
+    img_size: Tuple[int, int] = (512, 512)
+    resize: Tuple[int, int] = (512, 512)
+    reduce_channels: bool = False
+    augment_train: bool = False
+    normalize: bool = False
+    use_numpy: bool = True
+    use_parquet: bool = False
+    batch_size: int = 32
+    num_workers: int = 4
+    val_size: float = 0.1
+    seed: int = 1337
+
+
+class RxRx1DataModule:
+    """Lightweight data module for RxRx1.
+
+    Responsibilities:
+      - load metadata.csv or metadata_extended.csv
+      - add cell_type_id
+      - define train/val/test splits
+      - provide get_dataset / get_dataloader with optional filtering by condition
+    """
+
+    def __init__(self, cfg: RxRx1DataConfig):
+        self.cfg = cfg
+        self.data_dir = cfg.data_dir
+
+        metadata_path_extended = os.path.join(self.data_dir, "metadata_extended.csv")
+        metadata_path = os.path.join(self.data_dir, "metadata.csv")
+
+        if os.path.exists(metadata_path_extended):
+            metadata = pd.read_csv(metadata_path_extended)
+        elif os.path.exists(metadata_path):
+            metadata = pd.read_csv(metadata_path)
+        else:
+            raise FileNotFoundError(
+                f"Could not find metadata.csv or metadata_extended.csv in {self.data_dir}"
+            )
+
+        # Add cell_type_id
+        if "cell_type_id" not in metadata.columns:
+            metadata["cell_type_id"] = metadata["cell_type"].map(CELL_TYPE_TO_LABEL)
+
+        self.metadata = metadata
+
+        # Define splits
+        self._make_splits()
+
+    def _make_splits(self):
+        md = self.metadata
+
+        if "dataset" in md.columns:
+            train_md = md[md["dataset"] == "train"]
+            test_md = md[md["dataset"] == "test"]
+        else:
+            # no explicit dataset column, treat all as train+val, no test
+            train_md = md
+            test_md = md.iloc[0:0]  # empty
+
+        if self.cfg.val_size > 0.0 and len(train_md) > 0:
+            train_idx, val_idx = train_test_split(
+                train_md.index,
+                test_size=self.cfg.val_size,
+                random_state=self.cfg.seed,
+                # could stratify by sirna_id if you want
+            )
+            md["train_index"] = md.index.isin(train_idx)
+            md["val_index"] = md.index.isin(val_idx)
+        else:
+            md["train_index"] = (
+                md["dataset"] == "train" if "dataset" in md.columns else True
+            )
+            md["val_index"] = False
+
+        if "dataset" in md.columns:
+            md["test_index"] = md["dataset"] == "test"
+        else:
+            md["test_index"] = False
+
+        self.metadata = md
+
+    def _filtered_metadata(
+        self,
+        split: str,
+        cell_types: Optional[Sequence[int]] = None,
+        perturbations: Optional[Sequence[int]] = None,
+    ) -> pd.DataFrame:
+        md = self.metadata
+
+        if split == "train":
+            md = md[md["train_index"]]
+        elif split == "val":
+            md = md[md["val_index"]]
+        elif split == "test":
+            md = md[md["test_index"]]
+        else:
+            raise ValueError(f"Unknown split: {split}")
+
+        if cell_types is not None:
+            md = md[md["cell_type_id"].isin(cell_types)]
+
+        if perturbations is not None:
+            md = md[md["sirna_id"].isin(perturbations)]
+
+        return md
+
+    def get_dataset(
+        self,
+        split: str,
+        cell_types: Optional[Sequence[int]] = None,
+        perturbations: Optional[Sequence[int]] = None,
+        override_cfg: Optional[Dict] = None,
+    ) -> RxRx1Dataset:
+        md = self._filtered_metadata(split, cell_types, perturbations)
+        if len(md) == 0:
+            raise ValueError(f"No samples found for split={split} with given filters.")
+
+        ds_cfg = RxRx1DatasetConfig(
+            img_size=self.cfg.img_size,
+            resize=self.cfg.resize,
+            reduce_channels=self.cfg.reduce_channels,
+            augment=(self.cfg.augment_train and split == "train"),
+            normalize=self.cfg.normalize,
+            use_numpy=self.cfg.use_numpy,
+            use_parquet=self.cfg.use_parquet,
+            split=split,
+        )
+        if override_cfg is not None:
+            for k, v in override_cfg.items():
+                setattr(ds_cfg, k, v)
+
+        return RxRx1Dataset(md, ds_cfg)
+
+    def get_dataloader(
+        self,
+        split: str,
+        cell_types: Optional[Sequence[int]] = None,
+        perturbations: Optional[Sequence[int]] = None,
+        batch_size: Optional[int] = None,
+        shuffle: Optional[bool] = None,
+        override_cfg: Optional[Dict] = None,
+    ) -> DataLoader:
+        dataset = self.get_dataset(
+            split=split,
+            cell_types=cell_types,
+            perturbations=perturbations,
+            override_cfg=override_cfg,
+        )
+
+        if batch_size is None:
+            batch_size = self.cfg.batch_size
+
+        if shuffle is None:
+            shuffle = split == "train"
+
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+            drop_last=(split == "train"),
+        )
+
+    def available_conditions(self, split: str = "train") -> pd.DataFrame:
+        """Return a small table of (cell_type_id, sirna_id, count) for the given split."""
+        md = self._filtered_metadata(split, None, None)
+        grouped = (
+            md.groupby(["cell_type_id", "sirna_id"]).size().reset_index(name="count")
+        )
+        return grouped
