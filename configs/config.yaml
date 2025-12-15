@@ -1,9 +1,11 @@
-# conf/config.yaml
-
+# configs/config.yaml
 defaults:
-  - dataset: rxrx1
+  - dataset: celeba        # Changed from rxrx1
   - model: generator
+  - pl_module: default     # GeneratorPL settings (lr, etc)
+  - train: debug           # Trainer settings (50 batches)
   - eval: rfid
+  - logger: wandb          # WandB Logger
   - _self_
 
 seed: 1337

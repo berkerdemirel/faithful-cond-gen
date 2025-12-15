@@ -1,16 +1,15 @@
 # configs/model/generator.yaml
-
 _target_: faithful_cond_gen.model.generator.GeneratorConfig
 
-image_size: 224
+image_size: 64            # 224 is heavy for a "quick" test; 64 is standard for testing
+in_channels: 3            # RGB for CelebA
 
 vae_model_name: "stabilityai/sd-vae-ft-mse"
 vae_freeze: true
 
-sit_arch: "SiT-B/4"
-num_classes: 2000        # e.g. size of your condition-id vocabulary
+sit_arch: "SiT-B/2"       # Use smaller patch size (2) for 64x64 img
+attr_num_classes: [2, 2, 2, 2] # Placeholder; script will auto-update this if needed
 class_dropout_prob: 0.1
-use_global_alignment: false
 
 path_type: "linear"
 checkpoint: null

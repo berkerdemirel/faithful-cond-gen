@@ -1,0 +1,9 @@
+# configs/pl_module/default.yaml
+_target_: faithful_cond_gen.pl_modules.generator_pl.GeneratorPLConfig
+
+lr: 1e-4
+weight_decay: 0.0
+
+# Optional: Fixed targets for the validation buffer logic
+# If null, it will sample random ones.
+val_target_conditions: null

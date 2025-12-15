@@ -256,6 +256,39 @@ def test_dataset_structure(cache_dir: Optional[str] = None) -> None:
     print(f"[test_dataset_structure] Verified 'cond' keys: {list(cond_dict.keys())}")
 
 
+def test_get_matching_dataset(cache_dir: Optional[str] = None) -> None:
+    """Test get_matching_dataset logic for CelebA."""
+    cfg = CelebaDataConfig(cache_dir=cache_dir)
+    dm = CelebaDataModule(cfg)
+
+    # Pick a condition: e.g. Male=1, Smiling=1
+    conds = {"Male": 1, "Smiling": 1}
+    print(f"[test_get_matching_dataset] Testing conditions={conds}...")
+
+    # Get filtered dataset
+    ds_match = dm.get_matching_dataset("train", conds)
+
+    # 1. Manual check against internal metadata dataframe
+    md_train = dm._md_train
+    mask = (md_train["Male"] == 1) & (md_train["Smiling"] == 1)
+    expected_count = mask.sum()
+
+    assert (
+        len(ds_match) == expected_count
+    ), f"Count mismatch: got {len(ds_match)}, expected {expected_count}"
+
+    # 2. Check a few samples actually have the values
+    if len(ds_match) > 0:
+        # Check first sample
+        _, cond_out = ds_match[0]
+        c = cond_out["cond"]
+        assert (
+            int(c["Male"]) == 1 and int(c["Smiling"]) == 1
+        ), f"Sample 0 values mismatch: {c}"
+
+    print(f"  ✅ Filtering OK (n={len(ds_match)}).")
+
+
 def main():
     parser = argparse.ArgumentParser(description="CelebA dataset tests")
     parser.add_argument(
@@ -276,6 +309,9 @@ def main():
 
     # 3) Dataset structure
     test_dataset_structure(cache_dir=cache_dir)
+
+    # 4) get_matching_dataset
+    test_get_matching_dataset(cache_dir=cache_dir)
 
 
 if __name__ == "__main__":

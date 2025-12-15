@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+import pytorch_lightning as pl
 import torch
 from datasets import load_dataset
 from PIL import Image
@@ -92,7 +93,7 @@ class CelebaDataset(Dataset):
         return image, conditioning
 
 
-class CelebaDataModule:
+class CelebaDataModule(pl.LightningDataModule):
     """Lightweight DataModule-style wrapper around flwrlabs/celeba.
 
     Responsibilities:
@@ -106,6 +107,7 @@ class CelebaDataModule:
         self,
         cfg: CelebaDataConfig,
     ):
+        super().__init__()
         self.cfg = cfg
         selected_attrs = cfg.selected_attrs
         # load HF splits once; caching handled by datasets
@@ -160,6 +162,17 @@ class CelebaDataModule:
             self._md_val,
             self._md_test,
         ) = self._compute_composition_categories()
+
+    # ---- LIGHTNING HOOKS ----
+
+    def train_dataloader(self):
+        return self.get_dataloader("train")
+
+    def val_dataloader(self):
+        return self.get_dataloader("val")
+
+    def test_dataloader(self):
+        return self.get_dataloader("test")
 
     # ---- internal: transforms ----
 
@@ -356,3 +369,75 @@ class CelebaDataModule:
             .reset_index(name="count")
         )
         return grouped
+
+    def get_matching_dataset(
+        self, split: str, conditions: Dict[str, int], max_samples: Optional[int] = None
+    ) -> CelebaDataset:
+        """
+        Return a dataset containing only samples matching the specific conditions.
+        Args:
+            split: 'train', 'val', or 'test'
+            conditions: Dict {attribute_name: value (0/1)}, e.g. {'Male': 1, 'Smiling': 0}
+            max_samples: If provided, limit result to this many samples.
+        """
+        split = split.lower()
+        if split == "validation":
+            split = "val"
+
+        # 1. Get appropriate metadata and source objects
+        if split == "train":
+            md = self._md_train
+            hf_ds_full = self.ds_train
+            comp_cats_full = self.train_comp_categories
+            transform = self._build_transform(train=True)
+        elif split == "val":
+            md = self._md_val
+            hf_ds_full = self.ds_val
+            comp_cats_full = self.val_comp_categories
+            transform = self._build_transform(train=False)
+        elif split == "test":
+            md = self._md_test
+            hf_ds_full = self.ds_test
+            comp_cats_full = self.test_comp_categories
+            transform = self._build_transform(train=False)
+        else:
+            raise ValueError(f"Unknown split: {split}")
+
+        # 2. Build Filter Mask
+        # Start with all True
+        mask = pd.Series(True, index=md.index)
+
+        for attr, val in conditions.items():
+            if attr not in md.columns:
+                raise ValueError(f"Attribute '{attr}' not found in metadata.")
+            mask &= md[attr] == val
+
+        # 3. Get Indices
+        indices = md.index[mask].tolist()
+
+        if len(indices) == 0:
+            print(
+                f"Warning: No samples found for conditions {conditions} in split {split}"
+            )
+            # Return empty dataset logic could be complex; for now let HF handle empty select
+
+        if max_samples is not None and len(indices) > max_samples:
+            indices = indices[:max_samples]
+
+        # 4. Subset Data
+        # HF Datasets .select() creates a cheap view/copy
+        hf_subset = hf_ds_full.select(indices)
+
+        # Subset composition categories if they exist
+        comp_cats_subset = None
+        if comp_cats_full is not None:
+            comp_cats_subset = [comp_cats_full[i] for i in indices]
+
+        # 5. Return new Dataset instance
+        return CelebaDataset(
+            hf_dataset=hf_subset,
+            attr_names=self.attr_names,
+            selected_attrs=self.selected_attrs,
+            transform=transform,
+            comp_categories=comp_cats_subset,
+        )

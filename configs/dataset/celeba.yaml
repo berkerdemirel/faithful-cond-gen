@@ -1,15 +1,12 @@
-# conf/dataset/celeba.yaml
-
+# configs/dataset/celeba.yaml
 _target_: faithful_cond_gen.data.celeba.CelebaDataConfig
 
 cache_dir: /mnt/pvc/AutoSync/data/celeba_cache
-image_size: [224, 224]
-augment_train: false
-normalize: false
-batch_size: 64
+image_size: [64, 64]    # Matches model 64 for speed
+augment_train: true
+normalize: true
+batch_size: 64          # Per GPU
 num_workers: 4
 rare_threshold: 50
-
-# attributes to condition on (you can override in experiment)
-selected_attrs: null    # defaults to COMPOSITION_ATTRS_DEFAULT
+selected_attrs: null
 held_out_combos: null

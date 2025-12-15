@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytorch_lightning as pl
 import torch
 from PIL import Image
 from sklearn.model_selection import train_test_split
@@ -293,7 +294,7 @@ class RxRx1DataConfig:
     held_out_pairs: Optional[Sequence[Tuple[int, int]]] = None
 
 
-class RxRx1DataModule:
+class RxRx1DataModule(pl.LightningDataModule):
     """Lightweight data module for RxRx1.
 
     Responsibilities:
@@ -304,6 +305,7 @@ class RxRx1DataModule:
     """
 
     def __init__(self, cfg: RxRx1DataConfig):
+        super().__init__()
         self.cfg = cfg
         self.data_dir = cfg.data_dir
 
@@ -334,6 +336,17 @@ class RxRx1DataModule:
 
         # Add composition categories (seen / rare / unseen)
         self._add_composition_categories()
+
+    # ---- LIGHTNING HOOKS ----
+
+    def train_dataloader(self):
+        return self.get_dataloader("train")
+
+    def val_dataloader(self):
+        return self.get_dataloader("val")
+
+    def test_dataloader(self):
+        return self.get_dataloader("test")
 
     def _make_splits(self):
         md = self.metadata
@@ -502,3 +515,42 @@ class RxRx1DataModule:
 
         grouped = md.groupby(group_cols).size().reset_index(name="count")
         return grouped
+
+    def get_matching_dataset(
+        self, split: str, conditions: Dict[str, int], max_samples: Optional[int] = None
+    ) -> RxRx1Dataset:
+        """
+        Return a dataset containing only samples matching the specific conditions.
+        Args:
+            split: 'train', 'val', or 'test'
+            conditions: Dict containing 'cell_type_id' and/or 'sirna_id'.
+                        e.g. {'cell_type_id': 1, 'sirna_id': 1138}
+        """
+        # 1. Map generic dict to specific filter arguments
+        cell_types = None
+        if "cell_type_id" in conditions:
+            cell_types = [conditions["cell_type_id"]]
+
+        perturbations = None
+        if "sirna_id" in conditions:
+            perturbations = [conditions["sirna_id"]]
+
+        # 2. Get the filtered dataset using existing logic
+        ds = self.get_dataset(
+            split=split,
+            cell_types=cell_types,
+            perturbations=perturbations,
+            override_cfg=None,
+        )
+
+        # 3. Handle max_samples if requested
+        if max_samples is not None and len(ds) > max_samples:
+            # RxRx1Dataset wraps a DataFrame, so we can just slice it
+            ds.metadata = ds.metadata.iloc[:max_samples].reset_index(drop=True)
+            # Re-cache numpy arrays for convenience
+            ds.sirna_ids = ds.metadata["sirna_id"].to_numpy()
+            ds.cell_type_ids = ds.metadata["cell_type_id"].to_numpy()
+            if ds.comp_categories is not None:
+                ds.comp_categories = ds.comp_categories[:max_samples]
+
+        return ds

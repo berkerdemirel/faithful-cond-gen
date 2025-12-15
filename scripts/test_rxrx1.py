@@ -376,6 +376,61 @@ def save_control_examples(
         print(f"  {cell_name}: {count}")
 
 
+def test_get_matching_dataset(data_dir: str) -> None:
+    """Test get_matching_dataset logic for RxRx1."""
+    cfg = RxRx1DataConfig(
+        data_dir=data_dir,
+        val_size=0.1,
+    )
+    dm = RxRx1DataModule(cfg)
+
+    # 1. Test filtering by one attribute (cell_type)
+    target_cell = 1  # HUVEC
+    conditions = {"cell_type_id": target_cell}
+
+    print(f"[test_get_matching_dataset] Testing conditions={conditions}...")
+    ds_match = dm.get_matching_dataset("train", conditions)
+
+    # Verify all samples match
+    cell_types = ds_match.cell_type_ids
+    assert np.all(cell_types == target_cell), "Filtering by cell_type_id failed."
+
+    # Compare with manual filtering
+    full_md = dm.metadata
+    manual_count = len(
+        full_md[(full_md["train_index"]) & (full_md["cell_type_id"] == target_cell)]
+    )
+    assert (
+        len(ds_match) == manual_count
+    ), f"Count mismatch: got {len(ds_match)}, expected {manual_count}"
+    print(f"  ✅ Cell type filtering OK (n={len(ds_match)}).")
+
+    # 2. Test filtering by two attributes (cell_type + sirna)
+    target_sirna = 1138
+    conditions_combo = {"cell_type_id": target_cell, "sirna_id": target_sirna}
+
+    print(f"[test_get_matching_dataset] Testing conditions={conditions_combo}...")
+    ds_combo = dm.get_matching_dataset("train", conditions_combo)
+
+    sirnas = ds_combo.sirna_ids
+    cells = ds_combo.cell_type_ids
+    assert np.all(sirnas == target_sirna) and np.all(
+        cells == target_cell
+    ), "Filtering by combo failed."
+
+    manual_count_combo = len(
+        full_md[
+            (full_md["train_index"])
+            & (full_md["cell_type_id"] == target_cell)
+            & (full_md["sirna_id"] == target_sirna)
+        ]
+    )
+    assert (
+        len(ds_combo) == manual_count_combo
+    ), f"Combo count mismatch: got {len(ds_combo)}, expected {manual_count_combo}"
+    print(f"  ✅ Combo filtering OK (n={len(ds_combo)}).")
+
+
 def main():
     parser = argparse.ArgumentParser(description="RxRx1 dataset tests")
     parser.add_argument(
@@ -420,6 +475,9 @@ def main():
         sirna_id=args.sirna_id,
         samples_per_cell_type=args.samples_per_cell_type,
     )
+
+    # 5) Test get_matching_dataset
+    test_get_matching_dataset(data_dir=data_dir)
 
 
 if __name__ == "__main__":
