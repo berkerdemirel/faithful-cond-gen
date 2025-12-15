@@ -261,8 +261,10 @@ class RxRx1Dataset(Dataset):
         cell_type_id = torch.tensor(self.cell_type_ids[idx], dtype=torch.long)
 
         conditioning = {
-            "sirna_id": sirna_id,
-            "cell_type_id": cell_type_id,
+            "cond": {
+                "cell_type_id": cell_type_id,
+                "sirna_id": sirna_id,
+            }
         }
 
         if self.comp_categories is not None:

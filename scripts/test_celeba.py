@@ -234,6 +234,28 @@ def test_composition_categories_celeba(cache_dir: Optional[str] = None) -> None:
         )
 
 
+def test_dataset_structure(cache_dir: Optional[str] = None) -> None:
+    """Check that __getitem__ returns the expected nested 'cond' structure."""
+    cfg = CelebaDataConfig(cache_dir=cache_dir)
+    dm = CelebaDataModule(cfg)
+    ds = dm.get_dataset("train")
+
+    # Get one sample
+    img, conditioning = ds[0]
+
+    # Verify structure
+    if "cond" not in conditioning:
+        raise ValueError("Missing 'cond' key in conditioning dictionary")
+
+    cond_dict = conditioning["cond"]
+    # Check we have keys matching selected_attrs
+    missing = [attr for attr in dm.selected_attrs if attr not in cond_dict]
+    if missing:
+        raise ValueError(f"Missing attributes in cond dict: {missing}")
+
+    print(f"[test_dataset_structure] Verified 'cond' keys: {list(cond_dict.keys())}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="CelebA dataset tests")
     parser.add_argument(
@@ -251,6 +273,9 @@ def main():
 
     # 2) Composition categories consistency + summary
     test_composition_categories_celeba(cache_dir=cache_dir)
+
+    # 3) Dataset structure
+    test_dataset_structure(cache_dir=cache_dir)
 
 
 if __name__ == "__main__":

@@ -77,24 +77,17 @@ class CelebaDataset(Dataset):
 
         image = self.transform(image)
 
-        # full attribute vector in fixed order
-        full_attrs = torch.tensor(
-            [float(sample[name]) for name in self.attr_names],
-            dtype=torch.float32,
-        )
-
-        # select subset for conditioning
-        sel_indices = [self.attr_index[a] for a in self.selected_attrs]
-        attrs = full_attrs[sel_indices]  # (K,)
-
-        comp_category = None
-        if self.comp_categories is not None:
-            comp_category = self.comp_categories[idx]
+        cond_dict = {}
+        for name in self.selected_attrs:
+            # Convert float 0.0/1.0 -> long 0/1
+            val = int(sample[name])
+            cond_dict[name] = torch.tensor(val, dtype=torch.long)
 
         conditioning = {
-            "attrs": attrs,
-            "comp_category": comp_category,
+            "cond": cond_dict,
         }
+        if self.comp_categories is not None:
+            conditioning["comp_category"] = self.comp_categories[idx]
 
         return image, conditioning
 

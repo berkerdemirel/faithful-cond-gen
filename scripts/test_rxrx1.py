@@ -345,7 +345,7 @@ def save_control_examples(
 
     for x, cond in ds:
         # x: (C, H, W) float in [0, 1] from dataset (after to_rgb + scaling)
-        cell_type_id = int(cond["cell_type_id"].item())
+        cell_type_id = int(cond["cond"]["cell_type_id"].item())
         if cell_type_id not in saved_counts:
             saved_counts[cell_type_id] = 0
 

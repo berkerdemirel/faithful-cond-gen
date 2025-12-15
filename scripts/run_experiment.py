@@ -24,6 +24,8 @@ def main(cfg: DictConfig):
     dl = dm.get_dataloader("train")
     x, cond = next(iter(dl))
     print("Sample batch:", x.shape)
+    # print max and min
+    print("x min/max:", x.min().item(), x.max().item())
 
     # # instantiate models when implemented
     # gen = instantiate(cfg.model)

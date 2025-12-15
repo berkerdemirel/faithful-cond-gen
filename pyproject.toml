@@ -20,6 +20,7 @@ dependencies = [
   "torch-fidelity",
   "accelerate",
   "timm",
+  "pytorch_lightning",
 
   # diffusion / transformers stack
   "diffusers",

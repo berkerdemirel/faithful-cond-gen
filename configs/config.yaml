@@ -1,7 +1,7 @@
 # conf/config.yaml
 
 defaults:
-  - dataset: celeba
+  - dataset: rxrx1
   - model: generator
   - eval: rfid
   - _self_

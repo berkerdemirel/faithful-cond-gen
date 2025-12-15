@@ -1,5 +1,16 @@
-# conf/model/generator.yaml
+# configs/model/generator.yaml
 
-_target_: faithful_cond_gen.model.generator.GeneratorWrapper
-model_name: "placeholder"
+_target_: faithful_cond_gen.model.generator.GeneratorConfig
+
+image_size: 224
+
+vae_model_name: "stabilityai/sd-vae-ft-mse"
+vae_freeze: true
+
+sit_arch: "SiT-B/4"
+num_classes: 2000        # e.g. size of your condition-id vocabulary
+class_dropout_prob: 0.1
+use_global_alignment: false
+
+path_type: "linear"
 checkpoint: null
