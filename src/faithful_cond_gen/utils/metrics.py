@@ -8,11 +8,16 @@ class ConditionalFidelityMetrics:
         # 2048 feature dim is standard for FID
         self.fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
         self.device = device
+        self.fid.sync_on_compute = False
+        self.fid.dist_sync_on_step = False
 
     def _ensure_rgb(self, images: torch.Tensor) -> torch.Tensor:
         """Converts (B, 6, H, W) -> (B, 3, H, W) if needed."""
         if images.shape[1] == 6:
-            return torch.stack([to_rgb(img.cpu()[None]).squeeze(0) for img in images])
+            device = images.device
+            return torch.stack(
+                [to_rgb(img.cpu()[None]).squeeze(0) for img in images]
+            ).to(device)
         elif images.shape[1] == 1:
             return images.repeat(1, 3, 1, 1)
         return images

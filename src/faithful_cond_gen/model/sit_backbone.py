@@ -233,7 +233,7 @@ class SiT(nn.Module):
             ]
         )
         # self.ch_embedder = LabelEmbedder(6, hidden_size, class_dropout_prob)
-        self.ct_embedder = LabelEmbedder(4, hidden_size, class_dropout_prob)
+        # self.ct_embedder = LabelEmbedder(4, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(

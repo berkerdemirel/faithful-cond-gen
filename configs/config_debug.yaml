@@ -1,7 +1,7 @@
 # configs/config.yaml
 defaults:
-  - dataset: celeba        # Changed from rxrx1
-  - model: generator
+  - dataset: rxrx1        # celeba, rxrx1
+  - model: generator_rxrx1 # generator_celeba, generator_rxrx1
   - pl_module: default     # GeneratorPL settings (lr, etc)
   - train: debug           # Trainer settings (50 batches)
   - eval: rfid

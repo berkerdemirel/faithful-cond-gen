@@ -1,0 +1,15 @@
+# configs/model/generator.yaml
+_target_: faithful_cond_gen.model.generator.GeneratorConfig
+
+image_size: 256
+in_channels: 6            # 6 for CP
+
+vae_model_name: "stabilityai/sd-vae-ft-mse"
+vae_freeze: true
+
+sit_arch: "SiT-B/2"       # Use smaller patch size (2) for 64x64 img
+attr_num_classes: [4, 1138] # Placeholder; script will auto-update this if needed
+class_dropout_prob: 0.1
+
+path_type: "linear"
+checkpoint: null

@@ -1,7 +1,7 @@
 # configs/model/generator.yaml
 _target_: faithful_cond_gen.model.generator.GeneratorConfig
 
-image_size: 64            # 224 is heavy for a "quick" test; 64 is standard for testing
+image_size: 224
 in_channels: 3            # RGB for CelebA
 
 vae_model_name: "stabilityai/sd-vae-ft-mse"

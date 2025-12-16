@@ -2,7 +2,7 @@
 _target_: pytorch_lightning.loggers.WandbLogger
 
 project: "faithful-cond-gen"
-name: "debug_run_celeba"
+name: "run_rxrx1_full_model"
 save_dir: "./outputs"
 offline: false  # Set to true if you don't have internet access on the node
 id: null        # Set this to resume a specific run ID

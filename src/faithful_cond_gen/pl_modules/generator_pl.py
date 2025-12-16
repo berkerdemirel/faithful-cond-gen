@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -9,6 +11,25 @@ import torch.nn.functional as F
 from faithful_cond_gen.model.generator import GeneratorWrapper
 from faithful_cond_gen.utils.metrics import ConditionalFidelityMetrics
 from torch.optim import AdamW
+
+
+def dist_on() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def rank() -> int:
+    return torch.distributed.get_rank() if dist_on() else 0
+
+
+def world() -> int:
+    return torch.distributed.get_world_size() if dist_on() else 1
+
+
+def dprint(*args, **kwargs):
+    # avoids buffering so you actually see it during hangs
+    prefix = f"[rank {rank()}/{world()} pid={os.getpid()}] "
+    print(prefix + " ".join(map(str, args)), flush=True, **kwargs)
+    sys.stdout.flush()
 
 
 @dataclass
@@ -72,7 +93,6 @@ class GeneratorPL(pl.LightningModule):
 
     def training_step(self, batch, batch_idx: int):
         images, cond_ids = self._unpack_batch(batch)
-
         # --- encode to latents ---
         with torch.no_grad():
             x0 = self.generator.encode(images)  # (B,4,h,w) if VAE frozen
@@ -127,302 +147,142 @@ class GeneratorPL(pl.LightningModule):
         self.log("test/loss", loss, prog_bar=True)
         return loss
 
-    def on_fit_start(self):
-        """
-        Selects target conditions (from config or random sampling)
-        and buffers their real validation images using get_matching_dataset.
-        """
-        if self.global_rank == 0:
-            print("[GeneratorPL] Initializing validation targets...")
-            self.val_buffer = {}  # Store {cond_tuple: tensor_images}
-            self.fidelity_metrics = ConditionalFidelityMetrics(self.device)
-
-            dm = self.trainer.datamodule
-            targets = []
-
-            # 1. Determine Target Conditions
-            if (
-                self.cfg.val_target_conditions is not None
-                and len(self.cfg.val_target_conditions) > 0
-            ):
-                targets = self.cfg.val_target_conditions
-            else:
-                # Randomly sample from available validation conditions
-                print(
-                    "No preset conditions found. Sampling 8 random combos from validation set."
-                )
-                df_conds = dm.available_conditions("val")
-                # Exclude count/category cols to get pure attribute keys
-                drop_cols = ["count", "comp_category"]
-                attr_cols = [c for c in df_conds.columns if c not in drop_cols]
-
-                # Sample 8 random rows
-                sample_df = df_conds.sample(n=8, random_state=42)
-                targets = sample_df[attr_cols].to_dict(orient="records")
-
-            # 2. Buffer Images for each Target
-            # We assume we need ~128 images for stable FID
-            MAX_SAMPLES = 128
-
-            for cond_dict in targets:
-                # Use the new API we added to DataModules
-                ds_subset = dm.get_matching_dataset(
-                    "val", cond_dict, max_samples=MAX_SAMPLES
-                )
-
-                if len(ds_subset) < 4:
-                    print(
-                        f"⚠️ Condition {cond_dict} has too few samples ({len(ds_subset)}). Skipping."
-                    )
-                    continue
-
-                # Load all images into a tensor
-                # Note: We access [0] which is the image tensor from __getitem__
-                imgs = torch.stack([ds_subset[i][0] for i in range(len(ds_subset))])
-                imgs = imgs.to(self.device)
-
-                # Create a tuple key for storage (values sorted by key for determinism)
-                # e.g. tuple(1, 1138)
-                # We also need the tensor version of this condition for the model
-                # We grab it from the first sample's 'cond' dict
-                _, first_sample_cond = ds_subset[0]
-                cond_vals = list(first_sample_cond["cond"].values())
-                cond_tensor = torch.stack(cond_vals).to(self.device)  # (K,)
-
-                # Store
-                dict_key = tuple(
-                    sorted(cond_dict.items())
-                )  # Hashable dict representation
-                self.val_buffer[dict_key] = {
-                    "real_images": imgs,
-                    "cond_tensor": cond_tensor,
-                    "cond_dict": cond_dict,
-                }
-                self.target_keys.append(dict_key)
-                print(f"  ✅ Buffered {len(imgs)} images for {cond_dict}")
-
     def on_train_batch_start(self, batch, batch_idx):
-        """
-        Trigger logging every 5000 global steps.
-        """
-        if self.global_step % 5000 == 0:
+        if self.trainer.sanity_checking:
+            return
+
+        # single GPU: normal
+        if not (self.trainer.world_size > 1 and torch.distributed.is_initialized()):
+            if self.global_step % 5000 == 0:
+                self._log_images_and_metrics()
+            return
+
+        # DDP: rank0 decides, then broadcasts decision
+        do_log = torch.zeros(1, device=self.device, dtype=torch.int32)
+        if self.global_rank == 0:
+            do_log.fill_(1 if (self.global_step % 5000 == 0) else 0)
+
+        torch.distributed.broadcast(do_log, src=0)
+
+        if do_log.item() == 1:
+            # align ranks before/after logging so collectives happen in lockstep
+            self.trainer.strategy.barrier()
             self._log_images_and_metrics()
+            self.trainer.strategy.barrier()
 
-    # @torch.no_grad()
-    # def _log_images_and_metrics(self):
-    #     """
-    #     Parallelized Logging:
-    #     Each GPU (Rank N) processes the Nth target condition.
-    #     Results are gathered and logged by Rank 0.
-    #     """
-    #     print(
-    #         f"[GeneratorPL] Rank {self.global_rank} entering logging step {self.global_step}..."
-    #     )
-    #     self.generator.eval()
+    def on_fit_start(self):
+        print(f"[GeneratorPL] Rank {self.global_rank} initializing metrics...")
+        self._last_avg_rfid = torch.tensor(float("inf"), device=self.device)
+        self.fidelity_metrics = ConditionalFidelityMetrics(self.device)
+        self.val_buffer = {}
+        self.target_keys = []
 
-    #     # 1. Identify the target for this rank
-    #     target_idx = self.global_rank
-    #     num_targets = len(self.target_keys)
+        dm = self.trainer.datamodule
 
-    #     # Tensors to store results (initialize placeholders)
-    #     # Metrics: [rFID, FID_gen, FID_base]
-    #     local_metrics = torch.zeros(3, device=self.device)
-    #     # Images: Stack of [Real(8) | Rec(8) | Gen(8)] -> (24, C, H, W)
-    #     # We need a reference shape for initialization; use config or deduce
-    #     C, H, W = (
-    #         self.generator.cfg.in_channels,
-    #         self.generator.cfg.image_size,
-    #         self.generator.cfg.image_size,
-    #     )
-    #     local_vis_imgs = torch.zeros((24, C, H, W), device=self.device)
+        is_distributed = (
+            self.trainer.world_size > 1 and torch.distributed.is_initialized()
+        )
+        world_size = self.trainer.world_size
+        rank = self.global_rank
 
-    #     # Flag to track if this rank actually did work (to avoid logging zeros from idle ranks)
-    #     did_work = torch.tensor(0.0, device=self.device)
-    #     # 2. Process specific target if within bounds
-    #     if target_idx < num_targets:
-    #         c_key = self.target_keys[target_idx]
-    #         data = self.val_buffer.get(c_key)
+        # --- build targets (rank0 decides if distributed) ---
+        targets = []
+        if (self.cfg.val_target_conditions is not None) and len(
+            self.cfg.val_target_conditions
+        ) > 0:
+            targets = self.cfg.val_target_conditions
+        else:
+            df_conds = dm.available_conditions("val")
+            drop_cols = ["count", "comp_category"]
+            attr_cols = [c for c in df_conds.columns if c not in drop_cols]
 
-    #         real_imgs = data["real_images"]  # (N, C, H, W)
-    #         cond_tensor = data["cond_tensor"]  # (K,)
+            MIN_SAMPLES = 4
+            df_filtered = df_conds[df_conds["count"] >= MIN_SAMPLES].copy()
+            df_filtered = df_filtered.sort_values("count", ascending=False)
 
-    #         # --- A. Visualization (Fixed Reconstruction & Sampling) ---
-    #         # Take 8 samples for visualization
-    #         vis_real = real_imgs[:8].to(self.device)
+            n_samples = min(8, len(df_filtered))
+            if n_samples == 0:
+                print(
+                    f"⚠️ Rank {rank}: No conditions with >= {MIN_SAMPLES} samples found!"
+                )
+                return
 
-    #         # Reconstruct
-    #         latents = self.generator.encode(vis_real)
-    #         rec_imgs = self.generator.decode(latents)
+            sample_df = df_filtered.head(n_samples)
+            targets = sample_df[attr_cols].to_dict(orient="records")
 
-    #         # Generate Random (8 samples)
-    #         cond_batch_vis = cond_tensor.unsqueeze(0).repeat(8, 1).to(self.device)
-    #         gen_vis = self.generator.sample(cond_batch_vis, num_inference_steps=50)
+        if is_distributed:
+            obj = [targets] if rank == 0 else [None]
+            torch.distributed.broadcast_object_list(obj, src=0)
+            targets = obj[0]
 
-    #         # Pack images: (8+8+8, C, H, W)
-    #         local_vis_imgs = torch.cat([vis_real, rec_imgs, gen_vis], dim=0)
+        MAX_SAMPLES = 128
 
-    #         # --- B. Metric Computation (rFID) ---
-    #         # Generate N samples (matching Real count) for split-half calculation
-    #         n_gen = len(real_imgs)
-    #         cond_batch_metric = (
-    #             cond_tensor.unsqueeze(0).repeat(n_gen, 1).to(self.device)
-    #         )
+        for i, cond_dict in enumerate(targets):
+            dict_key = tuple(sorted(cond_dict.items()))
+            self.target_keys.append(dict_key)  # EXACTLY ONCE ON ALL RANKS
 
-    #         # Batch generation loop
-    #         gen_metric_list = []
-    #         batch_size = 16
-    #         for j in range(0, n_gen, batch_size):
-    #             curr_batch = cond_batch_metric[j : j + batch_size]
-    #             gen_metric_list.append(
-    #                 self.generator.sample(curr_batch, num_inference_steps=25)
-    #             )
-    #         gen_metric_imgs = torch.cat(gen_metric_list, dim=0)
+            # only the assigned rank loads images
+            if is_distributed and (i % world_size) != rank:
+                continue
 
-    #         # Compute rFID
-    #         rfid, fid_gen, fid_base = self.fidelity_metrics.compute_rfid(
-    #             real_imgs, gen_metric_imgs
-    #         )
+            print(f"[Rank {rank}] Loading buffer for target {i}: {cond_dict}")
 
-    #         local_metrics[0] = rfid
-    #         local_metrics[1] = fid_gen
-    #         local_metrics[2] = fid_base
-    #         did_work.fill_(1.0)
+            ds_subset = dm.get_matching_dataset(
+                "val", cond_dict, max_samples=MAX_SAMPLES
+            )
+            if len(ds_subset) < 4:
+                print(
+                    f"⚠️ Rank {rank}: Condition {cond_dict} has too few samples. Skipping."
+                )
+                continue
 
-    #         print(
-    #             f"[Rank {self.global_rank}] Completed target {target_idx} (rFID: {rfid:.4f})"
-    #         )
+            imgs = torch.stack([ds_subset[j][0] for j in range(len(ds_subset))]).to(
+                self.device
+            )
 
-    #     # 3. Gather results from all ranks to Rank 0
-    #     # gathered_metrics: (World_Size, 3)
-    #     gathered_metrics = [
-    #         torch.zeros_like(local_metrics) for _ in range(self.trainer.world_size)
-    #     ]
-    #     torch.distributed.all_gather(gathered_metrics, local_metrics)
+            _, first_sample_cond = ds_subset[0]
+            cond_vals = list(first_sample_cond["cond"].values())
+            cond_tensor = torch.stack(cond_vals).to(self.device)
 
-    #     # gathered_vis_imgs: (World_Size, 24, C, H, W)
-    #     # Note: all_gather requires tensors to be same size across ranks.
-    #     # Our initialization guarantees this (zeros if idle).
-    #     gathered_vis_imgs = [
-    #         torch.zeros_like(local_vis_imgs) for _ in range(self.trainer.world_size)
-    #     ]
-    #     torch.distributed.all_gather(gathered_vis_imgs, local_vis_imgs)
-
-    #     # gathered_work_flags: (World_Size,)
-    #     gathered_work_flags = [
-    #         torch.zeros_like(did_work) for _ in range(self.trainer.world_size)
-    #     ]
-    #     torch.distributed.all_gather(gathered_work_flags, did_work)
-
-    #     # 4. Log everything on Rank 0
-    #     if self.global_rank == 0:
-    #         avg_rfid = 0.0
-    #         valid_targets = 0
-
-    #         for i in range(self.trainer.world_size):
-    #             # Skip if this rank didn't process a valid target
-    #             if gathered_work_flags[i].item() < 0.5:
-    #                 continue
-
-    #             # Match index i to the target key
-    #             # (Assumes world_size >= num_targets, and ranks map 1:1 to indices)
-    #             if i >= len(self.target_keys):
-    #                 continue
-
-    #             c_key = self.target_keys[i]
-    #             # We need the dictionary for the tag string; grab from local buffer or re-derive
-    #             # Since Rank 0 has the full buffer (from on_fit_start), we can look it up
-    #             if c_key not in self.val_buffer:
-    #                 continue
-    #             cond_dict = self.val_buffer[c_key]["cond_dict"]
-
-    #             # Extract metrics
-    #             m = gathered_metrics[i]
-    #             rfid, fid_gen, fid_base = m[0].item(), m[1].item(), m[2].item()
-
-    #             # Extract images
-    #             # Shape (24, C, H, W) -> Split into Real(8), Rec(8), Gen(8)
-    #             imgs_stack = gathered_vis_imgs[i]
-    #             vis_real = imgs_stack[0:8]
-    #             rec_imgs = imgs_stack[8:16]
-    #             gen_vis = imgs_stack[16:24]
-
-    #             # Logging Keys
-    #             cond_str = "_".join([f"{v}" for k, v in cond_dict.items()])
-    #             cond_tag = f"cond_{cond_str}"
-
-    #             # 1. Log Metrics
-    #             self.log_dict(
-    #                 {
-    #                     f"val/{cond_tag}/rFID": rfid,
-    #                     f"val/{cond_tag}/FID_gen": fid_gen,
-    #                     f"val/{cond_tag}/FID_base": fid_base,
-    #                 },
-    #                 logger=True,
-    #                 rank_zero_only=True,  # redundant but safe
-    #             )
-
-    #             avg_rfid += rfid
-    #             valid_targets += 1
-
-    #             # 2. Log Images
-
-    #             import wandb
-    #             from torchvision.utils import make_grid
-
-    #             def grid_to_wandb(tensor):
-    #                 grid = make_grid(tensor, nrow=8, normalize=False)
-    #                 return wandb.Image(grid.cpu().permute(1, 2, 0).numpy())
-
-    #             self.logger.experiment.log(
-    #                 {
-    #                     f"vis/{cond_tag}/fixed_reconstruction": grid_to_wandb(
-    #                         torch.cat([vis_real, rec_imgs], dim=0)
-    #                     ),
-    #                     f"vis/{cond_tag}/random_generation": grid_to_wandb(gen_vis),
-    #                 },
-    #                 step=self.global_step,
-    #             )
-
-    #         if valid_targets > 0:
-    #             self.log(
-    #                 "val/avg_rFID",
-    #                 avg_rfid / valid_targets,
-    #                 logger=True,
-    #                 rank_zero_only=True,
-    #             )
-
-    #         print(f"[GeneratorPL] Logging complete. Processed {valid_targets} targets.")
-
-    #     self.generator.train()
+            self.val_buffer[dict_key] = {
+                "real_images": imgs,
+                "cond_tensor": cond_tensor,
+                "cond_dict": cond_dict,
+            }
 
     @torch.no_grad()
     def _log_images_and_metrics(self):
         """
         Computes rFID and generates visualization images.
-        - Single GPU: Processes all targets sequentially.
-        - DDP: Distributes targets across ranks (Rank N processes Target N), then gathers results.
         """
         print(
             f"[GeneratorPL] Rank {self.global_rank} entering logging step {self.global_step}..."
         )
         self.generator.eval()
 
+        # We want Rank N to compute FID *only* on its own data, not wait for others.
+        if hasattr(self.fidelity_metrics, "fid"):
+            self.fidelity_metrics.fid.sync_on_compute = False
+            self.fidelity_metrics.fid.dist_sync_on_step = False
+
         # --- Helper: Core Generation Logic ---
         def process_single_target(c_key):
             """Generates images and computes metrics for a specific target key."""
+            # If we are in DDP, we only have data for our assigned target.
+            # If we are Single GPU, we have data for all.
             data = self.val_buffer.get(c_key)
             if data is None:
                 return None
 
-            real_imgs = data["real_images"]
-            cond_tensor = data["cond_tensor"]  # (K,)
+            real_imgs = data["real_images"].to(self.device)
+            cond_tensor = data["cond_tensor"].to(self.device)
 
             # 1. Visualization
-            vis_real = real_imgs[:8].to(self.device)
+            vis_real = real_imgs[:8]
             latents = self.generator.encode(vis_real)
             rec_imgs = self.generator.decode(latents)
 
-            cond_batch_vis = cond_tensor.unsqueeze(0).repeat(8, 1).to(self.device)
+            cond_batch_vis = cond_tensor.unsqueeze(0).repeat(8, 1)
             gen_vis = self.generator.sample(cond_batch_vis, num_inference_steps=50)
 
             # Stack for transport/logging: (24, C, H, W) -> [Real|Rec|Gen]
@@ -430,9 +290,7 @@ class GeneratorPL(pl.LightningModule):
 
             # 2. Metrics (rFID)
             n_gen = len(real_imgs)
-            cond_batch_metric = (
-                cond_tensor.unsqueeze(0).repeat(n_gen, 1).to(self.device)
-            )
+            cond_batch_metric = cond_tensor.unsqueeze(0).repeat(n_gen, 1)
 
             gen_metric_list = []
             batch_size = 16
@@ -443,9 +301,13 @@ class GeneratorPL(pl.LightningModule):
                 )
             gen_metric_imgs = torch.cat(gen_metric_list, dim=0)
 
+            # Because sync_on_compute=False, this now returns LOCAL FID without waiting
+            self.fidelity_metrics.fid.reset()
+
             rfid, fid_gen, fid_base = self.fidelity_metrics.compute_rfid(
                 real_imgs, gen_metric_imgs
             )
+            self.fidelity_metrics.fid.reset()
 
             return (rfid, fid_gen, fid_base), vis_imgs
 
@@ -459,11 +321,17 @@ class GeneratorPL(pl.LightningModule):
             rec_imgs = imgs_stack[8:16]
             gen_vis = imgs_stack[16:24]
 
-            cond_dict = self.val_buffer[c_key]["cond_dict"]
-            cond_str = "_".join([f"{v}" for k, v in cond_dict.items()])
+            # check for channel count and convert to rgb if needed
+            if vis_real.shape[1] == 6:
+                vis_real = self.fidelity_metrics._ensure_rgb(vis_real)
+                rec_imgs = self.fidelity_metrics._ensure_rgb(rec_imgs)
+                gen_vis = self.fidelity_metrics._ensure_rgb(gen_vis)
+
+            cond_str = "_".join([f"{v}" for k, v in c_key])  # c_key is tuple of items
             cond_tag = f"cond_{cond_str}"
 
             # Log Metrics
+            # sync_dist=False is safer here since keys are unique to Rank 0 logging pass
             self.log_dict(
                 {
                     f"val/{cond_tag}/rFID": rfid,
@@ -472,6 +340,7 @@ class GeneratorPL(pl.LightningModule):
                 },
                 logger=True,
                 rank_zero_only=True,
+                sync_dist=False,
             )
 
             # Log Images
@@ -485,6 +354,7 @@ class GeneratorPL(pl.LightningModule):
                     grid = make_grid(tensor, nrow=8, normalize=False)
                     return wandb.Image(grid.cpu().permute(1, 2, 0).numpy())
 
+                # breakpoint()
                 self.logger.experiment.log(
                     {
                         f"vis/{cond_tag}/fixed_reconstruction": grid_to_wandb(
@@ -520,8 +390,10 @@ class GeneratorPL(pl.LightningModule):
             did_work = torch.tensor(0.0, device=self.device)
 
             if target_idx < len(self.target_keys):
+
                 c_key = self.target_keys[target_idx]
                 result = process_single_target(c_key)
+
                 if result is not None:
                     (m_rfid, m_fg, m_fb), m_imgs = result
                     local_metrics[0], local_metrics[1], local_metrics[2] = (
@@ -534,18 +406,23 @@ class GeneratorPL(pl.LightningModule):
                     print(
                         f"[Rank {self.global_rank}] Completed target {target_idx} (rFID: {m_rfid:.4f})"
                     )
-
             # Gather from all ranks
             gathered_metrics = [
                 torch.zeros_like(local_metrics) for _ in range(self.trainer.world_size)
             ]
             torch.distributed.all_gather(gathered_metrics, local_metrics)
 
-            gathered_vis_imgs = [
-                torch.zeros_like(local_vis_imgs) for _ in range(self.trainer.world_size)
-            ]
-            torch.distributed.all_gather(gathered_vis_imgs, local_vis_imgs)
-
+            local_vis_u8 = (local_vis_imgs.clamp(0, 1) * 255).to(torch.uint8)
+            world_size = self.trainer.world_size
+            if self.global_rank == 0:
+                gathered_vis_u8 = [
+                    torch.empty_like(local_vis_u8) for _ in range(world_size)
+                ]
+                torch.distributed.gather(
+                    local_vis_u8, gather_list=gathered_vis_u8, dst=0
+                )
+            else:
+                torch.distributed.gather(local_vis_u8, dst=0)
             gathered_work_flags = [
                 torch.zeros_like(did_work) for _ in range(self.trainer.world_size)
             ]
@@ -565,7 +442,7 @@ class GeneratorPL(pl.LightningModule):
                         gathered_metrics[i][1].item(),
                         gathered_metrics[i][2].item(),
                     )
-                    imgs_stack = gathered_vis_imgs[i]
+                    imgs_stack = gathered_vis_u8[i]
 
                     val = log_target_results(c_key, metrics_tuple, imgs_stack)
                     avg_rfid += val
@@ -584,14 +461,42 @@ class GeneratorPL(pl.LightningModule):
                 avg_rfid += val
                 valid_targets += 1
 
+        avg = torch.tensor(float("inf"), device=self.device)
+        if self.global_rank == 0 and valid_targets > 0:
+            avg.fill_(avg_rfid / valid_targets)
+
+        if dist_on():
+            torch.distributed.broadcast(avg, src=0)
+        self._last_avg_rfid = avg.detach()
         # Final average log
-        if valid_targets > 0:
-            self.log(
-                "val/avg_rFID",
-                avg_rfid / valid_targets,
-                logger=True,
-                rank_zero_only=True,
-            )
-            print(f"[GeneratorPL] Logging complete. Processed {valid_targets} targets.")
+        self.log(
+            "val/avg_rFID",
+            avg,
+            on_step=False,
+            on_epoch=True,
+            logger=True,
+            sync_dist=False,
+        )
+        print(f"[GeneratorPL] Logging complete. Processed {valid_targets} targets.")
 
         self.generator.train()
+
+    def on_validation_epoch_end(self):
+        if self.trainer.sanity_checking:
+            return
+
+        avg = self._last_avg_rfid
+        if dist_on():
+            # ensure all ranks have the same scalar
+            torch.distributed.broadcast(avg, src=0)
+
+        # make it visible to ModelCheckpoint
+        self.log(
+            "val/avg_rFID",
+            avg,
+            on_step=False,
+            on_epoch=True,
+            logger=True,
+            sync_dist=False,
+            rank_zero_only=False,
+        )

@@ -4,14 +4,14 @@ _target_: faithful_cond_gen.data.rxrx1.RxRx1DataConfig
 
 data_dir: /mnt/pvc/AutoSync/data/rxrx1
 img_size: [512, 512]
-resize: [512, 512]
+resize: [256, 256]
 reduce_channels: false
 augment_train: false
 normalize: false
 use_numpy: true
 use_parquet: false
-batch_size: 32
-num_workers: 4
+batch_size: 2
+num_workers: 2
 val_size: 0.1
 seed: 1337
 

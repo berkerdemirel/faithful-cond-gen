@@ -11,7 +11,7 @@ from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
 
-@hydra.main(config_path="../configs", config_name="config", version_base=None)
+@hydra.main(config_path="../configs", config_name="config_rxrx1", version_base=None)
 def main(cfg: DictConfig):
     # 1. Set Seed & Device logic (handled by PL Trainer usually, but good for setup)
     pl.seed_everything(cfg.get("seed", 1337), workers=True)
@@ -27,7 +27,6 @@ def main(cfg: DictConfig):
         dm = CelebaDataModule(dm_conf)
 
     # 3. Prepare Model Config
-    # Critical: Ensure model knows how many classes per attribute to expect.
     # CelebA default attributes are binary (2 classes).
     # If using default 4 attrs: [2, 2, 2, 2]
     if hasattr(dm, "selected_attrs"):
@@ -56,12 +55,20 @@ def main(cfg: DictConfig):
     # This uses the logger config group
     logger = instantiate(cfg.logger)
 
-    # 6. Instantiate Trainer
+    # 6. Instantiate Callbacks (NEW)
+    callbacks = []
+    if "callbacks" in cfg:
+        for _, cb_conf in cfg.callbacks.items():
+            if "_target_" in cb_conf:
+                print(f"Instantiating callback <{cb_conf._target_}>")
+                callbacks.append(instantiate(cb_conf))
+
+    # 7. Instantiate Trainer
     # We use the 'train' section of the config for trainer args
     print("Initializing Trainer...")
-    trainer = instantiate(cfg.train, logger=logger)
+    trainer = instantiate(cfg.train, logger=logger, callbacks=callbacks)
 
-    # 6. Run Training
+    # 8. Run Training
     print("Starting Training...")
     trainer.fit(model, datamodule=dm)
 
