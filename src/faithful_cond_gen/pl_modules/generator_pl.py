@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+from faithful_cond_gen.model.ema import EMA
 from faithful_cond_gen.model.generator import GeneratorWrapper
 from faithful_cond_gen.utils.metrics import ConditionalFidelityMetrics
 from torch.optim import AdamW
@@ -100,7 +101,7 @@ class GeneratorPL(pl.LightningModule):
         b = x0.shape[0]
 
         # --- forward/noising process ---
-        t = torch.rand(b, device=x0.device, dtype=x0.dtype)
+        t = torch.rand(b, device=x0.device, dtype=torch.float32)
         eps = torch.randn_like(x0)
         x_t, v_tgt = self.linear_interpolant(x0, t, eps)
 
@@ -120,7 +121,7 @@ class GeneratorPL(pl.LightningModule):
         x0 = self.generator.encode(images)
         b = x0.shape[0]
 
-        t = torch.rand(b, device=x0.device, dtype=x0.dtype)
+        t = torch.rand(b, device=x0.device, dtype=torch.float32)
         eps = torch.randn_like(x0)
         x_t, v_tgt = self.linear_interpolant(x0, t, eps)
 
@@ -137,7 +138,7 @@ class GeneratorPL(pl.LightningModule):
         x0 = self.generator.encode(images)
         b = x0.shape[0]
 
-        t = torch.rand(b, device=x0.device, dtype=x0.dtype)
+        t = torch.rand(b, device=x0.device, dtype=torch.float32)
         eps = torch.randn_like(x0)
         x_t, v_tgt = self.linear_interpolant(x0, t, eps)
 
@@ -146,6 +147,23 @@ class GeneratorPL(pl.LightningModule):
 
         self.log("test/loss", loss, prog_bar=True)
         return loss
+
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None):
+        optimizer.step(closure=optimizer_closure)
+        optimizer.zero_grad(set_to_none=True)
+        if hasattr(self, "ema"):
+            self.ema.update()
+
+    def on_save_checkpoint(self, checkpoint):
+        if hasattr(self, "ema"):
+            checkpoint["ema"] = self.ema.state_dict()
+
+    def on_load_checkpoint(self, checkpoint):
+        if "ema" in checkpoint:
+            # make sure self.ema exists before calling load (e.g. create in on_fit_start or here)
+            if not hasattr(self, "ema"):
+                self.ema = EMA(self.generator, decay=checkpoint["ema"]["decay"])
+            self.ema.load_state_dict(checkpoint["ema"])
 
     def on_train_batch_start(self, batch, batch_idx):
         if self.trainer.sanity_checking:
@@ -172,6 +190,8 @@ class GeneratorPL(pl.LightningModule):
 
     def on_fit_start(self):
         print(f"[GeneratorPL] Rank {self.global_rank} initializing metrics...")
+        if not hasattr(self, "ema"):
+            self.ema = EMA(self.generator, decay=0.9999)
         self._last_avg_rfid = torch.tensor(float("inf"), device=self.device)
         self.fidelity_metrics = ConditionalFidelityMetrics(self.device)
         self.val_buffer = {}
@@ -200,15 +220,19 @@ class GeneratorPL(pl.LightningModule):
             df_filtered = df_conds[df_conds["count"] >= MIN_SAMPLES].copy()
             df_filtered = df_filtered.sort_values("count", ascending=False)
 
-            n_samples = min(8, len(df_filtered))
+            # n_samples = min(8, len(df_filtered))
+            desired_n = self.trainer.world_size if is_distributed else 8
+            n_samples = min(desired_n, len(df_filtered))
+            sample_df = df_filtered.head(n_samples)
+            targets = sample_df[attr_cols].to_dict(orient="records")
             if n_samples == 0:
                 print(
                     f"⚠️ Rank {rank}: No conditions with >= {MIN_SAMPLES} samples found!"
                 )
                 return
 
-            sample_df = df_filtered.head(n_samples)
-            targets = sample_df[attr_cols].to_dict(orient="records")
+            # sample_df = df_filtered.head(n_samples)
+            # targets = sample_df[attr_cols].to_dict(orient="records")
 
         if is_distributed:
             obj = [targets] if rank == 0 else [None]
@@ -222,7 +246,7 @@ class GeneratorPL(pl.LightningModule):
             self.target_keys.append(dict_key)  # EXACTLY ONCE ON ALL RANKS
 
             # only the assigned rank loads images
-            if is_distributed and (i % world_size) != rank:
+            if is_distributed and i != rank:
                 continue
 
             print(f"[Rank {rank}] Loading buffer for target {i}: {cond_dict}")
@@ -259,6 +283,8 @@ class GeneratorPL(pl.LightningModule):
             f"[GeneratorPL] Rank {self.global_rank} entering logging step {self.global_step}..."
         )
         self.generator.eval()
+        if hasattr(self, "ema"):
+            self.ema.apply()
 
         # We want Rank N to compute FID *only* on its own data, not wait for others.
         if hasattr(self.fidelity_metrics, "fid"):
@@ -287,6 +313,12 @@ class GeneratorPL(pl.LightningModule):
 
             # Stack for transport/logging: (24, C, H, W) -> [Real|Rec|Gen]
             vis_imgs = torch.cat([vis_real, rec_imgs, gen_vis], dim=0)
+            # inside process_single_target, after vis_imgs is created:
+            if vis_imgs.shape[1] == 6:
+                vis_imgs = self.fidelity_metrics._ensure_rgb(
+                    vis_imgs
+                )  # now (24,3,H,W) float
+            vis_imgs = vis_imgs.clamp(0, 1)  # assuming ToTensor -> [0,1]
 
             # 2. Metrics (rFID)
             n_gen = len(real_imgs)
@@ -322,10 +354,10 @@ class GeneratorPL(pl.LightningModule):
             gen_vis = imgs_stack[16:24]
 
             # check for channel count and convert to rgb if needed
-            if vis_real.shape[1] == 6:
-                vis_real = self.fidelity_metrics._ensure_rgb(vis_real)
-                rec_imgs = self.fidelity_metrics._ensure_rgb(rec_imgs)
-                gen_vis = self.fidelity_metrics._ensure_rgb(gen_vis)
+            # if vis_real.shape[1] == 6:
+            #     vis_real = self.fidelity_metrics._ensure_rgb(vis_real)
+            #     rec_imgs = self.fidelity_metrics._ensure_rgb(rec_imgs)
+            #     gen_vis = self.fidelity_metrics._ensure_rgb(gen_vis)
 
             cond_str = "_".join([f"{v}" for k, v in c_key])  # c_key is tuple of items
             cond_tag = f"cond_{cond_str}"
@@ -382,7 +414,7 @@ class GeneratorPL(pl.LightningModule):
             # Initialize placeholders for gathering
             local_metrics = torch.zeros(3, device=self.device)
             C, H, W = (
-                self.generator.cfg.in_channels,
+                3,  # self.generator.cfg.in_channels,
                 self.generator.cfg.image_size,
                 self.generator.cfg.image_size,
             )
@@ -480,6 +512,8 @@ class GeneratorPL(pl.LightningModule):
         print(f"[GeneratorPL] Logging complete. Processed {valid_targets} targets.")
 
         self.generator.train()
+        if hasattr(self, "ema"):
+            self.ema.restore()
 
     def on_validation_epoch_end(self):
         if self.trainer.sanity_checking:
@@ -499,4 +533,12 @@ class GeneratorPL(pl.LightningModule):
             logger=True,
             sync_dist=False,
             rank_zero_only=False,
+        )
+        self.log(
+            "val_avg_rFID",
+            avg,
+            on_step=False,
+            on_epoch=True,
+            logger=True,
+            sync_dist=False,
         )
