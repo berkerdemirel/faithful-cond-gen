@@ -431,6 +431,53 @@ def test_get_matching_dataset(data_dir: str) -> None:
     print(f"  ✅ Combo filtering OK (n={len(ds_combo)}).")
 
 
+def test_heldout_pair_from_train_is_removed_and_evaled(
+    data_dir: str, val_size: float = 0.1
+):
+    cfg = RxRx1DataConfig(
+        data_dir=data_dir,
+        val_size=val_size,
+        use_numpy=True,
+        use_parquet=False,
+        rare_threshold=16,
+    )
+    dm = RxRx1DataModule(cfg)
+    md = dm.metadata
+
+    # pick a pair that exists in base train
+    train_md = md[md["train_index"]]
+    assert len(train_md) > 0
+    r0 = train_md.iloc[0]
+    candidate_pair = (int(r0["cell_type_id"]), int(r0["sirna_id"]))
+
+    dm2 = RxRx1DataModule(
+        RxRx1DataConfig(
+            data_dir=data_dir,
+            val_size=val_size,
+            use_numpy=True,
+            use_parquet=False,
+            held_out_pairs=[candidate_pair],
+            rare_threshold=16,
+        )
+    )
+    md2 = dm2.metadata
+
+    pair_mask = (md2["cell_type_id"] == candidate_pair[0]) & (
+        md2["sirna_id"] == candidate_pair[1]
+    )
+
+    # 1) not in train
+    assert int((md2["train_index"] & pair_mask).sum()) == 0
+
+    # 2) should exist in eval (val or test). with the change above, it should be in val.
+    n_eval = int(((md2["val_index"] | md2["test_index"]) & pair_mask).sum())
+    assert n_eval > 0, "Held-out pair disappeared from val/test."
+
+    # 3) eval samples for the pair must be 'unseen'
+    eval_subset = md2[(md2["val_index"] | md2["test_index"]) & pair_mask]
+    assert (eval_subset["comp_category"] == "unseen").all()
+
+
 def main():
     parser = argparse.ArgumentParser(description="RxRx1 dataset tests")
     parser.add_argument(
@@ -478,6 +525,11 @@ def main():
 
     # 5) Test get_matching_dataset
     test_get_matching_dataset(data_dir=data_dir)
+
+    # 6) Held-out pair removal from train and eval presence
+    test_heldout_pair_from_train_is_removed_and_evaled(
+        data_dir=data_dir, val_size=args.val_size
+    )
 
 
 if __name__ == "__main__":

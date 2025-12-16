@@ -387,6 +387,8 @@ class RxRx1DataModule(pl.LightningDataModule):
             )
             # ensure these never appear in train
             md.loc[mask_held_out, "train_index"] = False
+            not_eval = mask_held_out & ~(md["val_index"] | md["test_index"])
+            md.loc[not_eval, "val_index"] = True
 
         self.metadata = md
 

@@ -152,7 +152,16 @@ class CelebaDataModule(pl.LightningDataModule):
         self.held_out_combos = (
             set(cfg.held_out_combos) if cfg.held_out_combos is not None else None
         )
+        # Apply held-out combos to the *actual* training HF dataset so lengths stay aligned
+        if self.held_out_combos is not None:
+            md_train_full = self._hf_to_dataframe(self.ds_train)
+            md_train_full["combo"] = md_train_full.apply(self._combo_key, axis=1)
+            keep_idx = md_train_full.index[
+                ~md_train_full["combo"].isin(self.held_out_combos)
+            ].tolist()
 
+            # Replace ds_train with the filtered view
+            self.ds_train = self.ds_train.select(keep_idx)
         # composition categories per split
         (
             self.train_comp_categories,
@@ -180,7 +189,7 @@ class CelebaDataModule(pl.LightningDataModule):
         t: List[T.transforms] = []
 
         # basic resize / center crop like DINOv2-ish
-        t.append(T.Resize(256))
+        t.append(T.Resize(self.cfg.image_size))
         t.append(T.CenterCrop(self.cfg.image_size))
 
         if train and self.cfg.augment_train:
@@ -188,14 +197,14 @@ class CelebaDataModule(pl.LightningDataModule):
 
         t.append(T.ToTensor())
 
-        if self.cfg.normalize:
-            # ImageNet normalization
-            t.append(
-                T.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                )
-            )
+        # if self.cfg.normalize:
+        #     # ImageNet normalization
+        #     t.append(
+        #         T.Normalize(
+        #             mean=[0.485, 0.456, 0.406],
+        #             std=[0.229, 0.224, 0.225],
+        #         )
+        #     )
 
         return T.Compose(t)
 
@@ -238,10 +247,6 @@ class CelebaDataModule(pl.LightningDataModule):
         md_test = self._hf_to_dataframe(self.ds_test)
 
         md_train["combo"] = md_train.apply(self._combo_key, axis=1)
-        # Optionally drop held-out combinations from train
-        if self.held_out_combos is not None:
-            mask_held_out = md_train["combo"].isin(self.held_out_combos)
-            md_train = md_train[~mask_held_out]
 
         # counts per combination in train
         counts = md_train["combo"].value_counts()

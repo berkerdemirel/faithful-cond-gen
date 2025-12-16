@@ -3,6 +3,7 @@ import argparse
 import os
 from typing import Dict, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 from faithful_cond_gen.data.celeba import CelebaDataConfig, CelebaDataModule
 
@@ -289,6 +290,39 @@ def test_get_matching_dataset(cache_dir: Optional[str] = None) -> None:
     print(f"  ✅ Filtering OK (n={len(ds_match)}).")
 
 
+def test_train_dataset_indexes_last_item(cache_dir=None):
+    cfg = CelebaDataConfig(
+        cache_dir=cache_dir, held_out_combos=[(0, 0, 0, 0)]
+    )  # any tuple of right length
+    dm = CelebaDataModule(cfg)
+    ds = dm.get_dataset("train")
+    _ = ds[len(ds) - 1]  # should not throw IndexError
+
+
+def count_combo_in_hfds(hf_ds, selected_attrs, combo):
+    X = np.stack([np.asarray(hf_ds[a], dtype=np.int8) for a in selected_attrs], axis=1)
+    combo = np.asarray(combo, dtype=np.int8)[None, :]
+    return int(np.all(X == combo, axis=1).sum())
+
+
+def test_heldout_combo_removed_from_effective_train_data(cache_dir=None):
+    base = CelebaDataModule(CelebaDataConfig(cache_dir=cache_dir))
+    selected_attrs = base.selected_attrs
+
+    # pick a combo that actually exists in base train so the test is meaningful
+    md_train = base._md_train
+    candidate_combo = tuple(int(md_train.iloc[0][a]) for a in selected_attrs)
+
+    dm = CelebaDataModule(
+        CelebaDataConfig(cache_dir=cache_dir, held_out_combos=[candidate_combo])
+    )
+    ds_train = dm.get_dataset("train")
+
+    # IMPORTANT: check the HF dataset that the training dataset wraps
+    n = count_combo_in_hfds(ds_train.dataset, selected_attrs, candidate_combo)
+    assert n == 0, f"Held-out combo still present in effective train dataset: count={n}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="CelebA dataset tests")
     parser.add_argument(
@@ -312,6 +346,12 @@ def main():
 
     # 4) get_matching_dataset
     test_get_matching_dataset(cache_dir=cache_dir)
+
+    # 5) Train dataset indexing last item
+    test_train_dataset_indexes_last_item(cache_dir=cache_dir)
+
+    # 6) Held-out combo removal from effective train data
+    test_heldout_combo_removed_from_effective_train_data(cache_dir=cache_dir)
 
 
 if __name__ == "__main__":
