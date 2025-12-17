@@ -327,15 +327,21 @@ class RxRx1DataModule(pl.LightningDataModule):
 
         self.metadata = metadata
 
-        self.held_out_pairs = (
-            set(cfg.held_out_pairs) if cfg.held_out_pairs is not None else None
-        )
-
+        # self.held_out_pairs = (
+        #     set(cfg.held_out_pairs) if cfg.held_out_pairs is not None else None
+        # )
+        if cfg.held_out_pairs is not None:
+            self.held_out_pairs = {(int(a), int(b)) for a, b in cfg.held_out_pairs}
+        else:
+            self.held_out_pairs = None
         # Define splits
         self._make_splits()
 
         # Add composition categories (seen / rare / unseen)
         self._add_composition_categories()
+
+        # Print split sizes
+        self._print_split_info()
 
     # ---- LIGHTNING HOOKS ----
 
@@ -422,6 +428,42 @@ class RxRx1DataModule(pl.LightningDataModule):
 
         md["comp_category"] = md.apply(categorize, axis=1)
         self.metadata = md
+
+    def _print_split_info(self) -> None:
+        """Print information about train/val/test splits."""
+        md = self.metadata
+
+        train_count = md["train_index"].sum()
+        val_count = md["val_index"].sum()
+        test_count = md["test_index"].sum()
+        total = len(md)
+
+        print(f"\n{'='*60}")
+        print(f"RxRx1 Dataset Split Information")
+        print(f"{'='*60}")
+        print(f"Total samples:      {total:>8}")
+        print(f"Train samples:      {train_count:>8} ({100*train_count/total:>5.1f}%)")
+        print(f"Validation samples: {val_count:>8} ({100*val_count/total:>5.1f}%)")
+        print(f"Test samples:       {test_count:>8} ({100*test_count/total:>5.1f}%)")
+
+        if self.held_out_pairs is not None:
+            # Count samples in held_out_pairs
+            mask_held_out = md[["cell_type_id", "sirna_id"]].apply(
+                lambda row: (row["cell_type_id"], row["sirna_id"])
+                in self.held_out_pairs,
+                axis=1,
+            )
+            held_out_count = mask_held_out.sum()
+            held_out_in_val = (mask_held_out & md["val_index"]).sum()
+            held_out_in_test = (mask_held_out & md["test_index"]).sum()
+
+            print(f"\nHeld-out pairs info:")
+            print(f"  Number of held-out pairs:     {len(self.held_out_pairs):>8}")
+            print(f"  Samples in held-out pairs:    {held_out_count:>8}")
+            print(f"    - Moved to validation:      {held_out_in_val:>8}")
+            print(f"    - Already in test:          {held_out_in_test:>8}")
+
+        print(f"{'='*60}\n")
 
     def _filtered_metadata(
         self,

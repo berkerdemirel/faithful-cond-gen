@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms as T
@@ -149,19 +149,34 @@ class CelebaDataModule(pl.LightningDataModule):
                     raise ValueError(f"Selected attribute '{a}' not in CelebA attrs.")
             self.selected_attrs = list(selected_attrs)
 
-        self.held_out_combos = (
-            set(cfg.held_out_combos) if cfg.held_out_combos is not None else None
-        )
+        # self.held_out_combos = (
+        #     set(cfg.held_out_combos) if cfg.held_out_combos is not None else None
+        # )
+        if cfg.held_out_combos is not None:
+            self.held_out_combos = {
+                tuple(int(x) for x in combo) for combo in cfg.held_out_combos
+            }
+        else:
+            self.held_out_combos = None
         # Apply held-out combos to the *actual* training HF dataset so lengths stay aligned
         if self.held_out_combos is not None:
             md_train_full = self._hf_to_dataframe(self.ds_train)
             md_train_full["combo"] = md_train_full.apply(self._combo_key, axis=1)
-            keep_idx = md_train_full.index[
-                ~md_train_full["combo"].isin(self.held_out_combos)
-            ].tolist()
 
-            # Replace ds_train with the filtered view
-            self.ds_train = self.ds_train.select(keep_idx)
+            held_out_mask = md_train_full["combo"].isin(self.held_out_combos)
+
+            move_idx = md_train_full.index[held_out_mask].tolist()
+            keep_idx = md_train_full.index[~held_out_mask].tolist()
+
+            ds_train_kept = self.ds_train.select(keep_idx)
+            ds_train_moved = self.ds_train.select(move_idx)
+
+            # append moved samples to existing validation split
+            self.ds_val = concatenate_datasets([self.ds_val, ds_train_moved])
+
+            # update train split to kept samples
+            self.ds_train = ds_train_kept
+
         # composition categories per split
         (
             self.train_comp_categories,
@@ -171,6 +186,9 @@ class CelebaDataModule(pl.LightningDataModule):
             self._md_val,
             self._md_test,
         ) = self._compute_composition_categories()
+
+        # Print split information after all processing
+        self._print_split_info()
 
     # ---- LIGHTNING HOOKS ----
 
@@ -287,6 +305,24 @@ class CelebaDataModule(pl.LightningDataModule):
             md_val,
             md_test,
         )
+
+    def _print_split_info(self) -> None:
+        """Print dataset split sizes after held-out processing."""
+        print("\n" + "=" * 60)
+        print("CelebA Dataset Split Information")
+        print("=" * 60)
+        print(f"Train samples: {len(self.ds_train):,}")
+        print(f"Val samples:   {len(self.ds_val):,}")
+        print(f"Test samples:  {len(self.ds_test):,}")
+        print(
+            f"Total samples: {len(self.ds_train) + len(self.ds_val) + len(self.ds_test):,}"
+        )
+        print(f"Selected attributes: {self.selected_attrs}")
+        if self.held_out_combos:
+            print(
+                f"Held-out combinations: {len(self.held_out_combos)} combinations moved from train to val"
+            )
+        print("=" * 60 + "\n")
 
     # ---- public API ----
 

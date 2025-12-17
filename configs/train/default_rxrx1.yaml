@@ -7,7 +7,7 @@ strategy: ddp
 num_nodes: 1
 
 # Training Duration
-max_steps: 400000
+max_steps: 400001
 max_epochs: -1        # -1 means infinite epochs, stops at max_steps
 
 # Optimization

@@ -1,0 +1,15 @@
+# configs/config_celeba_marginal.yaml
+# Main config for training marginal model on CelebA
+# Excludes all attribute combinations except (0,0,0,0) and (1,1,1,1) from training
+
+defaults:
+  - dataset: celeba_marginal  # Use marginal dataset config with held_out_combos
+  - model: generator_celeba    # generator_celeba, generator_rxrx1
+  - pl_module: default         # Lightning module
+  - train: default_celeba      # Trainer settings
+  - callbacks: checkpoint      # Checkpointing
+  - logger: wandb_celeba_marginal       # WandB Logger
+  - _self_
+
+# Override specific settings if needed
+seed: 1337

@@ -36,6 +36,9 @@ class ConditionalFidelityMetrics:
         gen_samples = self._ensure_rgb(gen_samples)
 
         # 1. Split Real Data
+        perm = torch.randperm(n, device=real_samples.device)
+        real_samples = real_samples[perm]
+        gen_samples = gen_samples[perm]  # optional; for fid_gen fairness
         mid = n // 2
         real_A = real_samples[:mid]  # Target distribution
         real_B = real_samples[mid:]  # Baseline distribution

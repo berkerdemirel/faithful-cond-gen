@@ -1,0 +1,37 @@
+# configs/dataset/celeba_marginal.yaml
+# CelebA dataset config for marginal model training
+# Excludes all attribute combinations EXCEPT (0,0,0,0) and (1,1,1,1) from training
+# These combinations are moved to validation
+
+_target_: faithful_cond_gen.data.celeba.CelebaDataConfig
+
+cache_dir: /mnt/pvc/AutoSync/data/celeba_cache
+image_size: [224, 224]
+augment_train: true
+normalize: true
+batch_size: 16
+num_workers: 4
+rare_threshold: 50
+selected_attrs: null  # Uses default: Male, Smiling, Blond_Hair, Eyeglasses
+
+# Held-out combinations: all 2^4=16 combinations EXCEPT (0,0,0,0) and (1,1,1,1)
+# Format: [Male, Smiling, Blond_Hair, Eyeglasses]
+# These will be removed from training and added to validation
+held_out_combos:
+  - [0, 0, 0, 1]  # No Male, No Smiling, No Blond, Eyeglasses
+  - [0, 0, 1, 0]  # No Male, No Smiling, Blond, No Eyeglasses
+  - [0, 0, 1, 1]  # No Male, No Smiling, Blond, Eyeglasses
+  - [0, 1, 0, 0]  # No Male, Smiling, No Blond, No Eyeglasses
+  - [0, 1, 0, 1]  # No Male, Smiling, No Blond, Eyeglasses
+  - [0, 1, 1, 0]  # No Male, Smiling, Blond, No Eyeglasses
+  - [0, 1, 1, 1]  # No Male, Smiling, Blond, Eyeglasses
+  - [1, 0, 0, 0]  # Male, No Smiling, No Blond, No Eyeglasses
+  - [1, 0, 0, 1]  # Male, No Smiling, No Blond, Eyeglasses
+  - [1, 0, 1, 0]  # Male, No Smiling, Blond, No Eyeglasses
+  - [1, 0, 1, 1]  # Male, No Smiling, Blond, Eyeglasses
+  - [1, 1, 0, 0]  # Male, Smiling, No Blond, No Eyeglasses
+  - [1, 1, 0, 1]  # Male, Smiling, No Blond, Eyeglasses
+  - [1, 1, 1, 0]  # Male, Smiling, Blond, No Eyeglasses
+  # Keeping in training:
+  # [0, 0, 0, 0]  # No Male, No Smiling, No Blond, No Eyeglasses
+  # [1, 1, 1, 1]  # Male, Smiling, Blond, Eyeglasses
