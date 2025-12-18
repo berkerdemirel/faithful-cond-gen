@@ -29,6 +29,7 @@ dependencies = [
   "omegaconf",
   "einops",
   "datasets",
+  "open_clip_torch",
 
   # config / hydra
   "hydra-core",

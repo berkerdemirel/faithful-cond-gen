@@ -21,7 +21,9 @@ def rescale_intensity(
     arr: torch.Tensor, bounds: Tuple[float, float] = (0.5, 99.5), out_range=(0.0, 1.0)
 ) -> torch.Tensor:
     """Percentile-based contrast stretching per image."""
-    arr = arr.float() / 255
+    if arr.min() >= 0 and arr.max() > 1.0 + 1e-3:
+        arr = arr.float() / 255.0
+    # arr = arr.float() / 255
     sample = arr.flatten()[::100]
     percentiles = torch.quantile(
         sample, torch.tensor([bounds[0] / 100.0, bounds[1] / 100.0])
