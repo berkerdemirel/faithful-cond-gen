@@ -1,0 +1,11 @@
+# configs/cache_celeba.yaml
+defaults:
+  - dataset: celeba  # Inherits settings from configs/dataset/celeba.yaml
+  - _self_
+
+encoder_name: dinov3  # Default encoder for this experiment
+
+dataset:
+  batch_size: 64      # Higher batch size for faster inference
+  num_workers: 8
+  augment_train: false # CRITICAL: Disable random flips/crops for ground truth feature bank

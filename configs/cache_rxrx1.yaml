@@ -1,0 +1,11 @@
+# configs/cache_rxrx1.yaml
+defaults:
+  - dataset: rxrx1   # Inherits settings from configs/dataset/rxrx1.yaml
+  - _self_
+
+encoder_name: openphenom # Default encoder for RxRx1
+
+dataset:
+  batch_size: 32      # Adjust based on GPU memory (OpenPhenom uses 512x512)
+  num_workers: 8
+  augment_train: false
