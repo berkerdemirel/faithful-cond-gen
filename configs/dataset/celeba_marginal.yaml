@@ -18,20 +18,24 @@ selected_attrs: null  # Uses default: Male, Smiling, Blond_Hair, Eyeglasses
 # Format: [Male, Smiling, Blond_Hair, Eyeglasses]
 # These will be removed from training and added to validation
 held_out_combos:
-  - [0, 0, 0, 1]  # No Male, No Smiling, No Blond, Eyeglasses
-  - [0, 0, 1, 0]  # No Male, No Smiling, Blond, No Eyeglasses
   - [0, 0, 1, 1]  # No Male, No Smiling, Blond, Eyeglasses
-  - [0, 1, 0, 0]  # No Male, Smiling, No Blond, No Eyeglasses
   - [0, 1, 0, 1]  # No Male, Smiling, No Blond, Eyeglasses
   - [0, 1, 1, 0]  # No Male, Smiling, Blond, No Eyeglasses
   - [0, 1, 1, 1]  # No Male, Smiling, Blond, Eyeglasses
-  - [1, 0, 0, 0]  # Male, No Smiling, No Blond, No Eyeglasses
   - [1, 0, 0, 1]  # Male, No Smiling, No Blond, Eyeglasses
   - [1, 0, 1, 0]  # Male, No Smiling, Blond, No Eyeglasses
   - [1, 0, 1, 1]  # Male, No Smiling, Blond, Eyeglasses
   - [1, 1, 0, 0]  # Male, Smiling, No Blond, No Eyeglasses
   - [1, 1, 0, 1]  # Male, Smiling, No Blond, Eyeglasses
   - [1, 1, 1, 0]  # Male, Smiling, Blond, No Eyeglasses
+  - [1, 1, 1, 1]  # Male, Smiling, Blond, Eyeglasses
   # Keeping in training:
   # [0, 0, 0, 0]  # No Male, No Smiling, No Blond, No Eyeglasses
-  # [1, 1, 1, 1]  # Male, Smiling, Blond, Eyeglasses
+  # [0, 0, 0, 1]  # No Male, No Smiling, No Blond, Eyeglasses
+  # [0, 1, 0, 0]  # No Male, Smiling, No Blond, No Eyeglasses
+  # [0, 0, 1, 0]  # No Male, No Smiling, Blond, No Eyeglasses
+  # [1, 0, 0, 0]  # Male, No Smiling, No Blond, No Eyeglasses
+
+
+
+

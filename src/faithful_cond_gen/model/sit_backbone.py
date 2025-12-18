@@ -333,14 +333,15 @@ class SiT(nn.Module):
             assert attr_ids.size(1) == len(
                 self.attr_embedders
             ), f"Expected {len(self.attr_embedders)} factors, got {attr_ids.size(1)}"
-
+            attr_embs = 0
             for j, embedder in enumerate(self.attr_embedders):
                 labels_j = attr_ids[:, j]
                 emb_j = embedder(
                     labels_j,
                     self.training,
                 )  # (B, D)
-                c = c + emb_j
+                attr_embs = attr_embs + emb_j
+            c = c + attr_embs * (1.0 / math.sqrt(len(self.attr_embedders)))
 
         for i, block in enumerate(self.blocks):
             x = block(x, c)  # (N, T, D)
