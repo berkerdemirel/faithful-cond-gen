@@ -1,0 +1,19 @@
+defaults:
+  - dataset: celeba       # Override at CLI
+  - model: generator_celeba # Override at CLI
+  - _self_
+
+# Path to your trained model
+# ckpt_path: "/mnt/pvc/faithful-cond-gen/outputs/faithful-cond-gen/ekg1mfky/checkpoints/celeba_fullmodel_epoch_279-step_355880-rfid_1.1118.ckpt"
+ckpt_path: "/mnt/pvc/faithful-cond-gen/outputs/faithful-cond-gen/ob8i6pp8/checkpoints/celeba_marginalmodel_epoch_317-step_285882-rfid_1.4006.ckpt"
+
+# Output
+# output_dir: "outputs/generated_celeba_fullmodel"
+output_dir: "outputs/generated_celeba_marginalmodel"
+
+# Generation params
+samples_per_condition: 1000 # 1000 for CelebA, 50 for RxRx1
+batch_size: 128
+
+# DDP
+num_gpus: 8

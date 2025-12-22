@@ -1,0 +1,18 @@
+defaults:
+  - dataset: rxrx1       # Override at CLI
+  - model: generator_rxrx1 # Override at CLI
+  - _self_
+
+# Path to your trained model
+# ckpt_path: "/mnt/pvc/faithful-cond-gen/outputs/faithful-cond-gen/hemmlww5/checkpoints/rxrx1_fullmodel_epoch_085-step_392934-rfid_0.9122.ckpt"
+ckpt_path: "/mnt/pvc/faithful-cond-gen/outputs/faithful-cond-gen/uz1n1q3l/checkpoints/rxrx1_marginal_model_epoch_093-step_388784-rfid_2.2607.ckpt"
+
+# Output
+# output_dir: "outputs/generated_rxrx1_fullmodel"
+output_dir: "outputs/generated_rxrx1_marginalmodel"
+# Generation params
+samples_per_condition: 100 # 1000 for CelebA, 100 for RxRx1
+batch_size: 16
+
+# DDP
+num_gpus: 8
