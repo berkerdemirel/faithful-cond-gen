@@ -27,7 +27,9 @@ def setup_ddp():
         dist.init_process_group("nccl")
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
-        torch.cuda.set_device(rank)
+        # Use LOCAL_RANK for device selection (multi-node compatible)
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        torch.cuda.set_device(local_rank)
         return rank, world_size, True
     else:
         return 0, 1, False
@@ -170,8 +172,12 @@ def main(cfg: DictConfig):
             elif data_type == "rxrx1":
                 # Save Batch Tensors (Preserve 6 channels, faster IO)
                 # Filename: cell0_sirna10_batch0.pt
-                fname = f"{signature}_batch{batch_idx}.pt"
-                torch.save(images.cpu(), os.path.join(img_dir, fname))
+                # fname = f"{signature}_batch{batch_idx}.pt"
+                # torch.save(images.cpu(), os.path.join(img_dir, fname))
+                for i in range(current_bs):
+                    pil_img = images[i]
+                    fname = f"{signature}_{generated_count + i}.pt"
+                    torch.save(pil_img.cpu(), os.path.join(img_dir, fname))
 
             generated_count += current_bs
             batch_idx += 1
