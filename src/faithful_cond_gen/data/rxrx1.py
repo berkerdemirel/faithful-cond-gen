@@ -190,6 +190,9 @@ CELL_TYPE_TO_LABEL: Dict[str, int] = {
 }
 LABEL_TO_CELL_TYPE: Dict[int, str] = {v: k for k, v in CELL_TYPE_TO_LABEL.items()}
 
+# Canonical ordering of conditioning keys (used for stacking into tensors)
+RXRX1_COND_KEYS: List[str] = ["cell_type_id", "sirna_id"]
+
 
 @dataclass
 class RxRx1DatasetConfig:
@@ -307,6 +310,7 @@ class RxRx1Dataset(Dataset):
         sirna_id = torch.tensor(self.sirna_ids[idx], dtype=torch.long)
         cell_type_id = torch.tensor(self.cell_type_ids[idx], dtype=torch.long)
 
+        # Use canonical key order defined in RXRX1_COND_KEYS
         conditioning = {
             "cond": {
                 "cell_type_id": cell_type_id,

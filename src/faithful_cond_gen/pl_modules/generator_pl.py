@@ -77,17 +77,18 @@ class GeneratorPL(pl.LightningModule):
         images, conditioning = batch
 
         # Agnostic Unpacking:
-        # We assume the dataset __getitem__ inserted keys in the correct order.
-        # e.g. RxRx1: {'cell_type': ..., 'sirna': ...} -> [cell_type, sirna]
-        # e.g. CelebA: {'Male': ..., 'Smiling': ...} -> [Male, Smiling]
+        # Extract conditioning dict and use canonical key ordering
         cond_dict = conditioning.get("cond")
         if cond_dict is None:
             raise ValueError("Batch missing 'cond' dict in conditioning")
 
-        # dict.values() preserves insertion order in Python 3.7+
-        cond_tensors = list(cond_dict.values())
-
-        # Stack (B,) tensors into (B, K)
+        # Get canonical key order (stored at setup time)
+        if not hasattr(self, "_cond_keys"):
+            # First batch: infer and store canonical order from dict keys
+            self._cond_keys = list(cond_dict.keys())
+        
+        # Stack conditioning values in canonical order
+        cond_tensors = [cond_dict[k] for k in self._cond_keys]
         cond_ids = torch.stack(cond_tensors, dim=1)
 
         return images, cond_ids
@@ -265,7 +266,8 @@ class GeneratorPL(pl.LightningModule):
             )
 
             _, first_sample_cond = ds_subset[0]
-            cond_vals = list(first_sample_cond["cond"].values())
+            # Use canonical key order (same as training)
+            cond_vals = [first_sample_cond["cond"][k] for k in self._cond_keys]
             cond_tensor = torch.stack(cond_vals).to(self.device)
 
             self.val_buffer[dict_key] = {

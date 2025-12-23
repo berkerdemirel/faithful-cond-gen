@@ -19,6 +19,8 @@ COMPOSITION_ATTRS_DEFAULT: List[str] = [
     "Eyeglasses",
 ]
 
+# Note: CelebA uses selected_attrs as canonical ordering (set at DataModule init)
+
 
 @dataclass
 class CelebaDataConfig:
@@ -78,6 +80,7 @@ class CelebaDataset(Dataset):
 
         image = self.transform(image)
 
+        # Build cond_dict in canonical order (self.selected_attrs)
         cond_dict = {}
         for name in self.selected_attrs:
             # Convert float 0.0/1.0 -> long 0/1

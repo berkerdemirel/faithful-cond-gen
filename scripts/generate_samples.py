@@ -137,17 +137,6 @@ def main(cfg: DictConfig):
         signature = cond_data["signature"]
         data_type = cond_data["type"]
 
-        # Skip if already done (simple file check)
-        # For RxRx1 we check for the last batch file, for CelebA the last image
-        # This is basic resume capability
-        expected_last_fname = (
-            f"{signature}_{samples_per_cond-1}.png"
-            if data_type == "celeba"
-            else f"{signature}_batch{int(samples_per_cond/batch_size)}.pt"
-        )
-        if os.path.exists(os.path.join(img_dir, expected_last_fname)):
-            continue
-
         generated_count = 0
         batch_idx = 0
 
