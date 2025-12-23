@@ -160,12 +160,9 @@ def adapt_batch(images: torch.Tensor, target_channels: int) -> torch.Tensor:
     """Converts batch to match encoder's expected channels."""
     current_channels = images.shape[1]
 
-    # Case A: RxRx1 (6ch) -> DINO/SigLIP (3ch)
+    # Case A: RxRx1 (6ch) -> DINO/SigLIP (3ch) - GPU-friendly batch conversion
     if current_channels == 6 and target_channels == 3:
-        device = images.device
-        return torch.stack([to_rgb(img.cpu()[None]).squeeze(0) for img in images]).to(
-            device
-        )
+        return to_rgb(images)
 
     # Case B: Grayscale (1ch) -> RGB (3ch)
     elif current_channels == 1 and target_channels == 3:

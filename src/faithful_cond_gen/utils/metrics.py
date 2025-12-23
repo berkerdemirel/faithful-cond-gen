@@ -12,12 +12,9 @@ class ConditionalFidelityMetrics:
         self.fid.dist_sync_on_step = False
 
     def _ensure_rgb(self, images: torch.Tensor) -> torch.Tensor:
-        """Converts (B, 6, H, W) -> (B, 3, H, W) if needed."""
+        """Converts (B, 6, H, W) -> (B, 3, H, W) if needed (GPU-friendly)."""
         if images.shape[1] == 6:
-            device = images.device
-            return torch.stack(
-                [to_rgb(img.cpu()[None]).squeeze(0) for img in images]
-            ).to(device)
+            return to_rgb(images)
         elif images.shape[1] == 1:
             return images.repeat(1, 3, 1, 1)
         return images

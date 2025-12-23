@@ -18,61 +18,105 @@ from torchvision.transforms import functional as TF
 
 
 def rescale_intensity(
-    arr: torch.Tensor, bounds: Tuple[float, float] = (0.5, 99.5), out_range=(0.0, 1.0)
+    arr: torch.Tensor,
+    bounds: Tuple[float, float] = (0.5, 99.5),
+    out_range: Tuple[float, float] = (0.0, 1.0),
 ) -> torch.Tensor:
-    """Percentile-based contrast stretching per image."""
-    if arr.min() >= 0 and arr.max() > 1.0 + 1e-3:
-        arr = arr.float() / 255.0
-    # arr = arr.float() / 255
-    sample = arr.flatten()[::100]
-    percentiles = torch.quantile(
-        sample, torch.tensor([bounds[0] / 100.0, bounds[1] / 100.0])
+    """Percentile-based contrast stretching per image (GPU-friendly, batch-compatible).
+
+    - If arr is (B,C,H,W): percentiles computed independently for each item in B,
+      over all channels/pixels (same as flatten() in old code).
+    - If arr is (C,H,W) or (H,W): treated as a single image.
+    - Uses the same subsampling scheme: flatten()[::100].
+    """
+    # Normalize shape to (B, C, H, W)
+    squeeze_b = False
+    if arr.dim() == 2:
+        arr = arr.unsqueeze(0).unsqueeze(0)
+        squeeze_b = True
+    elif arr.dim() == 3:
+        arr = arr.unsqueeze(0)
+        squeeze_b = True
+    elif arr.dim() != 4:
+        raise ValueError(f"Expected 2D/3D/4D tensor, got {tuple(arr.shape)}")
+
+    B = arr.shape[0]
+
+    # Match original scaling condition, but PER IMAGE
+    arr = arr.float()
+    arr_min = arr.amin(dim=(1, 2, 3))
+    arr_max = arr.amax(dim=(1, 2, 3))
+    need_div = (arr_min >= 0) & (arr_max > 1.0 + 1e-3)
+    if need_div.any():
+        # broadcast (B,1,1,1)
+        div = torch.where(
+            need_div, torch.full_like(arr_min, 255.0), torch.ones_like(arr_min)
+        ).view(B, 1, 1, 1)
+        arr = arr / div
+
+    # Per-image sampling: flatten()[::100]
+    flat = arr.reshape(B, -1)
+    sample = flat[:, ::100]
+
+    q = torch.tensor(
+        [bounds[0] / 100.0, bounds[1] / 100.0],
+        device=arr.device,
+        dtype=arr.dtype,
     )
-    arr = torch.clamp(arr, percentiles[0], percentiles[1])
-    arr = (arr - percentiles[0]) / (percentiles[1] - percentiles[0] + 1e-6)
+    # Per-image quantiles along the flattened dimension
+    p = torch.quantile(sample, q, dim=1)  # (2, B)
+    lo = p[0].view(B, 1, 1, 1)
+    hi = p[1].view(B, 1, 1, 1)
+
+    arr = torch.clamp(arr, lo, hi)
+    arr = (arr - lo) / (hi - lo + 1e-6)
     arr = arr * (out_range[1] - out_range[0]) + out_range[0]
+
+    if squeeze_b:
+        arr = arr.squeeze(0)
+        if arr.shape[0] == 1:
+            arr = arr.squeeze(0)
     return arr
 
 
 def to_rgb(img: torch.Tensor, dtype=torch.float32) -> torch.Tensor:
-    """Convert 6-channel Cell Painting image to RGB.
+    """Convert 6-channel Cell Painting image to RGB (GPU-friendly, batch-compatible).
 
     Expects input of shape (B, C, H, W) with C <= 6.
 
     Reference: https://github.com/recursionpharma/rxrx1-utils/blob/d34b2b0db0af1cb4fe357573bb8de76bd042b34f/rxrx/io.py#L61
     """
-    num_channels_required = 6
-    b, num_channels, length, width = img.shape  # b x c x l x w
-    prepped_img = torch.zeros(
-        b, num_channels_required, length, width, dtype=img.dtype, device=img.device
-    )
-    if num_channels < num_channels_required:
-        prepped_img[:, :num_channels, :, :] += img
-    elif num_channels > num_channels_required:
-        prepped_img += img[:, :num_channels_required, :, :]
-    else:
-        prepped_img += img
+    if img.dim() != 4:
+        raise ValueError(f"Expected (B,C,H,W), got {tuple(img.shape)}")
 
-    # fixed color map
-    red = [1, 0, 0]
-    green = [0, 1, 0]
-    blue = [0, 0, 1]
-    yellow = [1, 1, 0]
-    magenta = [1, 0, 1]
-    cyan = [0, 1, 1]
+    b, c, h, w = img.shape
+    num_channels_required = 6
+
+    # Pad/truncate to 6 channels (same behavior as original)
+    prepped = torch.zeros(
+        (b, num_channels_required, h, w), dtype=img.dtype, device=img.device
+    )
+    if c < num_channels_required:
+        prepped[:, :c].copy_(img)
+    else:
+        prepped.copy_(img[:, :num_channels_required])
+
+    # Fixed color map
     rgb_map = torch.tensor(
-        [blue, green, red, cyan, magenta, yellow],
+        [
+            [0, 0, 1],  # blue
+            [0, 1, 0],  # green
+            [1, 0, 0],  # red
+            [0, 1, 1],  # cyan
+            [1, 0, 1],  # magenta
+            [1, 1, 0],  # yellow
+        ],
         dtype=dtype,
-        device=prepped_img.device,
+        device=prepped.device,
     )
-    rgb_img: torch.FloatTensor = (
-        torch.einsum(  # type: ignore[assignment]
-            "nchw,ct->nthw",
-            prepped_img.to(dtype=dtype),
-            rgb_map,
-        )
-        / 3.0
-    )
+
+    # (B,6,H,W) x (6,3) -> (B,3,H,W)
+    rgb_img = torch.einsum("nchw,ct->nthw", prepped.to(dtype=dtype), rgb_map) / 3.0
     return rescale_intensity(rgb_img, bounds=(0.1, 99.9))
 
 
