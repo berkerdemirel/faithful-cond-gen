@@ -71,6 +71,26 @@ def compute_statistics(features):
     return mu, sigma
 
 
+def infer_conditioning_keys(metadata):
+    """Infer actual conditioning keys by excluding known auxiliary keys."""
+    # These are auxiliary metadata fields, not actual conditioning
+    EXCLUDED_KEYS = {"comp_category", "labels", "comp_cat", "category"}
+    
+    all_keys = set(metadata.keys())
+    conditioning_keys = sorted(all_keys - EXCLUDED_KEYS)
+    
+    log.info(f"Inferred conditioning keys: {conditioning_keys}")
+    if EXCLUDED_KEYS & all_keys:
+        log.info(f"Excluded auxiliary keys: {sorted(EXCLUDED_KEYS & all_keys)}")
+    
+    return conditioning_keys
+
+
+def filter_metadata(metadata, conditioning_keys):
+    """Filter metadata to only include actual conditioning keys."""
+    return {k: metadata[k] for k in conditioning_keys if k in metadata}
+
+
 def hash_condition(cond_dict):
     """Consistent hashing for grouping."""
     # Convert tensors to items
@@ -133,19 +153,27 @@ def main(cfg: DictConfig):
     val_pl = torch.load(val_path, map_location="cpu")
     gen_pl = torch.load(gen_path, map_location="cpu")
 
-    # 3. Fit Scorer
+    # 3. Infer and filter conditioning keys
+    log.info("Inferring conditioning keys from metadata...")
+    conditioning_keys = infer_conditioning_keys(train_pl["metadata"])
+    
+    train_metadata_filtered = filter_metadata(train_pl["metadata"], conditioning_keys)
+    val_metadata_filtered = filter_metadata(val_pl["metadata"], conditioning_keys)
+    gen_metadata_filtered = filter_metadata(gen_pl["metadata"], conditioning_keys)
+    
+    # 4. Fit Scorer
     log.info(f"Initializing & Fitting Scorer: {cfg.scorer._target_}")
     scorer = instantiate(cfg.scorer, device=device)
-    scorer.fit(train_pl["features"], train_pl["metadata"])
+    scorer.fit(train_pl["features"], train_metadata_filtered)
 
-    # 4. Score Samples (Global)
+    # 5. Score Samples (Global)
     log.info("Scoring Validation Set (ID)...")
-    val_scores = scorer.score(val_pl["features"], val_pl["metadata"]).cpu().numpy()
+    val_scores = scorer.score(val_pl["features"], val_metadata_filtered).cpu().numpy()
 
     log.info("Scoring Generated Set (Test)...")
-    gen_scores = scorer.score(gen_pl["features"], gen_pl["metadata"]).cpu().numpy()
+    gen_scores = scorer.score(gen_pl["features"], gen_metadata_filtered).cpu().numpy()
 
-    # 5. Compute Global OOD Metrics
+    # 6. Compute Global OOD Metrics
     # Assumption: Val is "Real/Good", Gen is "Suspect".
     # Metric checks: Can we distinguish Gen from Real Val based on faithfulness?
     # Note: If Gen is perfect, AUROC should be 0.5 (indistinguishable).
@@ -155,10 +183,11 @@ def main(cfg: DictConfig):
         f"Global Detection Metrics (Val vs Gen): AUROC={auroc:.4f}, FPR95={fpr95:.4f}"
     )
 
-    # 6. Per-Condition Analysis (Relative FID & Mean Scores)
+    # 7. Per-Condition Analysis (Relative FID & Mean Scores)
     log.info("Starting Per-Condition Analysis (FID & Ranking)...")
 
     # We need to group indices by condition for Train, Val, and Gen
+    # Use FILTERED metadata (only conditioning keys, not comp_category etc.)
     def group_indices(metadata):
         groups = {}
         N = len(next(iter(metadata.values())))
@@ -171,9 +200,9 @@ def main(cfg: DictConfig):
             groups[h].append(i)
         return groups
 
-    train_groups = group_indices(train_pl["metadata"])
-    val_groups = group_indices(val_pl["metadata"])
-    gen_groups = group_indices(gen_pl["metadata"])
+    train_groups = group_indices(train_metadata_filtered)
+    val_groups = group_indices(val_metadata_filtered)
+    gen_groups = group_indices(gen_metadata_filtered)
 
     # Intersection of conditions present in GEN (we only care about what we generated)
     conditions_to_eval = list(gen_groups.keys())
@@ -242,7 +271,7 @@ def main(cfg: DictConfig):
 
     df = pd.DataFrame(results)
 
-    # 7. Ranking Analysis
+    # 8. Ranking Analysis
     # We sort by Mean Score (Ascending, assuming low score = good)
     df_sorted = df.sort_values("mean_score", ascending=True)
 
@@ -255,7 +284,7 @@ def main(cfg: DictConfig):
         spearman = corr
         log.info(f"Spearman Correlation (Score vs RelFID): {spearman:.4f}")
 
-    # 8. Save
+    # 9. Save
     os.makedirs(os.path.dirname(cfg.output_path), exist_ok=True)
 
     # Save CSV
