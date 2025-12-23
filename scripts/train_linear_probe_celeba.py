@@ -112,7 +112,7 @@ def main():
     parser.add_argument(
         "--dataset",
         type=str,
-        required=True,
+        default="celeba",
         help="Dataset name (e.g., celeba, rxrx1)",
     )
     parser.add_argument(

@@ -1,147 +1,433 @@
-"""Train linear classifiers on cached RxRx1 features to evaluate feature quality."""
+#!/usr/bin/env python3
+"""
+Train linear probes on cached RxRx1 features (PyTorch single-layer softmax classifier).
+
+- One probe per attribute (e.g., cell_type_id, sirna_id)
+- Model: nn.Linear(D, C) with softmax CE loss
+- Standardize features using train mean/std (important for stable optimization)
+- Early stopping on val loss (patience)
+- Evaluates on train/val + optionally generated_full / generated_marginal
+"""
 
 import argparse
+import random
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-from sklearn.preprocessing import label_binarize
+import torch.nn as nn
+import torch.nn.functional as F
+from sklearn.metrics import accuracy_score, f1_score
 
 
+def set_seed(seed: int):
+    """Set seed for reproducibility across all random number generators."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Make CUDA operations deterministic (may impact performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# --------------------------
+# I/O
+# --------------------------
 def load_cached_features(cache_path: Path):
-    """Load cached features and metadata."""
     train_path = cache_path / "train_features.pt"
     val_path = cache_path / "val_features.pt"
 
     print(f"Loading features from {cache_path}")
     train_data = torch.load(train_path, weights_only=False)
     val_data = torch.load(val_path, weights_only=False)
-
     return train_data, val_data
 
 
 def load_generated_features(cache_path: Path):
-    """Load generated features and metadata."""
     features_path = cache_path / "generated_unpacked_images_features.pt"
-
     if not features_path.exists():
         return None
-
     print(f"Loading generated features from {cache_path}")
-    data = torch.load(features_path, weights_only=False)
-    return data
+    return torch.load(features_path, weights_only=False)
 
 
-def evaluate_multiclass_classifier(clf, X, y, n_classes):
-    """Evaluate a trained multiclass classifier on a dataset."""
-    # Convert to numpy if needed
-    if isinstance(X, torch.Tensor):
-        X = X.cpu().numpy()
-    if isinstance(y, torch.Tensor):
-        y = y.cpu().numpy()
+# --------------------------
+# Utils
+# --------------------------
+@torch.no_grad()
+def standardize_fit(X: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return mean, std for standardization. std clamped for numerical stability."""
+    mu = X.mean(dim=0)
+    sigma = X.std(dim=0, unbiased=False).clamp_min(1e-6)
+    return mu, sigma
 
-    # Predict
-    y_pred = clf.predict(X)
-    y_pred_proba = clf.predict_proba(X)
 
-    # Compute metrics
-    acc = accuracy_score(y, y_pred)
-    f1_macro = f1_score(y, y_pred, average="macro")
-    f1_weighted = f1_score(y, y_pred, average="weighted")
+@torch.no_grad()
+def standardize_apply(
+    X: torch.Tensor, mu: torch.Tensor, sigma: torch.Tensor
+) -> torch.Tensor:
+    return (X - mu) / sigma
 
-    # Compute AUC-ROC (one-vs-rest)
-    try:
-        y_bin = label_binarize(y, classes=range(n_classes))
-        if n_classes == 2:
-            auc = roc_auc_score(y_bin, y_pred_proba[:, 1])
+
+def to_tensor(x):
+    if isinstance(x, torch.Tensor):
+        return x
+    if isinstance(x, np.ndarray):
+        return torch.from_numpy(x)
+    if isinstance(x, list):
+        return torch.tensor(x)
+    raise TypeError(f"Unsupported type: {type(x)}")
+
+
+def filter_data_by_metadata(
+    features: torch.Tensor,
+    metadata: Dict[str, any],
+    filter_cell_types: Optional[list] = None,
+    filter_sirna_ids: Optional[list] = None,
+) -> Tuple[torch.Tensor, Dict[str, any]]:
+    """
+    Filter features and metadata based on cell_type_id and/or sirna_id.
+    Returns filtered features and metadata.
+    """
+    mask = torch.ones(features.shape[0], dtype=torch.bool)
+
+    if filter_cell_types is not None and "cell_type_id" in metadata:
+        cell_types = to_tensor(metadata["cell_type_id"])
+        cell_mask = torch.zeros_like(mask)
+        for ct in filter_cell_types:
+            cell_mask |= cell_types == ct
+        mask &= cell_mask
+        print(f"  After cell_type filter: {mask.sum().item()} samples")
+
+    if filter_sirna_ids is not None and "sirna_id" in metadata:
+        sirna_ids = to_tensor(metadata["sirna_id"])
+        sirna_mask = torch.zeros_like(mask)
+        for sid in filter_sirna_ids:
+            sirna_mask |= sirna_ids == sid
+        mask &= sirna_mask
+        print(f"  After sirna_id filter: {mask.sum().item()} samples")
+
+    if mask.sum() == features.shape[0]:
+        return features, metadata
+
+    # Apply mask
+    mask_np = mask.cpu().numpy()  # Convert to numpy for consistent indexing
+    filtered_features = features[mask]
+    filtered_metadata = {}
+    for k, v in metadata.items():
+        # Check if it's an array-like structure with the right length
+        if isinstance(v, (torch.Tensor, np.ndarray, list)):
+            try:
+                if len(v) == features.shape[0]:
+                    # Handle both torch tensors and numpy arrays
+                    if isinstance(v, torch.Tensor):
+                        filtered_metadata[k] = v[mask]
+                    elif isinstance(v, np.ndarray):
+                        filtered_metadata[k] = v[mask_np]
+                    else:  # list
+                        filtered_metadata[k] = [
+                            v[i] for i in range(len(v)) if mask_np[i]
+                        ]
+                else:
+                    # Keep as-is if length doesn't match
+                    filtered_metadata[k] = v
+            except (TypeError, IndexError):
+                # If anything goes wrong, keep the original value
+                filtered_metadata[k] = v
         else:
-            auc = roc_auc_score(y_bin, y_pred_proba, average="macro", multi_class="ovr")
-    except:
-        auc = float("nan")
+            # Not an array-like structure (e.g., scalar, string, dict)
+            filtered_metadata[k] = v
+
+    return filtered_features, filtered_metadata
+
+
+def ensure_contiguous_labels(
+    y_train: torch.Tensor,
+    y_val: torch.Tensor,
+    y_gen_full: Optional[torch.Tensor] = None,
+    y_gen_marg: Optional[torch.Tensor] = None,
+):
+    """
+    Map arbitrary integer labels to contiguous [0..C-1] using labels seen in TRAIN.
+    If val/gen contain unseen labels, they will be marked as -1 and ignored in metrics.
+    """
+    y_train = y_train.long()
+    y_val = y_val.long()
+    train_classes = torch.unique(y_train).cpu().tolist()
+    train_classes_sorted = sorted(train_classes)
+    class_to_idx = {c: i for i, c in enumerate(train_classes_sorted)}
+
+    def map_y(y: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if y is None:
+            return None
+        y = y.long().cpu()
+        mapped = torch.full_like(y, fill_value=-1)
+        # vectorized-ish mapping
+        for c, i in class_to_idx.items():
+            mapped[y == c] = i
+        return mapped
+
+    y_train_m = map_y(y_train)
+    y_val_m = map_y(y_val)
+    y_gen_full_m = map_y(y_gen_full) if y_gen_full is not None else None
+    y_gen_marg_m = map_y(y_gen_marg) if y_gen_marg is not None else None
+    n_classes = len(train_classes_sorted)
+
+    return y_train_m, y_val_m, y_gen_full_m, y_gen_marg_m, n_classes
+
+
+@torch.no_grad()
+def predict_logits_in_batches(
+    model: nn.Module, X: torch.Tensor, batch_size: int, device: torch.device
+):
+    model.eval()
+    logits_all = []
+    for i in range(0, X.shape[0], batch_size):
+        xb = X[i : i + batch_size].to(device, non_blocking=True)
+        logits_all.append(model(xb).cpu())
+    return torch.cat(logits_all, dim=0)
+
+
+@torch.no_grad()
+def compute_per_class_accuracy(
+    y_true: np.ndarray, y_pred: np.ndarray, n_classes: int
+) -> np.ndarray:
+    """Compute per-class accuracy. Returns array of shape (n_classes,) with NaN for classes without samples."""
+    per_class_acc = np.full(n_classes, np.nan)
+    for c in range(n_classes):
+        mask = y_true == c
+        if mask.sum() > 0:
+            per_class_acc[c] = (y_pred[mask] == c).mean()
+    return per_class_acc
+
+
+@torch.no_grad()
+def evaluate_probe(
+    model: nn.Module,
+    X: torch.Tensor,
+    y: torch.Tensor,
+    batch_size: int,
+    device: torch.device,
+    topk: Tuple[int, ...] = (1, 5),
+) -> Dict[str, float]:
+    """
+    y expected in [0..C-1] with possible -1 entries (ignored).
+    Returns acc, f1 macro/weighted, top-k acc, and per-class accuracies.
+    """
+    # filter ignored labels
+    mask = y >= 0
+    if mask.sum().item() == 0:
+        return {
+            "accuracy": float("nan"),
+            "f1_macro": float("nan"),
+            "f1_weighted": float("nan"),
+            "top1": float("nan"),
+            "top5": float("nan"),
+            "per_class_acc": None,
+        }
+
+    Xf = X[mask]
+    yf = y[mask].cpu().numpy()
+
+    logits = predict_logits_in_batches(model, Xf, batch_size=batch_size, device=device)
+    y_pred = logits.argmax(dim=1).cpu().numpy()
+
+    acc = accuracy_score(yf, y_pred)
+    f1_macro = f1_score(yf, y_pred, average="macro")
+    f1_weighted = f1_score(yf, y_pred, average="weighted")
+
+    # per-class accuracy
+    n_classes = logits.shape[1]
+    per_class_acc = compute_per_class_accuracy(yf, y_pred, n_classes)
+
+    # top-k
+    topk_out = {}
+    for k in topk:
+        if k <= logits.shape[1]:
+            topk_pred = torch.topk(logits, k=k, dim=1).indices.cpu().numpy()
+            hit = (topk_pred == yf[:, None]).any(axis=1).mean()
+            topk_out[f"top{k}"] = float(hit)
+        else:
+            topk_out[f"top{k}"] = float("nan")
 
     return {
         "accuracy": acc,
         "f1_macro": f1_macro,
         "f1_weighted": f1_weighted,
-        "auc_roc": auc,
+        "per_class_acc": per_class_acc,
+        **topk_out,
     }
 
 
-def train_multiclass_classifier(
-    X_train,
-    y_train,
-    X_val,
-    y_val,
-    attribute_name: str,
+def train_linear_probe(
+    X_train: torch.Tensor,
+    y_train: torch.Tensor,
+    X_val: torch.Tensor,
+    y_val: torch.Tensor,
     n_classes: int,
-    X_generated_full=None,
-    y_generated_full=None,
-    X_generated_marginal=None,
-    y_generated_marginal=None,
-):
-    """Train a multiclass classifier for a single attribute and evaluate on all datasets."""
-    # Convert to numpy if needed
-    if isinstance(X_train, torch.Tensor):
-        X_train = X_train.cpu().numpy()
-    if isinstance(y_train, torch.Tensor):
-        y_train = y_train.cpu().numpy()
+    device: torch.device,
+    *,
+    lr: float = 1e-2,
+    weight_decay: float = 1e-4,
+    batch_size: int = 4096,
+    max_epochs: int = 200,
+    patience: int = 20,
+    min_delta: float = 1e-4,
+    use_class_weights: bool = False,
+    eval_batch_size: int = 8192,
+) -> nn.Module:
+    """
+    Single-layer softmax classifier (linear probe), trained with AdamW + early stopping on val loss.
+    """
+    D = X_train.shape[1]
+    model = nn.Linear(D, n_classes, bias=True).to(device)
 
-    # Train logistic regression
-    clf = LogisticRegression(max_iter=1000, random_state=42)
-    clf.fit(X_train, y_train)
+    # optional class weights (helps if sirna is imbalanced)
+    class_weights = None
+    if use_class_weights:
+        counts = torch.bincount(y_train[y_train >= 0], minlength=n_classes).float()
+        w = counts.sum() / counts.clamp_min(1.0)
+        w = w / w.mean()
+        class_weights = w.to(device)
 
-    # Evaluate on all datasets
-    results = {}
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # Train set
-    results["train"] = evaluate_multiclass_classifier(clf, X_train, y_train, n_classes)
+    # Build index list for valid train labels
+    train_mask = y_train >= 0
+    Xtr = X_train[train_mask]
+    ytr = y_train[train_mask]
 
-    # Validation set
-    results["val"] = evaluate_multiclass_classifier(clf, X_val, y_val, n_classes)
+    val_mask = y_val >= 0
+    Xva = X_val[val_mask]
+    yva = y_val[val_mask]
 
-    # Generated full model
-    if X_generated_full is not None:
-        results["generated_full"] = evaluate_multiclass_classifier(
-            clf, X_generated_full, y_generated_full, n_classes
-        )
+    best_state = None
+    best_val = float("inf")
+    bad = 0
 
-    # Generated marginal model
-    if X_generated_marginal is not None:
-        results["generated_marginal"] = evaluate_multiclass_classifier(
-            clf, X_generated_marginal, y_generated_marginal, n_classes
-        )
+    for epoch in range(1, max_epochs + 1):
+        model.train()
 
-    return results
+        # shuffle indices
+        idx = torch.randperm(Xtr.shape[0])
+        total_loss = 0.0
+        n_seen = 0
+
+        for i in range(0, Xtr.shape[0], batch_size):
+            j = idx[i : i + batch_size]
+            xb = Xtr[j].to(device, non_blocking=True)
+            yb = ytr[j].to(device, non_blocking=True)
+
+            logits = model(xb)
+            loss = F.cross_entropy(logits, yb, weight=class_weights)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+
+            bs = xb.shape[0]
+            total_loss += float(loss.item()) * bs
+            n_seen += bs
+
+        # val loss
+        model.eval()
+        with torch.no_grad():
+            val_logits = predict_logits_in_batches(
+                model, Xva, batch_size=eval_batch_size, device=device
+            )
+            val_loss = F.cross_entropy(
+                val_logits.to(device), yva.to(device), weight=class_weights
+            ).item()
+
+        train_loss = total_loss / max(1, n_seen)
+        if epoch % 10 == 0 or epoch == 1:
+            print(
+                f"  epoch {epoch:03d} | train_loss={train_loss:.4f} | val_loss={val_loss:.4f}"
+            )
+
+        if val_loss < (best_val - min_delta):
+            best_val = val_loss
+            best_state = {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
+            bad = 0
+        else:
+            bad += 1
+            if bad >= patience:
+                print(f"  early stop (best val_loss={best_val:.4f})")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return model
 
 
+# --------------------------
+# Main
+# --------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Train linear probes on cached RxRx1 features"
+        description="Train PyTorch linear probes on cached RxRx1 features"
+    )
+    parser.add_argument("--encoder", type=str, required=True)
+    parser.add_argument("--feature_cache_root", type=str, default="feature_cache")
+    parser.add_argument("--skip_generated", action="store_true")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+
+    # training hyperparams
+    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--batch_size", type=int, default=4096)
+    parser.add_argument("--max_epochs", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--min_delta", type=float, default=1e-4)
+    parser.add_argument("--use_class_weights", action="store_true")
+
+    # siRNA-specific hyperparams (overrides defaults for sirna_id)
+    parser.add_argument(
+        "--sirna_lr",
+        type=float,
+        default=None,
+        help="Learning rate for siRNA (default: use --lr)",
     )
     parser.add_argument(
-        "--encoder",
-        type=str,
-        required=True,
-        help="Encoder name (e.g., dinov2, dinov3, mae, bioclip, openphenom)",
+        "--sirna_weight_decay",
+        type=float,
+        default=None,
+        help="Weight decay for siRNA (default: use --weight_decay)",
+    )
+
+    # filtering options
+    parser.add_argument(
+        "--filter_cell_types",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Filter to specific cell type IDs (space-separated list, e.g., --filter_cell_types 0 1 2)",
     )
     parser.add_argument(
-        "--feature_cache_root",
-        type=str,
-        default="feature_cache",
-        help="Root directory for cached features (default: feature_cache)",
+        "--filter_sirna_ids",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Filter to specific siRNA IDs (space-separated list, e.g., --filter_sirna_ids 10 20 30)",
     )
-    parser.add_argument(
-        "--skip_generated",
-        action="store_true",
-        help="Skip evaluation on generated samples",
-    )
+
+    # eval
+    parser.add_argument("--eval_batch_size", type=int, default=8192)
+
     args = parser.parse_args()
 
-    # Construct paths
+    # Set seed for reproducibility
+    set_seed(args.seed)
+    print(f"Random seed: {args.seed}")
+
     dataset = "rxrx1"
     feature_cache_root = Path(args.feature_cache_root)
+
     cache_path = feature_cache_root / "real_samples" / dataset / args.encoder
     generated_full_path = (
         feature_cache_root / "generated_samples" / dataset / "fullmodel" / args.encoder
@@ -158,42 +444,123 @@ def main():
     print(f"Encoder: {args.encoder}")
     print(f"Real samples path: {cache_path}")
 
-    # Load features
     train_data, val_data = load_cached_features(cache_path)
+    X_train = to_tensor(train_data["features"]).float()
+    X_val = to_tensor(val_data["features"]).float()
 
-    X_train = train_data["features"]
-    X_val = val_data["features"]
+    print(f"\nFeature dimension: {X_train.shape[1]}")
+    print(f"Train samples (before filtering): {X_train.shape[0]}")
+    print(f"Val samples (before filtering): {X_val.shape[0]}")
 
-    print(f"\nFeature dimension: {train_data['feature_dim']}")
-    print(f"Train samples: {X_train.shape[0]}")
-    print(f"Val samples: {X_val.shape[0]}")
+    # Apply filtering if requested
+    if args.filter_cell_types is not None or args.filter_sirna_ids is not None:
+        print(f"\nApplying filters:")
+        if args.filter_cell_types is not None:
+            print(f"  Cell types: {args.filter_cell_types}")
+        if args.filter_sirna_ids is not None:
+            print(f"  siRNA IDs: {args.filter_sirna_ids}")
 
-    # Load generated samples if provided
+        print(f"\nFiltering train split:")
+        X_train, train_data["metadata"] = filter_data_by_metadata(
+            X_train,
+            train_data["metadata"],
+            args.filter_cell_types,
+            args.filter_sirna_ids,
+        )
+
+        print(f"Filtering val split:")
+        X_val, val_data["metadata"] = filter_data_by_metadata(
+            X_val,
+            val_data["metadata"],
+            args.filter_cell_types,
+            args.filter_sirna_ids,
+        )
+
+        print(f"\nAfter filtering:")
+        print(f"  Train samples: {X_train.shape[0]}")
+        print(f"  Val samples: {X_val.shape[0]}")
+
     generated_full_data = None
     generated_marginal_data = None
-
     if not args.skip_generated:
         generated_full_data = load_generated_features(generated_full_path)
         if generated_full_data:
+            X_gen_full_orig = to_tensor(generated_full_data["features"]).float()
             print(
-                f"Generated (full) samples: {generated_full_data['features'].shape[0]}"
+                f"Generated (full) samples (before filtering): {X_gen_full_orig.shape[0]}"
             )
+
+            # Apply filtering to generated data
+            if args.filter_cell_types is not None or args.filter_sirna_ids is not None:
+                print(f"Filtering generated (full) split:")
+                X_gen_full_filtered, generated_full_data["metadata"] = (
+                    filter_data_by_metadata(
+                        X_gen_full_orig,
+                        generated_full_data["metadata"],
+                        args.filter_cell_types,
+                        args.filter_sirna_ids,
+                    )
+                )
+                generated_full_data["features"] = X_gen_full_filtered
+                print(f"  After filtering: {X_gen_full_filtered.shape[0]} samples")
+            else:
+                generated_full_data["features"] = X_gen_full_orig
 
         generated_marginal_data = load_generated_features(generated_marginal_path)
         if generated_marginal_data:
+            X_gen_marg_orig = to_tensor(generated_marginal_data["features"]).float()
             print(
-                f"Generated (marginal) samples: {generated_marginal_data['features'].shape[0]}"
+                f"Generated (marginal) samples (before filtering): {X_gen_marg_orig.shape[0]}"
             )
 
-    # Determine which attributes to train on
+            # Apply filtering to generated data
+            if args.filter_cell_types is not None or args.filter_sirna_ids is not None:
+                print(f"Filtering generated (marginal) split:")
+                X_gen_marg_filtered, generated_marginal_data["metadata"] = (
+                    filter_data_by_metadata(
+                        X_gen_marg_orig,
+                        generated_marginal_data["metadata"],
+                        args.filter_cell_types,
+                        args.filter_sirna_ids,
+                    )
+                )
+                generated_marginal_data["features"] = X_gen_marg_filtered
+                print(f"  After filtering: {X_gen_marg_filtered.shape[0]} samples")
+            else:
+                generated_marginal_data["features"] = X_gen_marg_orig
+
+    # Standardize features (fit on train, apply everywhere)
+    mu, sigma = standardize_fit(X_train)
+    X_train = standardize_apply(X_train, mu, sigma)
+    X_val = standardize_apply(X_val, mu, sigma)
+
+    X_gen_full = None
+    X_gen_marg = None
+    if generated_full_data is not None:
+        X_gen_full = standardize_apply(
+            to_tensor(generated_full_data["features"]).float(), mu, sigma
+        )
+    if generated_marginal_data is not None:
+        X_gen_marg = standardize_apply(
+            to_tensor(generated_marginal_data["features"]).float(), mu, sigma
+        )
+
+    # attributes
     metadata_keys = list(train_data["metadata"].keys())
-    # Exclude comp_category if present (it's an auxiliary key)
     attributes = [k for k in metadata_keys if k != "comp_category"]
 
-    print(f"\nTraining linear classifiers for: {attributes}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\nDevice: {device}")
+    print(f"Training linear probes for: {attributes}")
+    print(f"\nHyperparameters:")
+    print(f"  LR: {args.lr}, Weight Decay: {args.weight_decay}")
+    if args.sirna_lr is not None or args.sirna_weight_decay is not None:
+        print(f"  siRNA overrides: LR={args.sirna_lr}, WD={args.sirna_weight_decay}")
+    print(
+        f"  Batch Size: {args.batch_size}, Max Epochs: {args.max_epochs}, Patience: {args.patience}"
+    )
     print("=" * 80)
 
-    # Train classifiers for each attribute
     all_results = {}
 
     for attr in attributes:
@@ -201,245 +568,170 @@ def main():
             print(f"Warning: {attr} not found in metadata, skipping")
             continue
 
-        # Get labels
-        y_train = train_data["metadata"][attr]
-        y_val = val_data["metadata"][attr]
+        y_train_raw = to_tensor(train_data["metadata"][attr])
+        y_val_raw = to_tensor(val_data["metadata"][attr])
 
-        # Convert to tensor if needed
-        if isinstance(y_train, list):
-            y_train = torch.tensor(y_train)
-        if isinstance(y_val, list):
-            y_val = torch.tensor(y_val)
-
-        # Determine number of classes
-        n_classes = len(torch.unique(y_train))
-
-        # Get generated labels if available
-        y_generated_full = None
-        X_generated_full = None
+        y_gen_full_raw = None
+        y_gen_marg_raw = None
         if generated_full_data is not None and attr in generated_full_data["metadata"]:
-            y_generated_full = generated_full_data["metadata"][attr]
-            X_generated_full = generated_full_data["features"]
-            if isinstance(y_generated_full, list):
-                y_generated_full = torch.tensor(y_generated_full)
-
-        y_generated_marginal = None
-        X_generated_marginal = None
+            y_gen_full_raw = to_tensor(generated_full_data["metadata"][attr])
         if (
             generated_marginal_data is not None
             and attr in generated_marginal_data["metadata"]
         ):
-            y_generated_marginal = generated_marginal_data["metadata"][attr]
-            X_generated_marginal = generated_marginal_data["features"]
-            if isinstance(y_generated_marginal, list):
-                y_generated_marginal = torch.tensor(y_generated_marginal)
+            y_gen_marg_raw = to_tensor(generated_marginal_data["metadata"][attr])
 
-        print(f"\nTraining classifier for: {attr} ({n_classes} classes)")
+        # map labels to contiguous indices based on TRAIN classes
+        y_train, y_val, y_gen_full, y_gen_marg, n_classes = ensure_contiguous_labels(
+            y_train_raw, y_val_raw, y_gen_full_raw, y_gen_marg_raw
+        )
 
-        # For siRNA, we need to train per-class binary classifiers
+        print(f"\n[{attr}] classes (train): {n_classes}")
+
+        # Use attribute-specific hyperparams if available
+        current_lr = args.lr
+        current_wd = args.weight_decay
         if attr == "sirna_id":
-            sirna_results = {}
-            unique_sirnas = torch.unique(y_train).tolist()
+            if args.sirna_lr is not None:
+                current_lr = args.sirna_lr
+                print(f"  Using siRNA-specific lr: {current_lr}")
+            if args.sirna_weight_decay is not None:
+                current_wd = args.sirna_weight_decay
+                print(f"  Using siRNA-specific weight_decay: {current_wd}")
 
-            print(f"  Training {len(unique_sirnas)} binary classifiers (one per siRNA)")
-            for i, sirna in enumerate(unique_sirnas):
-                # Create binary labels (one-vs-rest)
-                y_train_binary = (y_train == sirna).long()
-                y_val_binary = (y_val == sirna).long()
+        # train probe
+        model = train_linear_probe(
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            n_classes,
+            device,
+            lr=current_lr,
+            weight_decay=current_wd,
+            batch_size=args.batch_size,
+            max_epochs=args.max_epochs,
+            patience=args.patience,
+            min_delta=args.min_delta,
+            use_class_weights=args.use_class_weights,
+            eval_batch_size=args.eval_batch_size,
+        )
 
-                y_gen_full_binary = None
-                X_gen_full = None
-                if y_generated_full is not None:
-                    y_gen_full_binary = (y_generated_full == sirna).long()
-                    X_gen_full = X_generated_full
+        # evaluate
+        results = {}
+        results["train"] = evaluate_probe(
+            model, X_train, y_train, args.eval_batch_size, device
+        )
+        results["val"] = evaluate_probe(
+            model, X_val, y_val, args.eval_batch_size, device
+        )
 
-                y_gen_marg_binary = None
-                X_gen_marg = None
-                if y_generated_marginal is not None:
-                    y_gen_marg_binary = (y_generated_marginal == sirna).long()
-                    X_gen_marg = X_generated_marginal
-
-                # Train binary classifier using multiclass function with n_classes=2
-                metrics = train_multiclass_classifier(
-                    X_train,
-                    y_train_binary,
-                    X_val,
-                    y_val_binary,
-                    f"{attr}_{sirna}",
-                    2,
-                    X_gen_full,
-                    y_gen_full_binary,
-                    X_gen_marg,
-                    y_gen_marg_binary,
-                )
-                sirna_results[sirna] = metrics
-
-                if (i + 1) % 100 == 0:
-                    print(
-                        f"    Progress: {i + 1}/{len(unique_sirnas)} classifiers trained"
-                    )
-
-            all_results[attr] = sirna_results
-
-            # Print top 5 and worst 5 for validation set
-            sorted_by_acc = sorted(
-                sirna_results.items(),
-                key=lambda x: x[1]["val"]["accuracy"],
-                reverse=True,
+        if X_gen_full is not None and y_gen_full is not None:
+            results["generated_full"] = evaluate_probe(
+                model, X_gen_full, y_gen_full, args.eval_batch_size, device
+            )
+        if X_gen_marg is not None and y_gen_marg is not None:
+            results["generated_marginal"] = evaluate_probe(
+                model, X_gen_marg, y_gen_marg, args.eval_batch_size, device
             )
 
-            print(f"\n  Top 5 siRNAs (by validation accuracy):")
-            for sirna, metrics in sorted_by_acc[:5]:
+        all_results[attr] = results
+
+        # Pretty print results
+        print(f"\n  Results for [{attr}]:")
+        print(f"  {'-' * 78}")
+
+        for split_name, split_key in [
+            ("Train       ", "train"),
+            ("Val         ", "val"),
+            ("Gen-Full    ", "generated_full"),
+            ("Gen-Marginal", "generated_marginal"),
+        ]:
+            if split_key in results:
+                r = results[split_key]
                 print(
-                    f"    siRNA {sirna}: Acc={metrics['val']['accuracy']:.4f}, F1={metrics['val']['f1_macro']:.4f}, AUC={metrics['val']['auc_roc']:.4f}"
+                    f"  {split_name}: "
+                    f"Acc={r['accuracy']:.4f}  "
+                    f"F1-macro={r['f1_macro']:.4f}  "
+                    f"F1-weighted={r['f1_weighted']:.4f}  "
+                    f"Top1={r['top1']:.4f}  "
+                    f"Top5={r['top5']:.4f}"
                 )
 
-            print(f"\n  Worst 5 siRNAs (by validation accuracy):")
-            for sirna, metrics in sorted_by_acc[-5:]:
-                print(
-                    f"    siRNA {sirna}: Acc={metrics['val']['accuracy']:.4f}, F1={metrics['val']['f1_macro']:.4f}, AUC={metrics['val']['auc_roc']:.4f}"
-                )
+        # Show per-class analysis for evaluation splits
+        print(f"\n  Per-class analysis (top/bottom 5 classes by accuracy):")
+        for split_name, split_key in [
+            ("Val", "val"),
+            ("Gen-Full", "generated_full"),
+            ("Gen-Marginal", "generated_marginal"),
+        ]:
+            if split_key in results and results[split_key]["per_class_acc"] is not None:
+                per_class = results[split_key]["per_class_acc"]
+                valid_mask = ~np.isnan(per_class)
 
-            # Compute average metrics
-            avg_val_acc = np.mean(
-                [m["val"]["accuracy"] for m in sirna_results.values()]
-            )
-            avg_val_f1 = np.mean([m["val"]["f1_macro"] for m in sirna_results.values()])
-            avg_val_auc = np.mean([m["val"]["auc_roc"] for m in sirna_results.values()])
+                if valid_mask.sum() > 0:
+                    valid_classes = np.where(valid_mask)[0]
+                    valid_accs = per_class[valid_mask]
 
-            print(f"\n  Average siRNA metrics (validation):")
-            print(
-                f"    Acc={avg_val_acc:.4f}, F1={avg_val_f1:.4f}, AUC={avg_val_auc:.4f}"
-            )
+                    # Sort by accuracy
+                    sorted_idx = np.argsort(valid_accs)
 
-        else:
-            # For cell_type_id, train a single multiclass classifier
-            metrics = train_multiclass_classifier(
-                X_train,
-                y_train,
-                X_val,
-                y_val,
-                attr,
-                n_classes,
-                X_generated_full,
-                y_generated_full,
-                X_generated_marginal,
-                y_generated_marginal,
-            )
-            all_results[attr] = metrics
+                    print(f"\n    [{split_name}]")
 
-            # Print results
-            print(
-                f"  Train - Acc: {metrics['train']['accuracy']:.4f}, F1-macro: {metrics['train']['f1_macro']:.4f}, F1-weighted: {metrics['train']['f1_weighted']:.4f}, AUC: {metrics['train']['auc_roc']:.4f}"
-            )
-            print(
-                f"  Val   - Acc: {metrics['val']['accuracy']:.4f}, F1-macro: {metrics['val']['f1_macro']:.4f}, F1-weighted: {metrics['val']['f1_weighted']:.4f}, AUC: {metrics['val']['auc_roc']:.4f}"
-            )
-            if "generated_full" in metrics:
-                print(
-                    f"  Gen-F - Acc: {metrics['generated_full']['accuracy']:.4f}, F1-macro: {metrics['generated_full']['f1_macro']:.4f}, F1-weighted: {metrics['generated_full']['f1_weighted']:.4f}, AUC: {metrics['generated_full']['auc_roc']:.4f}"
-                )
-            if "generated_marginal" in metrics:
-                print(
-                    f"  Gen-M - Acc: {metrics['generated_marginal']['accuracy']:.4f}, F1-macro: {metrics['generated_marginal']['f1_macro']:.4f}, F1-weighted: {metrics['generated_marginal']['f1_weighted']:.4f}, AUC: {metrics['generated_marginal']['auc_roc']:.4f}"
-                )
+                    # Top 5 classes
+                    top_n = min(5, len(sorted_idx))
+                    print(f"      Best classes:")
+                    for i in range(-1, -top_n - 1, -1):
+                        cls_id = valid_classes[sorted_idx[i]]
+                        acc = valid_accs[sorted_idx[i]]
+                        print(f"        Class {cls_id}: {acc:.4f}")
 
-    # Print summary
+                    # Bottom 5 classes
+                    bottom_n = min(5, len(sorted_idx))
+                    print(f"      Worst classes:")
+                    for i in range(bottom_n):
+                        cls_id = valid_classes[sorted_idx[i]]
+                        acc = valid_accs[sorted_idx[i]]
+                        print(f"        Class {cls_id}: {acc:.4f}")
+
+    # Final Summary
     print("\n" + "=" * 80)
-    print("SUMMARY")
+    print("FINAL SUMMARY")
     print("=" * 80)
 
-    # Cell type summary
-    if "cell_type_id" in all_results and not isinstance(
-        all_results["cell_type_id"], dict
-    ):
-        print("\nCell Type Classification:")
-        print("-" * 80)
-        metrics = all_results["cell_type_id"]
-        print(
-            f"  Validation - Acc: {metrics['val']['accuracy']:.4f}, F1-macro: {metrics['val']['f1_macro']:.4f}, F1-weighted: {metrics['val']['f1_weighted']:.4f}, AUC: {metrics['val']['auc_roc']:.4f}"
-        )
+    # Cell Type Summary
+    if "cell_type_id" in all_results:
+        print("\n[CELL TYPE]")
+        res = all_results["cell_type_id"]
+        for split_name, split_key in [
+            ("Train       ", "train"),
+            ("Val         ", "val"),
+            ("Gen-Full    ", "generated_full"),
+            ("Gen-Marginal", "generated_marginal"),
+        ]:
+            if split_key in res:
+                r = res[split_key]
+                print(f"  {split_name}: Acc={r['accuracy']:.4f}")
 
-        if "generated_full" in metrics:
-            print(
-                f"  Gen (Full) - Acc: {metrics['generated_full']['accuracy']:.4f}, F1-macro: {metrics['generated_full']['f1_macro']:.4f}, F1-weighted: {metrics['generated_full']['f1_weighted']:.4f}, AUC: {metrics['generated_full']['auc_roc']:.4f}"
-            )
+    # siRNA Summary
+    if "sirna_id" in all_results:
+        print("\n[SIRNA]")
+        res = all_results["sirna_id"]
+        for split_name, split_key in [
+            ("Train       ", "train"),
+            ("Val         ", "val"),
+            ("Gen-Full    ", "generated_full"),
+            ("Gen-Marginal", "generated_marginal"),
+        ]:
+            if split_key in res:
+                r = res[split_key]
+                print(
+                    f"  {split_name}: "
+                    f"Acc={r['accuracy']:.4f}  "
+                    f"Top5={r['top5']:.4f}"
+                )
 
-        if "generated_marginal" in metrics:
-            print(
-                f"  Gen (Marg) - Acc: {metrics['generated_marginal']['accuracy']:.4f}, F1-macro: {metrics['generated_marginal']['f1_macro']:.4f}, F1-weighted: {metrics['generated_marginal']['f1_weighted']:.4f}, AUC: {metrics['generated_marginal']['auc_roc']:.4f}"
-            )
-
-    # siRNA summary
-    if "sirna_id" in all_results and isinstance(all_results["sirna_id"], dict):
-        sirna_results = all_results["sirna_id"]
-
-        print("\nsiRNA Classification (Average over all siRNAs):")
-        print("-" * 80)
-
-        # Validation metrics
-        avg_val_acc = np.mean([m["val"]["accuracy"] for m in sirna_results.values()])
-        avg_val_f1 = np.mean([m["val"]["f1_macro"] for m in sirna_results.values()])
-        avg_val_auc = np.mean([m["val"]["auc_roc"] for m in sirna_results.values()])
-        print(
-            f"  Validation - Acc: {avg_val_acc:.4f}, F1-macro: {avg_val_f1:.4f}, AUC: {avg_val_auc:.4f}"
-        )
-
-        # Generated full model metrics
-        if any("generated_full" in m for m in sirna_results.values()):
-            avg_gen_full_acc = np.mean(
-                [
-                    m["generated_full"]["accuracy"]
-                    for m in sirna_results.values()
-                    if "generated_full" in m
-                ]
-            )
-            avg_gen_full_f1 = np.mean(
-                [
-                    m["generated_full"]["f1_macro"]
-                    for m in sirna_results.values()
-                    if "generated_full" in m
-                ]
-            )
-            avg_gen_full_auc = np.mean(
-                [
-                    m["generated_full"]["auc_roc"]
-                    for m in sirna_results.values()
-                    if "generated_full" in m
-                ]
-            )
-            print(
-                f"  Gen (Full) - Acc: {avg_gen_full_acc:.4f}, F1-macro: {avg_gen_full_f1:.4f}, AUC: {avg_gen_full_auc:.4f}"
-            )
-
-        # Generated marginal model metrics
-        if any("generated_marginal" in m for m in sirna_results.values()):
-            avg_gen_marg_acc = np.mean(
-                [
-                    m["generated_marginal"]["accuracy"]
-                    for m in sirna_results.values()
-                    if "generated_marginal" in m
-                ]
-            )
-            avg_gen_marg_f1 = np.mean(
-                [
-                    m["generated_marginal"]["f1_macro"]
-                    for m in sirna_results.values()
-                    if "generated_marginal" in m
-                ]
-            )
-            avg_gen_marg_auc = np.mean(
-                [
-                    m["generated_marginal"]["auc_roc"]
-                    for m in sirna_results.values()
-                    if "generated_marginal" in m
-                ]
-            )
-            print(
-                f"  Gen (Marg) - Acc: {avg_gen_marg_acc:.4f}, F1-macro: {avg_gen_marg_f1:.4f}, AUC: {avg_gen_marg_auc:.4f}"
-            )
-
-    print("=" * 80)
+    print("\n" + "=" * 80)
 
 
 if __name__ == "__main__":
