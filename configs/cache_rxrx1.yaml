@@ -4,6 +4,7 @@ defaults:
   - _self_
 
 encoder_name: openphenom # Default encoder for RxRx1
+generated_path: null  # Set to path of generated images folder, or null for real data
 
 dataset:
   batch_size: 32      # Adjust based on GPU memory (OpenPhenom uses 512x512)

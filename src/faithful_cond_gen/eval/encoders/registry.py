@@ -1,4 +1,6 @@
+import inspect
 import math
+import os
 from typing import Dict, Optional
 
 import open_clip
@@ -6,9 +8,43 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as T
 from faithful_cond_gen.eval.configs.encoder_config import EncoderConfig
+from PIL import Image
 from transformers import AutoModel, CLIPModel, SiglipVisionModel
 
 from .base import BaseEncoder
+
+
+# -----------------------------------------------------------------------------
+# Smart ToTensor that handles both PIL and Tensor inputs
+# -----------------------------------------------------------------------------
+class SmartToTensor:
+    """Converts PIL/ndarray to Tensor, but passes through if already a Tensor."""
+
+    def __call__(self, pic):
+        if isinstance(pic, torch.Tensor):
+            # Already a tensor - ensure it's float and in [0,1] range
+            if pic.dtype == torch.uint8:
+                return pic.float().div(255.0)
+            return pic.float()
+        # PIL or ndarray - use standard ToTensor
+        return T.functional.to_tensor(pic)
+
+
+def _hf_auth_kwargs():
+    tok = os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")
+    if not tok:
+        return {}
+    # transformers versions differ: some accept token=, older use use_auth_token=
+    try:
+        sig = inspect.signature(AutoModel.from_pretrained)
+        if "token" in sig.parameters:
+            return {"token": tok}
+        if "use_auth_token" in sig.parameters:
+            return {"use_auth_token": tok}
+    except Exception:
+        pass
+    # safe fallback: try token first in caller with try/except if needed
+    return {"token": tok}
 
 
 # -----------------------------------------------------------------------------
@@ -19,15 +55,20 @@ class HFEncoder(BaseEncoder):
         super().__init__(config, device)
         print(f"Loading {config.name} from {config.hf_path}...")
 
+        auth = _hf_auth_kwargs()
+
         if "siglip" in config.name.lower():
-            self.backbone = SiglipVisionModel.from_pretrained(config.hf_path)
+            self.backbone = SiglipVisionModel.from_pretrained(config.hf_path, **auth)
         elif "clip" in config.name.lower() and "bio" not in config.name.lower():
-            self.backbone = CLIPModel.from_pretrained(config.hf_path).vision_model
+            self.backbone = CLIPModel.from_pretrained(
+                config.hf_path, **auth
+            ).vision_model
         else:
             self.backbone = AutoModel.from_pretrained(
                 config.hf_path,
                 trust_remote_code=config.trust_remote_code,
                 **config.model_kwargs,
+                **auth,
             )
 
         self.backbone.to(device)
@@ -64,8 +105,11 @@ class HFEncoder(BaseEncoder):
         return {"features": features}
 
     def get_transform(self):
+        """Transform that handles both PIL images and Tensors."""
         return T.Compose(
             [
+                SmartToTensor(),  # Smart converter: PIL/ndarray -> Tensor, or pass-through
+                T.ConvertImageDtype(torch.float32),  # Ensure float32
                 T.Resize(
                     self.cfg.image_size, interpolation=T.InterpolationMode.BICUBIC
                 ),
@@ -107,8 +151,11 @@ class OpenCLIPEncoder(BaseEncoder):
         return {"features": features}
 
     def get_transform(self):
+        """Transform that handles both PIL images and Tensors."""
         return T.Compose(
             [
+                SmartToTensor(),  # PIL -> Tensor [0,1], no-op if already Tensor
+                T.ConvertImageDtype(torch.float32),  # Ensure float32
                 T.Resize(
                     self.cfg.image_size, interpolation=T.InterpolationMode.BICUBIC
                 ),
@@ -131,8 +178,11 @@ class OpenPhenomWrapper(BaseEncoder):
         print(f"Loading OpenPhenom logic from {config.hf_path}...")
 
         # --- Copied/Adapted Logic Start ---
+        auth = _hf_auth_kwargs()
         self.encoder = AutoModel.from_pretrained(
-            config.hf_path, trust_remote_code=config.trust_remote_code
+            config.hf_path,
+            trust_remote_code=config.trust_remote_code,
+            **auth,
         ).to(device)
         self.encoder.eval()
 
@@ -195,13 +245,15 @@ class OpenPhenomWrapper(BaseEncoder):
         return {"features": out}
 
     def get_transform(self) -> T.Compose:
-        """
+        """Transform that handles both PIL images and Tensors.
+
         OpenPhenom performs InstanceNorm internally.
-        We only need to ensure size is 512x512.
-        Input is assumed to be raw tensor.
+        We need to ensure size is 512x512 and convert to float tensor.
         """
         return T.Compose(
             [
+                SmartToTensor(),  # Smart converter: PIL/ndarray -> Tensor, or pass-through
+                T.ConvertImageDtype(torch.float32),  # Ensure float32
                 T.Resize(
                     self.cfg.image_size, interpolation=T.InterpolationMode.NEAREST
                 ),

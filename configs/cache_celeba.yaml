@@ -4,6 +4,7 @@ defaults:
   - _self_
 
 encoder_name: dinov3  # Default encoder for this experiment
+generated_path: null  # Set to path of generated images folder, or null for real data
 
 dataset:
   batch_size: 64      # Higher batch size for faster inference
