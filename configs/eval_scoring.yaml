@@ -1,0 +1,20 @@
+defaults:
+  - _self_
+
+# INPUTS
+# Point to the DIRECTORY containing train_features.pt / val_features.pt
+real_feats_path: "./feature_cache/real_samples/celeba/dinov2/"
+  
+# Point to the specific generated file (since it's not split by train/val)
+gen_feats_path: "./feature_cache/generated_samples/celeba/fullmodel/dinov2/generated_images_features.pt"
+
+# OUTPUTS
+stats_path: "outputs/stats/celeba_dinov2_maha_stats.pt"
+output_path: "outputs/scores/celeba_dinov2_maha_scores.pt"
+
+force_fit: False
+
+scorer:
+  _target_: faithful_cond_gen.eval.scoring.mahalanobis.MahalanobisScore
+  regularization: 1e-5
+  normalize_feats: False
