@@ -7,6 +7,7 @@ real_feats_path: "./feature_cache/real_samples/celeba/dinov2/"
   
 # Point to the specific generated file (since it's not split by train/val)
 gen_feats_path: "./feature_cache/generated_samples/celeba/fullmodel/dinov2/generated_images_features.pt"
+# gen_feats_path: "./feature_cache/generated_samples/celeba/marginalmodel/dinov2/generated_images_features.pt"
 
 # OUTPUTS
 stats_path: "outputs/stats/celeba_dinov2_maha_stats.pt"

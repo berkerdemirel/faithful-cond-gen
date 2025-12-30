@@ -12,6 +12,7 @@ from faithful_cond_gen.model.ema import EMA
 from faithful_cond_gen.model.generator import GeneratorWrapper
 from faithful_cond_gen.utils.metrics import ConditionalFidelityMetrics
 from torch.optim import AdamW
+from transformers import get_scheduler
 
 
 def dist_on() -> bool:
@@ -37,6 +38,7 @@ def dprint(*args, **kwargs):
 class GeneratorPLConfig:
     lr: float = 1e-4
     weight_decay: float = 0.0
+    warmup_steps: int = 0  # REPA uses warmup
     val_target_conditions: Optional[List[Dict[str, int]]] = None
 
 
@@ -58,7 +60,22 @@ class GeneratorPL(pl.LightningModule):
 
     def configure_optimizers(self):
         params = [p for p in self.generator.parameters() if p.requires_grad]
-        return AdamW(params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+        optimizer = AdamW(params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+
+        if self.cfg.warmup_steps > 0:
+            scheduler = get_scheduler(
+                "constant_with_warmup",
+                optimizer=optimizer,
+                num_warmup_steps=self.cfg.warmup_steps,
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                },
+            }
+        return optimizer
 
     @staticmethod
     def linear_interpolant(
@@ -311,7 +328,9 @@ class GeneratorPL(pl.LightningModule):
             rec_imgs = self.generator.decode(latents)
 
             cond_batch_vis = cond_tensor.unsqueeze(0).repeat(8, 1)
-            gen_vis = self.generator.sample(cond_batch_vis, num_inference_steps=50)
+            gen_vis = self.generator.sample(
+                cond_batch_vis, num_inference_steps=50, t_cutoff=0.04
+            )
 
             # Stack for transport/logging: (24, C, H, W) -> [Real|Rec|Gen]
             vis_imgs = torch.cat([vis_real, rec_imgs, gen_vis], dim=0)
@@ -331,7 +350,7 @@ class GeneratorPL(pl.LightningModule):
             for j in range(0, n_gen, batch_size):
                 curr_batch = cond_batch_metric[j : j + batch_size]
                 gen_metric_list.append(
-                    self.generator.sample(curr_batch, num_inference_steps=25)
+                    self.generator.sample(curr_batch, num_inference_steps=25, t_cutoff=0.04)
                 )
             gen_metric_imgs = torch.cat(gen_metric_list, dim=0)
 

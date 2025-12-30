@@ -255,23 +255,65 @@ class GeneratorWrapper(nn.Module):
 
         return v_hat
 
+    @staticmethod
+    def get_score_from_velocity(
+        v: torch.Tensor,  # Predicted velocity (B, C, H, W)
+        x: torch.Tensor,  # Current state (B, C, H, W)
+        t: torch.Tensor,  # Timestep (B,)
+    ) -> torch.Tensor:
+        """Convert velocity to score for linear interpolant.
+
+        For linear path x_t = (1-t)·x_0 + t·ε:
+        - alpha(t) = 1 - t, sigma(t) = t
+        - d_alpha/dt = -1, d_sigma/dt = 1
+
+        Score ∇_x log p(x_t|c) = (-(1-t)·v - x) / t
+
+        Args:
+            v: Predicted velocity from model
+            x: Current noisy latent state
+            t: Timestep in [0, 1]
+
+        Returns:
+            Score (gradient of log probability)
+        """
+        b = t.shape[0]
+        t_b = t.view(b, 1, 1, 1)
+
+        # Linear interpolant coefficients
+        alpha_t = 1.0 - t_b
+        sigma_t = t_b
+        d_alpha_t = -1.0
+        d_sigma_t = 1.0
+
+        # REPA formula: score = (reverse_alpha_ratio * v - x) / var
+        # where reverse_alpha_ratio = alpha_t / d_alpha_t = -(1-t)
+        # and var = t² - (-(1-t)) * t = t
+        reverse_alpha_ratio = alpha_t / d_alpha_t  # -(1-t)
+        var = sigma_t.square() - reverse_alpha_ratio * d_sigma_t * sigma_t  # t
+        score = (reverse_alpha_ratio * v - x) / (var + 1e-8)
+
+        return score
+
     # ------------------------------------------------------------------
     # Sampling
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def sample(
+    def basic_sample(
         self,
         cond_ids: torch.Tensor,  # (B,) long condition indices
         num_inference_steps: int = 50,
         eta: float = 0.0,  # 0: deterministic (ODE-like), >0: Euler-Maruyama
     ) -> torch.Tensor:
-        """Euler / Euler-Maruyama sampler in latent space.
+        """Basic Euler / Euler-Maruyama sampler in latent space.
 
         Uses same linear interpolant as training:
             x_t = (1-t) x0 + t eps, t in [0,1].
         At t=1: x_1 ~ N(0,I). Integrates backward to t=0.
         Returns decoded images in [0,1].
+
+        Note: This is the old simple sampler. Use sample() for REPA-style sampling.
         """
         device = cond_ids.device
         model_dtype = next(self.parameters()).dtype
@@ -328,5 +370,107 @@ class GeneratorWrapper(nn.Module):
                 noise_std = eta * torch.sqrt(var_inc.abs().to(model_dtype))
                 if float(noise_std) > 0:
                     x = x + noise_std * torch.randn_like(x)
+
+        return self.decode(x)
+
+    @torch.no_grad()
+    def sample(
+        self,
+        cond_ids: torch.Tensor,
+        num_inference_steps: int = 250,
+        t_cutoff: float = 0.04,
+        cfg_scale: float = 1.0,
+    ) -> torch.Tensor:
+        """REPA-style two-stage sampling (default sampler).
+
+        Stage 1 (SDE): t=1.0 → t=0.04 with score-based drift correction
+        Stage 2 (ODE): t=0.04 → t=0.0 deterministic refinement
+
+        Args:
+            cond_ids: (B,) or (B, K) conditioning indices
+            num_inference_steps: Total timesteps (REPA default: 250)
+            t_cutoff: Transition point between SDE and ODE (default: 0.04)
+            cfg_scale: Classifier-free guidance scale (1.0 = no guidance)
+
+        Returns:
+            Decoded images in [0, 1]
+        """
+        device = cond_ids.device
+        model_dtype = next(self.parameters()).dtype
+        b = cond_ids.shape[0]
+
+        latent_size = self.vae.get_latent_size(self.cfg.image_size)
+
+        # Initialize from noise at t=1
+        x = torch.randn(
+            b,
+            self.vae.out_channels,
+            latent_size,
+            latent_size,
+            device=device,
+            dtype=model_dtype,
+        )
+
+        cond_ids = cond_ids.to(device=device, dtype=torch.long)
+
+        # --- Timestep Grid (REPA-style) ---
+        # Create grid from 1.0 → t_cutoff, then append 0.0
+        t_steps = torch.linspace(
+            1.0, t_cutoff, num_inference_steps, device=device, dtype=model_dtype
+        )
+        t_steps = torch.cat(
+            [t_steps, torch.tensor([0.0], device=device, dtype=model_dtype)]
+        )
+
+        # --- STAGE 1: SDE (t=1.0 → t_cutoff) ---
+        # Iterate over all but the last transition (which is t_cutoff → 0.0)
+        for k in range(len(t_steps) - 2):
+            t_cur = t_steps[k]
+            t_next = t_steps[k + 1]
+            dt = t_next - t_cur  # Negative
+
+            t_in = t_cur.expand(b)
+
+            # Predict velocity
+            v, _ = self.diffusion_backbone(x, t_in, cond_ids)
+            if v.shape[1] > x.shape[1]:
+                v = v[:, : x.shape[1]]
+
+            # Convert velocity to score
+            score = self.get_score_from_velocity(v, x, t_in)
+
+            # Diffusion coefficient for linear interpolant: g²(t) = 2t
+            diffusion_coeff = 2.0 * t_cur
+
+            # SDE drift with score correction
+            drift = v - 0.5 * diffusion_coeff * score
+
+            # Euler-Maruyama step
+            x = x + drift * dt
+
+            # Stochastic noise term: sqrt(g²(t)) * eps * sqrt(|dt|)
+            noise_std = torch.sqrt(diffusion_coeff * (-dt).abs())
+            if noise_std > 1e-8:
+                x = x + noise_std * torch.randn_like(x)
+
+        # --- STAGE 2: ODE (t_cutoff → 0.0) ---
+        # REPA: Single deterministic Euler step with score-corrected drift (NO noise)
+        t_final = torch.full((b,), t_cutoff, device=device, dtype=model_dtype)
+
+        # Predict velocity
+        v_final, _ = self.diffusion_backbone(x, t_final, cond_ids)
+        if v_final.shape[1] > x.shape[1]:
+            v_final = v_final[:, : x.shape[1]]
+
+        # Convert to score
+        score_final = self.get_score_from_velocity(v_final, x, t_final)
+
+        # Score-corrected drift (same as SDE, but no noise)
+        diffusion_coeff_final = 2.0 * t_cutoff
+        drift_final = v_final - 0.5 * diffusion_coeff_final * score_final
+
+        # Deterministic Euler step: x_0 = x_t + (-t) * drift
+        dt_final = 0.0 - t_cutoff  # = -0.04
+        x = x + dt_final * drift_final
 
         return self.decode(x)

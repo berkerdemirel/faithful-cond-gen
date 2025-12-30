@@ -464,7 +464,7 @@ def bootstrap_unconditional_stratified_metrics(
 )
 def main(cfg: DictConfig):
     # Reproducibility
-    seed = int(getattr(cfg, "seed", 123))
+    seed = int(getattr(cfg, "seed", 1337))
     seed_everything(seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"

@@ -152,7 +152,9 @@ def main(cfg: DictConfig):
             # Generate
             with torch.no_grad():
                 images = pl_module.generator.sample(
-                    cond_ids=batch_cond_ids, num_inference_steps=50, eta=0.0
+                    cond_ids=batch_cond_ids,
+                    num_inference_steps=250,  # REPA-style: higher quality
+                    t_cutoff=0.04,
                 )
                 images = torch.clamp(images, 0, 1)
 
