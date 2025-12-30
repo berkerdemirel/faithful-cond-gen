@@ -5,7 +5,7 @@
 defaults:
   - dataset: rxrx1_marginal  # Use marginal dataset config with held_out_pairs
   - model: generator_rxrx1    # generator_celeba, generator_rxrx1
-  - pl_module: default        # Lightning module
+  - pl_module: marginal       # Lightning module with condition dropout enabled
   - train: default_rxrx1      # Trainer settings
   - callbacks: checkpoint     # Checkpointing
   - logger: wandb_rxrx1_marginal       # WandB Logger

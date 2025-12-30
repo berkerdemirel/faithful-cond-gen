@@ -10,9 +10,25 @@ ckpt_path: "/mnt/pvc/faithful-cond-gen/outputs/faithful-cond-gen/uz1n1q3l/checkp
 # Output
 # output_dir: "outputs/generated_rxrx1_fullmodel"
 output_dir: "outputs/generated_rxrx1_marginalmodel"
+
 # Generation params
 samples_per_condition: 100 # 1000 for CelebA, 100 for RxRx1
 batch_size: 16
+
+# Sampling params (REPA-style + CFG)
+num_inference_steps: 250
+t_cutoff: 0.04
+
+# Classifier-Free Guidance (NEW)
+# - 1.0: No guidance (default, backward compatible)
+# - 1.5-2.5: Moderate guidance (better quality)
+# - 3.0+: Strong guidance (may over-saturate)
+cfg_scale: 1.0
+
+# Adaptive CFG (uses condition frequency statistics)
+# - false: Use fixed cfg_scale for all samples
+# - true: Automatic per-condition scaling (rare conditions get higher CFG)
+adaptive_cfg: false
 
 # DDP
 num_gpus: 8

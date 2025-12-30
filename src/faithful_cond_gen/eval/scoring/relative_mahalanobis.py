@@ -1,8 +1,10 @@
 import logging
 from typing import Any, Dict
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from sklearn.covariance import LedoitWolf
 
 from .base import ScoreFunction
 
@@ -21,10 +23,14 @@ class RelativeMahalanobisScore(ScoreFunction):
         device: str = "cuda",
         regularization: float = 1e-5,
         normalize_feats: bool = True,
+        use_shrinkage: bool = True,
+        min_samples_for_shrinkage: int = 10,
     ):
         super().__init__(device)
         self.reg = regularization
         self.normalize_feats = normalize_feats
+        self.use_shrinkage = use_shrinkage
+        self.min_samples_for_shrinkage = min_samples_for_shrinkage
 
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
         if self.normalize_feats:
@@ -77,20 +83,43 @@ class RelativeMahalanobisScore(ScoreFunction):
         mu_k = mu_k / class_counts.unsqueeze(1)
 
         # ---------------------------------------------------------
-        # 3. Compute Covariances
+        # 3. Compute Covariances with Ledoit-Wolf Shrinkage
         # ---------------------------------------------------------
         log.info("Computing Covariances...")
 
         # A. Background Covariance
-        centered_0 = features - mu_0.unsqueeze(0)
-        cov_0 = torch.matmul(centered_0.T, centered_0) / (N - 1)
+        if N >= self.min_samples_for_shrinkage and self.use_shrinkage:
+            feats_np = features.cpu().numpy()
+            lw_bg = LedoitWolf()
+            cov_0_np = lw_bg.fit(feats_np).covariance_
+            cov_0 = torch.from_numpy(cov_0_np).to(device=self.device, dtype=features.dtype)
+            shrinkage_bg = lw_bg.shrinkage_
+        else:
+            centered_0 = features - mu_0.unsqueeze(0)
+            cov_0 = torch.matmul(centered_0.T, centered_0) / (N - 1)
+            shrinkage_bg = None
+
         cov_0 = cov_0 + self.reg * torch.eye(D, device=self.device)
 
         # B. Pooled Conditional Covariance
         # Center each sample by ITS OWN class mean
         centered_cond = features - mu_k[y]
-        cov_cond = torch.matmul(centered_cond.T, centered_cond) / (N - 1)
+
+        if N >= self.min_samples_for_shrinkage and self.use_shrinkage:
+            centered_np = centered_cond.cpu().numpy()
+            lw_cond = LedoitWolf()
+            cov_cond_np = lw_cond.fit(centered_np).covariance_
+            cov_cond = torch.from_numpy(cov_cond_np).to(device=self.device, dtype=features.dtype)
+            shrinkage_cond = lw_cond.shrinkage_
+        else:
+            cov_cond = torch.matmul(centered_cond.T, centered_cond) / (N - 1)
+            shrinkage_cond = None
+
         cov_cond = cov_cond + self.reg * torch.eye(D, device=self.device)
+
+        bg_str = f"{shrinkage_bg:.4f}" if shrinkage_bg is not None else "None"
+        cond_str = f"{shrinkage_cond:.4f}" if shrinkage_cond is not None else "None"
+        log.info(f"Shrinkage: background={bg_str}, conditional={cond_str}")
 
         # ---------------------------------------------------------
         # 4. Invert & Save

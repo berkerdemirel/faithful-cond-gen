@@ -15,5 +15,20 @@ output_dir: "outputs/generated_celeba_marginalmodel"
 samples_per_condition: 1000 # 1000 for CelebA, 50 for RxRx1
 batch_size: 128
 
+# Sampling params (REPA-style + CFG)
+num_inference_steps: 250
+t_cutoff: 0.04
+
+# Classifier-Free Guidance (NEW)
+# - 1.0: No guidance (default, backward compatible)
+# - 1.5-2.5: Moderate guidance (better quality)
+# - 3.0+: Strong guidance (may over-saturate)
+cfg_scale: 1.0
+
+# Adaptive CFG (uses condition frequency statistics)
+# - false: Use fixed cfg_scale for all samples
+# - true: Automatic per-condition scaling (rare conditions get higher CFG)
+adaptive_cfg: false
+
 # DDP
 num_gpus: 8

@@ -9,6 +9,11 @@ vae_freeze: true
 
 sit_arch: "SiT-B/2"       # Use smaller patch size (2) for 64x64 img
 attr_num_classes: [2, 2, 2, 2] # Placeholder; script will auto-update this if needed
+
+# Class dropout for Classifier-Free Guidance (CFG)
+# - Drops ENTIRE condition → (UNCOND, UNCOND, ...) during training
+# - Enables guidance: v = v_uncond + cfg_scale * (v_cond - v_uncond)
+# - Different from cond_dropout_prob in pl_module (which drops individual attributes)
 class_dropout_prob: 0.1
 
 path_type: "linear"

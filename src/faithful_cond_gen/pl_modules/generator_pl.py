@@ -40,6 +40,7 @@ class GeneratorPLConfig:
     weight_decay: float = 0.0
     warmup_steps: int = 0  # REPA uses warmup
     val_target_conditions: Optional[List[Dict[str, int]]] = None
+    cond_dropout_prob: float = 0.0  # Probability of dropping individual attributes (compositional generalization)
 
 
 class GeneratorPL(pl.LightningModule):
@@ -110,8 +111,47 @@ class GeneratorPL(pl.LightningModule):
 
         return images, cond_ids
 
+    def apply_condition_dropout(self, cond_ids: torch.Tensor) -> torch.Tensor:
+        """Apply per-attribute dropout for compositional generalization.
+
+        Randomly masks individual attributes (sets to unconditional token),
+        forcing the model to learn from partial attribute information.
+
+        This is DIFFERENT from class_dropout (classifier-free guidance):
+        - class_dropout: Drops ALL attributes → (UNCOND, UNCOND)
+        - cond_dropout: Drops INDIVIDUAL attributes → (attr1, UNCOND) or (UNCOND, attr2)
+
+        Args:
+            cond_ids: (B, K) tensor where K is number of attributes
+
+        Returns:
+            (B, K) tensor with some attributes masked to unconditional token
+        """
+        p = self.cfg.cond_dropout_prob
+        if p <= 0.0:
+            return cond_ids  # Fast path: no dropout
+
+        b, k = cond_ids.shape
+
+        # For each (sample, attribute) pair, decide whether to drop it
+        # Shape: (B, K) - each attribute can be independently dropped
+        drop_mask = torch.rand(b, k, device=cond_ids.device) < p
+
+        # Get unconditional token ID for each attribute
+        # Each embedder in the SiT has num_classes as its unconditional token
+        attr_num_classes = self.generator.diffusion_backbone.attr_num_classes  # length k
+        uncond = torch.tensor(attr_num_classes, device=cond_ids.device, dtype=cond_ids.dtype)  # (k,)
+        uncond_mat = uncond.unsqueeze(0).expand(b, k)  # (b, k)
+
+        # Vectorized replacement: use unconditional token where mask is True
+        return torch.where(drop_mask, uncond_mat, cond_ids)
+
     def training_step(self, batch, batch_idx: int):
         images, cond_ids = self._unpack_batch(batch)
+
+        # --- apply condition dropout (compositional generalization) ---
+        cond_ids = self.apply_condition_dropout(cond_ids)
+
         # --- encode to latents ---
         with torch.no_grad():
             x0 = self.generator.encode(images)  # (B,4,h,w) if VAE frozen
@@ -124,6 +164,9 @@ class GeneratorPL(pl.LightningModule):
         x_t, v_tgt = self.linear_interpolant(x0, t, eps)
 
         # --- velocity prediction ---
+        # Note: class_dropout is applied inside velocity_prediction via LabelEmbedder
+        # So cond_ids here may have individual attributes masked (cond_dropout)
+        # AND the whole condition may be dropped (class_dropout) - they compose!
         v_hat = self.generator.velocity_prediction(x_t=x_t, t=t, cond_ids=cond_ids)
 
         # --- loss ---

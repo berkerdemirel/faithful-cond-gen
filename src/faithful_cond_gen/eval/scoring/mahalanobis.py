@@ -1,8 +1,10 @@
 import logging
 from typing import Any, Dict
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from sklearn.covariance import LedoitWolf
 from tqdm import tqdm
 
 from .base import ScoreFunction
@@ -21,10 +23,14 @@ class MahalanobisScore(ScoreFunction):
         device: str = "cuda",
         regularization: float = 1e-5,
         normalize_feats: bool = True,
+        use_shrinkage: bool = True,
+        min_samples_for_shrinkage: int = 2,
     ):
         super().__init__(device)
         self.reg = regularization
         self.normalize_feats = normalize_feats
+        self.use_shrinkage = use_shrinkage
+        self.min_samples_for_shrinkage = min_samples_for_shrinkage
 
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
         if self.normalize_feats:
@@ -65,20 +71,31 @@ class MahalanobisScore(ScoreFunction):
             # A. Mean
             mu = feats_sub.mean(dim=0)
 
-            # B. Covariance
-            # Center data
-            centered = feats_sub - mu.unsqueeze(0)
+            # B. Covariance with Ledoit-Wolf Shrinkage
             M_cond = feats_sub.shape[0]
 
-            if M_cond > 1:
-                # Empirical Covariance: (X^T X) / (M-1)
-                cov = torch.matmul(centered.T, centered) / (M_cond - 1)
-            else:
-                # Fallback for single sample: Identity (Score will rely purely on Euclidean dist approx)
-                cov = torch.eye(D, device=self.device)
+            if M_cond >= self.min_samples_for_shrinkage and self.use_shrinkage:
+                # Use Ledoit-Wolf shrinkage estimator (sample efficient)
+                # Convert to numpy for sklearn
+                feats_np = feats_sub.cpu().numpy()
+                lw = LedoitWolf()
+                cov_np = lw.fit(feats_np).covariance_
+                cov = torch.from_numpy(cov_np).to(device=self.device, dtype=feats_sub.dtype)
 
-            # C. Regularization (Shrinkage)
-            # Essential for high-dim features (D > M_cond)
+                # Store shrinkage coefficient for analysis
+                shrinkage_coef = lw.shrinkage_
+            elif M_cond > 1:
+                # Fallback: Empirical covariance with basic regularization
+                centered = feats_sub - mu.unsqueeze(0)
+                cov = torch.matmul(centered.T, centered) / (M_cond - 1)
+                cov = cov + self.reg * torch.eye(D, device=self.device)
+                shrinkage_coef = None
+            else:
+                # Single sample: Use identity matrix
+                cov = torch.eye(D, device=self.device)
+                shrinkage_coef = None
+
+            # Ensure numerical stability
             cov_reg = cov + self.reg * torch.eye(D, device=self.device)
 
             # D. Precision Matrix (Inverse)
@@ -94,9 +111,12 @@ class MahalanobisScore(ScoreFunction):
             self.stats["conditions"][cond_key] = {
                 "mu": mu.cpu(),
                 "cov_inv": cov_inv.cpu(),
+                "n_samples": M_cond,
+                "shrinkage": shrinkage_coef,
             }
 
             # E. Compute "Self-Scores" for normalization
+            centered = feats_sub - mu.unsqueeze(0)  # Recompute for all cases
             term1 = torch.matmul(centered, cov_inv)
             dists = torch.sum(term1 * centered, dim=1)
             all_train_scores.append(dists)
@@ -110,9 +130,21 @@ class MahalanobisScore(ScoreFunction):
         else:
             self.stats["normalization_factor"] = 1.0
 
-        log.info(
-            f"Fit complete. Normalization Factor (99.9% ID Score): {self.stats['normalization_factor']:.4f}"
-        )
+        # Log shrinkage statistics
+        shrinkage_values = [
+            s["shrinkage"] for s in self.stats["conditions"].values() if s["shrinkage"] is not None
+        ]
+        if shrinkage_values:
+            avg_shrinkage = np.mean(shrinkage_values)
+            log.info(
+                f"Fit complete. Normalization Factor: {self.stats['normalization_factor']:.4f}, "
+                f"Avg Shrinkage: {avg_shrinkage:.4f} ({len(shrinkage_values)}/{len(cond_map)} conditions)"
+            )
+        else:
+            log.info(
+                f"Fit complete. Normalization Factor: {self.stats['normalization_factor']:.4f} "
+                f"(no shrinkage used)"
+            )
 
     def score(self, features: torch.Tensor, metadata: Dict[str, Any]) -> torch.Tensor:
         """

@@ -5,7 +5,7 @@
 defaults:
   - dataset: celeba_marginal  # Use marginal dataset config with held_out_combos
   - model: generator_celeba    # generator_celeba, generator_rxrx1
-  - pl_module: default         # Lightning module
+  - pl_module: marginal        # Lightning module with condition dropout enabled
   - train: default_celeba      # Trainer settings
   - callbacks: checkpoint      # Checkpointing
   - logger: wandb_celeba_marginal       # WandB Logger

@@ -153,8 +153,10 @@ def main(cfg: DictConfig):
             with torch.no_grad():
                 images = pl_module.generator.sample(
                     cond_ids=batch_cond_ids,
-                    num_inference_steps=250,  # REPA-style: higher quality
-                    t_cutoff=0.04,
+                    num_inference_steps=cfg.get("num_inference_steps", 250),
+                    t_cutoff=cfg.get("t_cutoff", 0.04),
+                    cfg_scale=cfg.get("cfg_scale", 1.0),
+                    adaptive_cfg=cfg.get("adaptive_cfg", False),
                 )
                 images = torch.clamp(images, 0, 1)
 

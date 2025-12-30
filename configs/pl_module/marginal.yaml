@@ -1,0 +1,15 @@
+# configs/pl_module/marginal.yaml
+# PL module config for marginal models with condition dropout enabled
+_target_: faithful_cond_gen.pl_modules.generator_pl.GeneratorPLConfig
+
+lr: 1e-4
+weight_decay: 0.0
+warmup_steps: 1000  # REPA-style warmup
+
+# Condition dropout for compositional generalization
+# Marginal models benefit from higher dropout to learn attribute independence
+cond_dropout_prob: 0.2  # 20% dropout for marginal models
+
+# Optional: Fixed targets for the validation buffer logic
+# If null, it will sample random ones.
+val_target_conditions: null

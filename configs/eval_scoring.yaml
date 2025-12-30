@@ -22,3 +22,9 @@ scorer:
   _target_: faithful_cond_gen.eval.scoring.mahalanobis.MahalanobisScore
   regularization: 1e-5
   normalize_feats: False
+
+  # Ledoit-Wolf shrinkage for sample-efficient covariance estimation (NEW)
+  # - use_shrinkage: true (recommended, especially for small pools)
+  # - min_samples_for_shrinkage: minimum samples to use shrinkage (2 for MahalanobisScore)
+  use_shrinkage: true
+  min_samples_for_shrinkage: 2

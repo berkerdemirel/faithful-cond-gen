@@ -1,8 +1,10 @@
 import logging
 from typing import Any, Dict
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from sklearn.covariance import LedoitWolf
 from tqdm import tqdm
 
 from .base import ScoreFunction
@@ -30,10 +32,14 @@ class MarginalMahalanobisScore(ScoreFunction):
         device: str = "cuda",
         regularization: float = 1e-5,
         normalize_feats: bool = True,
+        use_shrinkage: bool = True,
+        min_samples_for_shrinkage: int = 2,
     ):
         super().__init__(device)
         self.reg = regularization
         self.normalize_feats = normalize_feats
+        self.use_shrinkage = use_shrinkage
+        self.min_samples_for_shrinkage = min_samples_for_shrinkage
 
     def _normalize(self, x: torch.Tensor) -> torch.Tensor:
         if self.normalize_feats:
@@ -93,16 +99,27 @@ class MarginalMahalanobisScore(ScoreFunction):
                 # Mean
                 mu = feats_sub.mean(dim=0)
 
-                # Covariance
-                centered = feats_sub - mu.unsqueeze(0)
+                # Covariance with Ledoit-Wolf Shrinkage
                 M_cond = feats_sub.shape[0]
 
-                if M_cond > 1:
+                if M_cond >= self.min_samples_for_shrinkage and self.use_shrinkage:
+                    # Use Ledoit-Wolf shrinkage
+                    feats_np = feats_sub.cpu().numpy()
+                    lw = LedoitWolf()
+                    cov_np = lw.fit(feats_np).covariance_
+                    cov = torch.from_numpy(cov_np).to(device=self.device, dtype=feats_sub.dtype)
+                    shrinkage_coef = lw.shrinkage_
+                elif M_cond > 1:
+                    # Fallback: Empirical covariance
+                    centered = feats_sub - mu.unsqueeze(0)
                     cov = torch.matmul(centered.T, centered) / (M_cond - 1)
+                    shrinkage_coef = None
                 else:
+                    # Single sample: Use identity
                     cov = torch.eye(D, device=self.device)
+                    shrinkage_coef = None
 
-                # Regularization
+                # Regularization for numerical stability
                 cov_reg = cov + self.reg * torch.eye(D, device=self.device)
 
                 try:
@@ -114,9 +131,12 @@ class MarginalMahalanobisScore(ScoreFunction):
                 self.stats["attributes"][attr_name][val] = {
                     "mu": mu.cpu(),
                     "cov_inv": cov_inv.cpu(),
+                    "n_samples": M_cond,
+                    "shrinkage": shrinkage_coef,
                 }
 
                 # Compute ID scores for this attribute value
+                centered = feats_sub - mu.unsqueeze(0)  # Recompute for all cases
                 term1 = torch.matmul(centered, cov_inv)
                 dists = torch.sum(term1 * centered, dim=1)
                 all_attr_scores.append(dists)
@@ -130,7 +150,21 @@ class MarginalMahalanobisScore(ScoreFunction):
             else:
                 self.stats["norm_factors"][attr_name] = 1.0
 
-        log.info("Marginal Fit Complete.")
+        # Log shrinkage statistics
+        all_shrinkages = []
+        for attr_name in self.stats["attributes"]:
+            for val_stats in self.stats["attributes"][attr_name].values():
+                if val_stats["shrinkage"] is not None:
+                    all_shrinkages.append(val_stats["shrinkage"])
+
+        if all_shrinkages:
+            avg_shrinkage = np.mean(all_shrinkages)
+            log.info(
+                f"Marginal Fit Complete. Avg Shrinkage: {avg_shrinkage:.4f} "
+                f"({len(all_shrinkages)} values used shrinkage)"
+            )
+        else:
+            log.info("Marginal Fit Complete (no shrinkage used)")
 
     def score(self, features: torch.Tensor, metadata: Dict[str, Any]) -> torch.Tensor:
         """
