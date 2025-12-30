@@ -13,6 +13,13 @@ from scipy import linalg
 from scipy.stats import spearmanr
 from sklearn.metrics import roc_auc_score, roc_curve
 from tqdm import tqdm
+from faithful_cond_gen.eval.viz import (
+    plot_difficulty_distribution,
+    plot_score_distributions,
+    plot_score_vs_kid,
+    plot_score_vs_pool_size,
+    save_correlation_heatmap,
+)
 
 log = logging.getLogger(__name__)
 
@@ -655,6 +662,69 @@ def main(cfg: DictConfig):
             }
         )
 
+    # 5a) Add pool-normalized scores (mitigate data scarcity bias)
+    def add_pool_normalized_scores(results_list, alpha=0.5):
+        """Add pool-size-normalized scores to mitigate data scarcity bias.
+
+        Args:
+            results_list: List of result dictionaries
+            alpha: Normalization strength (0=no norm, 1=full norm)
+
+        Returns:
+            Modified results_list with added columns
+        """
+        for res in results_list:
+            raw_score = res["mean_score"]
+            n_pool = res["n_real_pool"]
+
+            # Log-based normalization penalty
+            pool_penalty = 1.0 / (1.0 + alpha * np.log1p(n_pool))
+            res["mean_score_pool_norm"] = raw_score * pool_penalty
+
+            # Also normalize KID metrics
+            if np.isfinite(res["kid_delta_mean"]):
+                res["kid_delta_pool_norm"] = res["kid_delta_mean"] * pool_penalty
+
+        return results_list
+
+    # 5b) Compute condition difficulty metric
+    def compute_condition_difficulty(results_list):
+        """Add difficulty score based on data availability and variability.
+
+        Difficulty factors:
+        - Small training pool (harder)
+        - High baseline variability (harder)
+        - Few similar conditions (harder to interpolate)
+
+        Args:
+            results_list: List of result dictionaries
+
+        Returns:
+            Modified results_list with 'difficulty' column
+        """
+        for res in results_list:
+            n_pool = res["n_real_pool"]
+            kid_base_std = res["kid_base_std"]
+
+            # Scarcity term (log-scaled)
+            scarcity = -np.log1p(n_pool) if n_pool > 0 else 10.0
+
+            # Variability term
+            variability = kid_base_std if np.isfinite(kid_base_std) else 0.0
+
+            # Isolation term (simplified: assume isolated if pool < 50)
+            isolation = 2.0 if n_pool < 50 else 0.0
+
+            # Combined difficulty (higher = harder)
+            res["difficulty"] = scarcity + variability + isolation
+
+        return results_list
+
+    # Apply enhancements
+    pool_norm_alpha = float(getattr(cfg, "pool_norm_alpha", 0.5))
+    results = add_pool_normalized_scores(results, alpha=pool_norm_alpha)
+    results = compute_condition_difficulty(results)
+
     df = pd.DataFrame(results)
 
     # 6) Pairwise correlations between all metrics you care about
@@ -730,6 +800,37 @@ def main(cfg: DictConfig):
     }
     torch.save(payload, cfg.output_path)
     log.info(f"Saved raw payload to {cfg.output_path}")
+
+    # 7b) Generate visualizations
+
+
+    viz_dir = os.path.join(os.path.dirname(cfg.output_path), "visualizations")
+    os.makedirs(viz_dir, exist_ok=True)
+
+    # Core visualizations
+    plot_score_vs_kid(df, os.path.join(viz_dir, "score_vs_kid.png"))
+    save_correlation_heatmap(corr_df, os.path.join(viz_dir, "correlations.png"))
+
+    # Data scarcity analysis
+    plot_score_vs_pool_size(df, os.path.join(viz_dir, "score_vs_pool_size.png"))
+
+    # Difficulty distribution
+    plot_difficulty_distribution(df, os.path.join(viz_dir, "difficulty_distribution.png"))
+
+    # Score distributions by composition category (if available)
+    if "comp_category" in df.columns:
+        plot_score_distributions(df, viz_dir)
+
+    # Pool-normalized score vs KID (if normalization was applied)
+    if "mean_score_pool_norm" in df.columns:
+        plot_score_vs_kid(
+            df,
+            os.path.join(viz_dir, "score_pool_norm_vs_kid.png"),
+            score_col="mean_score_pool_norm",
+            title="Pool-Normalized Score vs Quality",
+        )
+
+    log.info(f"Visualizations saved to {viz_dir}")
 
     # 8) Display
     pd.set_option("display.max_colwidth", None)

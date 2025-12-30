@@ -15,6 +15,9 @@ output_path: "outputs/scores/celeba_dinov2_maha_scores.pt"
 
 force_fit: False
 
+# Phase 1: Pool normalization strength (0=no norm, 1=full norm)
+pool_norm_alpha: 0.5
+
 scorer:
   _target_: faithful_cond_gen.eval.scoring.mahalanobis.MahalanobisScore
   regularization: 1e-5
