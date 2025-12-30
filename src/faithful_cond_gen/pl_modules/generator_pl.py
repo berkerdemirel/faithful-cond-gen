@@ -101,8 +101,8 @@ class GeneratorPL(pl.LightningModule):
 
         # Get canonical key order (stored at setup time)
         if not hasattr(self, "_cond_keys"):
-            # First batch: infer and store canonical order from dict keys
-            self._cond_keys = list(cond_dict.keys())
+            # First batch: infer and store canonical order (sorted for consistency)
+            self._cond_keys = sorted(cond_dict.keys())
         
         # Stack conditioning values in canonical order
         cond_tensors = [cond_dict[k] for k in self._cond_keys]
@@ -216,6 +216,18 @@ class GeneratorPL(pl.LightningModule):
         self.target_keys = []
 
         dm = self.trainer.datamodule
+
+        # Initialize _cond_keys before any batch processing
+        # Get canonical key order from a sample from the training set
+        if not hasattr(self, "_cond_keys"):
+            train_ds = dm.train_dataloader().dataset
+            if len(train_ds) > 0:
+                _, first_sample_cond = train_ds[0]
+                self._cond_keys = sorted(first_sample_cond["cond"].keys())
+                print(f"[GeneratorPL] Initialized condition keys: {self._cond_keys}")
+            else:
+                # Fallback: try to infer from datamodule config
+                print("⚠️ [GeneratorPL] Warning: Could not get sample from train dataset")
 
         is_distributed = (
             self.trainer.world_size > 1 and torch.distributed.is_initialized()

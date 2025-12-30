@@ -5,6 +5,7 @@ from typing import Any, Dict
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.stats import entropy
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import LabelEncoder
 
@@ -19,8 +20,11 @@ class MarginalLinearProbeScore(ScoreFunction):
 
     Score(x) = Mean( 1 - P(target_attribute | x) )
 
-    Strict Mode: If an attribute value (class) is encountered in scoring that was
-    not seen during training, it logs a warning and TERMINATES.
+    Soft Mode (soft_mode=True): If an attribute value (class) is encountered in scoring
+    that was not seen during training, uses prediction entropy as the score instead of
+    terminating. This allows graceful handling of unseen combinations.
+
+    Strict Mode (soft_mode=False): Terminates if unseen labels are encountered.
     """
 
     def __init__(
@@ -29,11 +33,13 @@ class MarginalLinearProbeScore(ScoreFunction):
         normalize_feats: bool = True,
         C: float = 1.0,
         max_iter: int = 1000,
+        soft_mode: bool = False,
     ):
         super().__init__(device)
         self.normalize_feats = normalize_feats
         self.C = C
         self.max_iter = max_iter
+        self.soft_mode = soft_mode
 
         self.models = {}  # Attr -> LogisticRegression
         self.encoders = {}  # Attr -> LabelEncoder
@@ -72,9 +78,7 @@ class MarginalLinearProbeScore(ScoreFunction):
             clf = LogisticRegression(
                 C=self.C,
                 solver="lbfgs",
-                multi_class="multinomial",
                 max_iter=self.max_iter,
-                n_jobs=-1,
                 verbose=0,
             )
 
@@ -91,7 +95,9 @@ class MarginalLinearProbeScore(ScoreFunction):
     def score(self, features: torch.Tensor, metadata: Dict[str, Any]) -> torch.Tensor:
         """
         Scores samples based on classifier confidence.
-        TERMINATES if unseen labels are found.
+
+        In soft_mode=True: Uses entropy for unseen labels.
+        In soft_mode=False: TERMINATES if unseen labels are found.
         """
         features = features.to(self.device)
         features = self._normalize(features)
@@ -118,33 +124,41 @@ class MarginalLinearProbeScore(ScoreFunction):
             else:
                 targets = np.array(targets)
 
-            # 2. Strict Check for Unseen Labels
-            # np.unique is fast enough for checking
-            unique_targets = np.unique(targets)
+            # 2. Check for Unseen Labels
             known_classes = set(le.classes_)
 
-            unseen = [t for t in unique_targets if t not in known_classes]
-
-            if unseen:
-                msg = (
-                    f"CRITICAL: Unseen labels encountered for attribute '{attr_name}'. "
-                    f"The Linear Probe cannot score classes it hasn't seen.\n"
-                    f"Unseen values: {unseen[:10]}..."
-                )
-                log.error(msg)
-                raise ValueError(msg)
-
-            # 3. Predict & Score
+            # 3. Predict probabilities for all samples
             probs = clf.predict_proba(X)  # (N, K)
 
-            # Transform targets to indices
-            target_idx = le.transform(targets)
+            # 4. Score each sample
+            current_scores = np.zeros(N, dtype=np.float32)
 
-            # Advanced Indexing: probs[row, class_idx]
-            target_probs = probs[np.arange(N), target_idx]
+            for i in range(N):
+                target_val = targets[i]
 
-            # Score = 1 - Confidence (High prob = Low anomaly score)
-            current_scores = 1.0 - target_probs
+                if target_val in known_classes:
+                    # Seen value: Use normal scoring (1 - P(target))
+                    target_idx = le.transform([target_val])[0]
+                    target_prob = probs[i, target_idx]
+                    current_scores[i] = 1.0 - target_prob
+                else:
+                    # Unseen value
+                    if self.soft_mode:
+                        # Soft mode: Use entropy of prediction
+                        # High entropy = model is uncertain (higher score)
+                        # Normalize by log(num_classes) to get [0, 1] range
+                        ent = entropy(probs[i])
+                        max_entropy = np.log(len(le.classes_))
+                        current_scores[i] = ent / max_entropy if max_entropy > 0 else 1.0
+                    else:
+                        # Strict mode: Raise error
+                        msg = (
+                            f"CRITICAL: Unseen label '{target_val}' encountered for attribute '{attr_name}'. "
+                            f"The Linear Probe cannot score classes it hasn't seen.\n"
+                            f"Known classes: {list(le.classes_)[:10]}..."
+                        )
+                        log.error(msg)
+                        raise ValueError(msg)
 
             total_scores += current_scores
             valid_attr_counts += 1

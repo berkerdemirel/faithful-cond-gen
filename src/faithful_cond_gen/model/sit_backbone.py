@@ -312,12 +312,14 @@ class SiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
 
-    def forward(self, x, t, attr_ids=None, return_logvar=False):
+    def forward(self, x, t, attr_ids=None, return_logvar=False, force_drop_ids=None):
         """
         Forward pass of SiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
+        attr_ids: (N, K) tensor of attribute labels
+        return_logvar: (unused) for compatibility
+        force_drop_ids: (N,) tensor of 0/1 to force conditional/unconditional (for CFG)
         """
         x = (
             self.x_embedder(x) + self.pos_embed
@@ -339,6 +341,7 @@ class SiT(nn.Module):
                 emb_j = embedder(
                     labels_j,
                     self.training,
+                    force_drop_ids=force_drop_ids,  # Pass CFG dropout mask
                 )  # (B, D)
                 attr_embs = attr_embs + emb_j
             c = c + attr_embs * (1.0 / math.sqrt(len(self.attr_embedders)))

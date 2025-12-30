@@ -3,12 +3,33 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from diffusers import AutoencoderKL
-from faithful_cond_gen.model.sit_backbone import SiT_models  # you’ll put SiT code here
+from faithful_cond_gen.model.sit_backbone import SiT_models  # you'll put SiT code here
+
+
+def hash_condition(cond_ids: torch.Tensor, cond_idx: int = None) -> str:
+    """Create canonical hash from condition IDs.
+
+    Args:
+        cond_ids: (B, K) or (K,) tensor of condition IDs
+        cond_idx: If cond_ids is 2D, which sample to hash. If None, hash the whole thing.
+
+    Returns:
+        String hash suitable for dictionary lookup
+    """
+    if cond_ids.dim() == 1:
+        # Single sample
+        return str(tuple(cond_ids.tolist()))
+    elif cond_idx is not None:
+        # Extract specific sample
+        return str(tuple(cond_ids[cond_idx].tolist()))
+    else:
+        # Hash all samples (rare, but handle it)
+        return str([tuple(row.tolist()) for row in cond_ids])
 
 # -----------------------------------------------------------------------------
 # VAE backbone
@@ -208,7 +229,16 @@ class GeneratorWrapper(nn.Module):
             fused_attn=cfg.fused_attn,
         )
 
-        # if you later add alignment / projector loss, you’ll have extra flags here
+        # if you later add alignment / projector loss, you'll have extra flags here
+
+        # Adaptive CFG: store condition frequency statistics
+        self.condition_stats = {}  # condition_hash -> count
+        self.adaptive_cfg_config = {
+            "min_cfg": 1.0,  # CFG scale for common conditions
+            "max_cfg": 3.0,  # CFG scale for rare conditions
+            "threshold_common": 100,  # Conditions with >threshold_common samples
+            "threshold_rare": 10,  # Conditions with <threshold_rare samples
+        }
 
         if cfg.checkpoint is not None:
             self._load_checkpoint(cfg.checkpoint)
@@ -238,8 +268,16 @@ class GeneratorWrapper(nn.Module):
         x_t: torch.Tensor,  # (B, C, h, w) noisy latents
         t: torch.Tensor,  # (B,) float in [0,1]
         cond_ids: torch.Tensor,  # (B,K) long OR (B,) long
+        force_drop_ids: torch.Tensor = None,  # (B,) 0/1 for CFG
     ) -> torch.Tensor:
-        """Predict latent velocity v(x_t, t, cond). No noising, no loss, no VAE."""
+        """Predict latent velocity v(x_t, t, cond). No noising, no loss, no VAE.
+
+        Args:
+            x_t: Noisy latent state
+            t: Timestep
+            cond_ids: Conditioning IDs
+            force_drop_ids: Optional force dropout for CFG (0=conditional, 1=unconditional)
+        """
         if cond_ids.dim() == 1:
             cond_ids = cond_ids.unsqueeze(1)  # (B,) -> (B,1)
 
@@ -247,6 +285,7 @@ class GeneratorWrapper(nn.Module):
             x_t,
             t,
             attr_ids=cond_ids.to(device=x_t.device, dtype=torch.long),
+            force_drop_ids=force_drop_ids,
         )
 
         # If your SiT ever returns extra channels, keep the first C
@@ -296,6 +335,184 @@ class GeneratorWrapper(nn.Module):
         return score
 
     # ------------------------------------------------------------------
+    # Adaptive Classifier-Free Guidance
+    # ------------------------------------------------------------------
+
+    def load_condition_stats(self, stats_dict: Dict[str, int]):
+        """Load condition frequency statistics for adaptive CFG.
+
+        Args:
+            stats_dict: Dictionary mapping condition hash to count
+                       Keys should be string hashes from hash_condition()
+                       Example: {"(0, 0)": 150, "(0, 1)": 50, ...}
+        """
+        self.condition_stats = stats_dict
+
+        if len(self.condition_stats) > 0:
+            print(
+                f"Loaded condition stats: {len(self.condition_stats)} unique conditions, "
+                f"range [{min(self.condition_stats.values())}, {max(self.condition_stats.values())}]"
+            )
+        else:
+            print("⚠️ Warning: Loaded empty condition stats")
+
+    def compute_condition_stats_from_metadata(self, metadata):
+        """Helper to compute condition stats from dataset metadata.
+
+        Args:
+            metadata: Can be:
+                     - pandas DataFrame with condition columns
+                     - dict with condition arrays
+                     - list of condition dicts
+
+        Returns:
+            Dictionary suitable for load_condition_stats()
+        """
+        import pandas as pd
+        from collections import Counter
+
+        if isinstance(metadata, pd.DataFrame):
+            # Get condition columns (exclude metadata columns)
+            exclude_cols = ["count", "comp_category", "condition_hash", "numpy_path", "parquet_path"]
+            cond_cols = [c for c in metadata.columns if c not in exclude_cols]
+
+            # Create hashes for each row
+            hashes = []
+            for _, row in metadata.iterrows():
+                # Create condition tuple
+                cond_tuple = tuple(row[c] for c in sorted(cond_cols))
+                hashes.append(str(cond_tuple))
+
+            return dict(Counter(hashes))
+
+        elif isinstance(metadata, dict):
+            # Dict of arrays - zip them together
+            keys = sorted(metadata.keys())
+            n_samples = len(metadata[keys[0]])
+
+            hashes = []
+            for i in range(n_samples):
+                cond_tuple = tuple(metadata[k][i] for k in keys)
+                hashes.append(str(cond_tuple))
+
+            return dict(Counter(hashes))
+
+        elif isinstance(metadata, list):
+            # List of dicts
+            hashes = []
+            for cond_dict in metadata:
+                keys = sorted(cond_dict.keys())
+                cond_tuple = tuple(cond_dict[k] for k in keys)
+                hashes.append(str(cond_tuple))
+
+            return dict(Counter(hashes))
+
+        else:
+            raise ValueError(f"Unsupported metadata type: {type(metadata)}")
+
+    def compute_adaptive_cfg_scale(self, cond_ids: torch.Tensor) -> torch.Tensor:
+        """Compute per-sample CFG scale based on condition rarity.
+
+        Heuristic: Rare conditions get higher guidance to improve faithfulness.
+
+        Args:
+            cond_ids: (B,) or (B, K) conditioning indices
+
+        Returns:
+            (B,) tensor of cfg_scale values
+        """
+        if not self.condition_stats:
+            # No stats loaded, return default
+            return torch.ones(cond_ids.shape[0], device=cond_ids.device)
+
+        cfg_scales = []
+
+        for i in range(cond_ids.shape[0]):
+            # Use canonical hash function
+            cond_hash = hash_condition(cond_ids, cond_idx=i)
+            count = self.condition_stats.get(cond_hash, 0)
+
+            # Adaptive heuristic:
+            # - Common conditions (>threshold_common): min_cfg
+            # - Rare conditions (<threshold_rare): max_cfg
+            # - In between: linear interpolation
+            min_cfg = self.adaptive_cfg_config["min_cfg"]
+            max_cfg = self.adaptive_cfg_config["max_cfg"]
+            thresh_common = self.adaptive_cfg_config["threshold_common"]
+            thresh_rare = self.adaptive_cfg_config["threshold_rare"]
+
+            if count >= thresh_common:
+                cfg = min_cfg
+            elif count <= thresh_rare:
+                cfg = max_cfg
+            else:
+                # Linear interpolation
+                alpha = (count - thresh_rare) / (thresh_common - thresh_rare)
+                cfg = max_cfg + alpha * (min_cfg - max_cfg)
+
+            cfg_scales.append(cfg)
+
+        return torch.tensor(cfg_scales, device=cond_ids.device)
+
+    # ------------------------------------------------------------------
+    # Classifier-Free Guidance Helper
+    # ------------------------------------------------------------------
+
+    def apply_cfg(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        cond_ids: torch.Tensor,
+        cfg_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply classifier-free guidance to velocity prediction.
+
+        Args:
+            x: Current latent state (B, C, H, W)
+            t: Timestep (B,)
+            cond_ids: Conditioning IDs (B, K)
+            cfg_scale: Guidance scale (B,) or scalar
+
+        Returns:
+            Guided velocity (B, C, H, W)
+        """
+        b = x.shape[0]
+
+        # Convert scalar to tensor if needed
+        if isinstance(cfg_scale, (int, float)):
+            cfg_scale = torch.full((b,), cfg_scale, device=x.device, dtype=x.dtype)
+        else:
+            cfg_scale = cfg_scale.to(device=x.device, dtype=x.dtype)
+
+        # Check if we need CFG
+        needs_cfg = (cfg_scale != 1.0).any()
+
+        if not needs_cfg:
+            # No guidance needed, just predict conditional
+            v_cond, _ = self.diffusion_backbone(x, t, cond_ids)
+            if v_cond.shape[1] > x.shape[1]:
+                v_cond = v_cond[:, : x.shape[1]]
+            return v_cond
+
+        # Predict conditional velocity
+        v_cond, _ = self.diffusion_backbone(x, t, cond_ids)
+        if v_cond.shape[1] > x.shape[1]:
+            v_cond = v_cond[:, : x.shape[1]]
+
+        # Predict unconditional velocity (force all conditions to be dropped)
+        force_drop = torch.ones(b, device=x.device, dtype=torch.long)
+        v_uncond, _ = self.diffusion_backbone(x, t, cond_ids, force_drop_ids=force_drop)
+        if v_uncond.shape[1] > x.shape[1]:
+            v_uncond = v_uncond[:, : x.shape[1]]
+
+        # Apply classifier-free guidance
+        # v = v_uncond + cfg_scale * (v_cond - v_uncond)
+        cfg_scale_expanded = cfg_scale.view(b, 1, 1, 1)  # (B, 1, 1, 1) for broadcasting
+        v_guided = v_uncond + cfg_scale_expanded * (v_cond - v_uncond)
+
+        return v_guided
+
+    # ------------------------------------------------------------------
     # Sampling
     # ------------------------------------------------------------------
 
@@ -305,6 +522,7 @@ class GeneratorWrapper(nn.Module):
         cond_ids: torch.Tensor,  # (B,) long condition indices
         num_inference_steps: int = 50,
         eta: float = 0.0,  # 0: deterministic (ODE-like), >0: Euler-Maruyama
+        cfg_scale: float = 1.0,  # Classifier-free guidance scale
     ) -> torch.Tensor:
         """Basic Euler / Euler-Maruyama sampler in latent space.
 
@@ -312,6 +530,12 @@ class GeneratorWrapper(nn.Module):
             x_t = (1-t) x0 + t eps, t in [0,1].
         At t=1: x_1 ~ N(0,I). Integrates backward to t=0.
         Returns decoded images in [0,1].
+
+        Args:
+            cond_ids: Conditioning IDs (B,) or (B, K)
+            num_inference_steps: Number of sampling steps
+            eta: Noise scale (0=deterministic ODE, >0=SDE)
+            cfg_scale: Classifier-free guidance scale (1.0=no guidance)
 
         Note: This is the old simple sampler. Use sample() for REPA-style sampling.
         """
@@ -356,10 +580,8 @@ class GeneratorWrapper(nn.Module):
 
             t_in = t_cur.expand(b)
 
-            # predict velocity
-            v, _ = self.diffusion_backbone(x, t_in, cond_ids)
-            if v.shape[1] > x.shape[1]:
-                v = v[:, : x.shape[1]]
+            # Predict velocity with classifier-free guidance
+            v = self.apply_cfg(x, t_in, cond_ids, cfg_scale)
 
             # Euler ODE step
             x = x + dt * v
@@ -380,6 +602,7 @@ class GeneratorWrapper(nn.Module):
         num_inference_steps: int = 250,
         t_cutoff: float = 0.04,
         cfg_scale: float = 1.0,
+        adaptive_cfg: bool = False,
     ) -> torch.Tensor:
         """REPA-style two-stage sampling (default sampler).
 
@@ -391,10 +614,19 @@ class GeneratorWrapper(nn.Module):
             num_inference_steps: Total timesteps (REPA default: 250)
             t_cutoff: Transition point between SDE and ODE (default: 0.04)
             cfg_scale: Classifier-free guidance scale (1.0 = no guidance)
+                      If adaptive_cfg=True, this is ignored and per-sample scales are computed
+            adaptive_cfg: If True, use condition-adaptive CFG based on rarity
 
         Returns:
             Decoded images in [0, 1]
         """
+        # Compute adaptive CFG scales if requested
+        if adaptive_cfg:
+            cfg_scale_tensor = self.compute_adaptive_cfg_scale(cond_ids)
+        else:
+            cfg_scale_tensor = torch.full(
+                (cond_ids.shape[0],), cfg_scale, device=cond_ids.device
+            )
         device = cond_ids.device
         model_dtype = next(self.parameters()).dtype
         b = cond_ids.shape[0]
@@ -431,10 +663,8 @@ class GeneratorWrapper(nn.Module):
 
             t_in = t_cur.expand(b)
 
-            # Predict velocity
-            v, _ = self.diffusion_backbone(x, t_in, cond_ids)
-            if v.shape[1] > x.shape[1]:
-                v = v[:, : x.shape[1]]
+            # Predict velocity with classifier-free guidance
+            v = self.apply_cfg(x, t_in, cond_ids, cfg_scale_tensor)
 
             # Convert velocity to score
             score = self.get_score_from_velocity(v, x, t_in)
@@ -450,17 +680,15 @@ class GeneratorWrapper(nn.Module):
 
             # Stochastic noise term: sqrt(g²(t)) * eps * sqrt(|dt|)
             noise_std = torch.sqrt(diffusion_coeff * (-dt).abs())
-            if noise_std > 1e-8:
+            if noise_std.item() > 1e-8:
                 x = x + noise_std * torch.randn_like(x)
 
         # --- STAGE 2: ODE (t_cutoff → 0.0) ---
         # REPA: Single deterministic Euler step with score-corrected drift (NO noise)
         t_final = torch.full((b,), t_cutoff, device=device, dtype=model_dtype)
 
-        # Predict velocity
-        v_final, _ = self.diffusion_backbone(x, t_final, cond_ids)
-        if v_final.shape[1] > x.shape[1]:
-            v_final = v_final[:, : x.shape[1]]
+        # Predict velocity with classifier-free guidance
+        v_final = self.apply_cfg(x, t_final, cond_ids, cfg_scale_tensor)
 
         # Convert to score
         score_final = self.get_score_from_velocity(v_final, x, t_final)
