@@ -173,6 +173,9 @@ class GeneratorConfig:
 
     class_dropout_prob: float = 0.1
 
+    # Conditioning mode
+    use_per_attr_modulation: bool = False  # If True, use per-attribute adaLN (ablation)
+
     # diffusion / training settings (interpolant etc.)
     path_type: str = "linear"  # "linear" or "cosine" later, but currently linear [0,1]
     # you can extend with EDM-style sigma schedule later
@@ -225,6 +228,7 @@ class GeneratorWrapper(nn.Module):
             in_channels=sit_in_channels,
             attr_num_classes=cfg.attr_num_classes,
             class_dropout_prob=cfg.class_dropout_prob,
+            use_per_attr_modulation=cfg.use_per_attr_modulation,
             qk_norm=cfg.qk_norm,
             fused_attn=cfg.fused_attn,
         )

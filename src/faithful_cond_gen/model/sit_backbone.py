@@ -122,9 +122,13 @@ class LabelEmbedder(nn.Module):
 class SiTBlock(nn.Module):
     """
     A SiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+
+    Supports two modes:
+    1. Shared modulation (default): Single modulator for combined conditioning
+    2. Per-attribute modulation: Separate modulators for timestep + each attribute
     """
 
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_per_attr_modulation=False, n_attrs=0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(
@@ -144,14 +148,56 @@ class SiTBlock(nn.Module):
             act_layer=approx_gelu,
             drop=0,
         )
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
 
-    def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(c).chunk(6, dim=-1)
-        )
+        self.use_per_attr_modulation = use_per_attr_modulation
+
+        if use_per_attr_modulation:
+            # Separate modulators: one for timestep, one for each attribute
+            self.t_modulation = nn.Sequential(
+                nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            )
+            self.attr_modulators = nn.ModuleList([
+                nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
+                for _ in range(n_attrs)
+            ])
+        else:
+            # Shared modulation (backward compatible)
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            )
+
+    def forward(self, x, c, t_emb=None, attr_embs_list=None):
+        """
+        Args:
+            x: (N, T, D) patch embeddings
+            c: (N, D) combined conditioning (used in shared mode)
+            t_emb: (N, D) timestep embedding (used in per-attr mode)
+            attr_embs_list: List of (N, D) attribute embeddings (used in per-attr mode)
+        """
+        if self.use_per_attr_modulation:
+            # Per-attribute modulation
+            assert t_emb is not None and attr_embs_list is not None, \
+                "Per-attribute modulation requires t_emb and attr_embs_list"
+
+            # Get timestep modulation
+            t_mod = self.t_modulation(t_emb)  # (N, 6D)
+
+            # Get per-attribute modulations and sum (variance-preserving)
+            attr_mod = sum(
+                modulator(emb) for modulator, emb in zip(self.attr_modulators, attr_embs_list)
+            )
+            if len(attr_embs_list) > 0:
+                attr_mod = attr_mod / math.sqrt(len(attr_embs_list))
+
+            # Combine
+            total_mod = t_mod + attr_mod
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = total_mod.chunk(6, dim=-1)
+        else:
+            # Shared modulation (original implementation)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                self.adaLN_modulation(c).chunk(6, dim=-1)
+            )
+
         x = x + gate_msa.unsqueeze(1) * self.attn(
             modulate(self.norm1(x), shift_msa, scale_msa)
         )
@@ -167,18 +213,44 @@ class FinalLayer(nn.Module):
     The final layer of SiT.
     """
 
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(self, hidden_size, patch_size, out_channels, use_per_attr_modulation=False, n_attrs=0):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(
             hidden_size, patch_size * patch_size * out_channels, bias=True
         )
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
+        self.use_per_attr_modulation = use_per_attr_modulation
 
-    def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+        if use_per_attr_modulation:
+            self.t_modulation = nn.Sequential(
+                nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            )
+            self.attr_modulators = nn.ModuleList([
+                nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
+                for _ in range(n_attrs)
+            ])
+        else:
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+            )
+
+    def forward(self, x, c, t_emb=None, attr_embs_list=None):
+        if self.use_per_attr_modulation:
+            assert t_emb is not None and attr_embs_list is not None, \
+                "Per-attribute modulation requires t_emb and attr_embs_list"
+
+            t_mod = self.t_modulation(t_emb)
+            attr_mod = sum(
+                modulator(emb) for modulator, emb in zip(self.attr_modulators, attr_embs_list)
+            )
+            if len(attr_embs_list) > 0:
+                attr_mod = attr_mod / math.sqrt(len(attr_embs_list))
+
+            total_mod = t_mod + attr_mod
+            shift, scale = total_mod.chunk(2, dim=-1)
+        else:
+            shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
 
@@ -208,7 +280,8 @@ class SiT(nn.Module):
         z_dims=[768],
         projector_dim=2048,
         use_global_alignment=False,
-        **block_kwargs,  # fused_attn
+        use_per_attr_modulation=False,
+        **block_kwargs,  # fused_attn, qk_norm
     ):
         super().__init__()
         self.path_type = path_type
@@ -221,6 +294,7 @@ class SiT(nn.Module):
         self.z_dims = z_dims
         self.encoder_depth = encoder_depth
         self.use_global_alignment = use_global_alignment
+        self.use_per_attr_modulation = use_per_attr_modulation
 
         self.x_embedder = PatchEmbed(
             input_size, patch_size, in_channels, hidden_size, bias=True
@@ -242,7 +316,14 @@ class SiT(nn.Module):
 
         self.blocks = nn.ModuleList(
             [
-                SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs)
+                SiTBlock(
+                    hidden_size,
+                    num_heads,
+                    mlp_ratio=mlp_ratio,
+                    use_per_attr_modulation=use_per_attr_modulation,
+                    n_attrs=len(attr_num_classes),
+                    **block_kwargs
+                )
                 for _ in range(depth)
             ]
         )
@@ -250,7 +331,9 @@ class SiT(nn.Module):
         #     [build_mlp(hidden_size, projector_dim, z_dim) for z_dim in z_dims]
         # )
         self.final_layer = FinalLayer(
-            decoder_hidden_size, patch_size, self.out_channels
+            decoder_hidden_size, patch_size, self.out_channels,
+            use_per_attr_modulation=use_per_attr_modulation,
+            n_attrs=len(attr_num_classes)
         )
         self.initialize_weights()
 
@@ -288,12 +371,28 @@ class SiT(nn.Module):
 
         # Zero-out adaLN modulation layers in SiT blocks:
         for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+            if block.use_per_attr_modulation:
+                # Per-attribute modulation: zero-init all modulators
+                nn.init.constant_(block.t_modulation[-1].weight, 0)
+                nn.init.constant_(block.t_modulation[-1].bias, 0)
+                for modulator in block.attr_modulators:
+                    nn.init.constant_(modulator[-1].weight, 0)
+                    nn.init.constant_(modulator[-1].bias, 0)
+            else:
+                # Shared modulation
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        if self.final_layer.use_per_attr_modulation:
+            nn.init.constant_(self.final_layer.t_modulation[-1].weight, 0)
+            nn.init.constant_(self.final_layer.t_modulation[-1].bias, 0)
+            for modulator in self.final_layer.attr_modulators:
+                nn.init.constant_(modulator[-1].weight, 0)
+                nn.init.constant_(modulator[-1].bias, 0)
+        else:
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
@@ -328,26 +427,51 @@ class SiT(nn.Module):
 
         # timestep and class embedding
         t_embed = self.t_embedder(t)  # (N, D)
-        c = t_embed
-        if attr_ids is not None:
-            if attr_ids.dim() == 1:
-                attr_ids = attr_ids.unsqueeze(-1)  # (B,) -> (B,1)
-            assert attr_ids.size(1) == len(
-                self.attr_embedders
-            ), f"Expected {len(self.attr_embedders)} factors, got {attr_ids.size(1)}"
-            attr_embs = 0
-            for j, embedder in enumerate(self.attr_embedders):
-                labels_j = attr_ids[:, j]
-                emb_j = embedder(
-                    labels_j,
-                    self.training,
-                    force_drop_ids=force_drop_ids,  # Pass CFG dropout mask
-                )  # (B, D)
-                attr_embs = attr_embs + emb_j
-            c = c + attr_embs * (1.0 / math.sqrt(len(self.attr_embedders)))
 
-        for i, block in enumerate(self.blocks):
-            x = block(x, c)  # (N, T, D)
+        if self.use_per_attr_modulation:
+            # Per-attribute modulation mode: keep embeddings separate
+            attr_embs_list = []
+            if attr_ids is not None:
+                if attr_ids.dim() == 1:
+                    attr_ids = attr_ids.unsqueeze(-1)  # (B,) -> (B,1)
+                assert attr_ids.size(1) == len(
+                    self.attr_embedders
+                ), f"Expected {len(self.attr_embedders)} factors, got {attr_ids.size(1)}"
+
+                for j, embedder in enumerate(self.attr_embedders):
+                    labels_j = attr_ids[:, j]
+                    emb_j = embedder(
+                        labels_j,
+                        self.training,
+                        force_drop_ids=force_drop_ids,  # Pass CFG dropout mask
+                    )  # (B, D)
+                    attr_embs_list.append(emb_j)
+
+            # Pass separate embeddings to blocks
+            for i, block in enumerate(self.blocks):
+                x = block(x, c=None, t_emb=t_embed, attr_embs_list=attr_embs_list)  # (N, T, D)
+        else:
+            # Shared modulation mode (original): combine into single conditioning vector
+            c = t_embed
+            if attr_ids is not None:
+                if attr_ids.dim() == 1:
+                    attr_ids = attr_ids.unsqueeze(-1)  # (B,) -> (B,1)
+                assert attr_ids.size(1) == len(
+                    self.attr_embedders
+                ), f"Expected {len(self.attr_embedders)} factors, got {attr_ids.size(1)}"
+                attr_embs = 0
+                for j, embedder in enumerate(self.attr_embedders):
+                    labels_j = attr_ids[:, j]
+                    emb_j = embedder(
+                        labels_j,
+                        self.training,
+                        force_drop_ids=force_drop_ids,  # Pass CFG dropout mask
+                    )  # (B, D)
+                    attr_embs = attr_embs + emb_j
+                c = c + attr_embs * (1.0 / math.sqrt(len(self.attr_embedders)))
+
+            for i, block in enumerate(self.blocks):
+                x = block(x, c)  # (N, T, D)
             # if (i + 1) == self.encoder_depth:
             #     if self.use_global_alignment:
             #         # Global alignment: pool patches first, then project
@@ -361,7 +485,13 @@ class SiT(nn.Module):
             #             projector(x.reshape(-1, D)).reshape(N, T, -1)
             #             for projector in self.projectors
             #         ]
-        x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
+
+        # Final layer call - use appropriate mode
+        if self.use_per_attr_modulation:
+            x = self.final_layer(x, c=None, t_emb=t_embed, attr_embs_list=attr_embs_list)
+        else:
+            x = self.final_layer(x, c)
+
         x = self.unpatchify(x)  # (N, out_channels, H, W)
         return x, None  # , zs
 
