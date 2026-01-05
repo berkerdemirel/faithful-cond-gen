@@ -43,6 +43,12 @@ dependencies = [
   "tqdm",
   "requests",
   "wandb",
+  "tabulate",
+  "seaborn",
+  "inquirerpy",
+  "prompt-toolkit",
+  "pfzy",
+  
 ]
 
 [project.optional-dependencies]
