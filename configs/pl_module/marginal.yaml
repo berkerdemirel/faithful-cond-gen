@@ -12,8 +12,8 @@ cond_dropout_prob: 0.2  # 20% dropout for marginal models
 
 # Additivity loss for compositional generalization
 # Enforces v(c_full) ≈ v(c_drop_i) + v(c_drop_j) - v(c_drop_ij) via inclusion-exclusion
-additivity_loss_weight: 0.01  # Stronger for marginal models (never see real combos)
-additivity_loss_prob: 0.1  # Apply to 10% of batches
+additivity_loss_weight: 1  # Stronger for marginal models (never see real combos)
+additivity_loss_prob: 0.25  # Apply to 25% of batches
 additivity_t_threshold: 0.7  # Only apply when t > 0.7 (high noise, conditioning dominates)
 
 # Optional: Fixed targets for the validation buffer logic
