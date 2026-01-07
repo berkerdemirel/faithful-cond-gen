@@ -151,82 +151,74 @@ class GeneratorPL(pl.LightningModule):
         return torch.where(drop_mask, uncond_mat, cond_ids)
 
     def compute_additivity_loss(
-        self, x_t: torch.Tensor, t: torch.Tensor
+        self, x_t: torch.Tensor, t: torch.Tensor, cond_ids: torch.Tensor
     ) -> torch.Tensor:
-        """Compute self-consistency additivity loss for compositional generalization.
+        """Compute inclusion-exclusion additivity loss for compositional generalization.
 
-        Enforces: v(ei + ej) ≈ v(ei) + v(ej) - v(0)
-        where ei, ej are single-attribute conditions.
+        Enforces: v(c_full) ≈ v(c_drop_i) + v(c_drop_j) - v(c_drop_ij)
+
+        This formulation works for any categorical attributes (CelebA binary or RxRx1 sirna).
+        We "drop" attributes by setting them to the unconditional token, rather than
+        constructing new conditions with arbitrary class IDs.
 
         Only applied at high noise levels (t > threshold) where conditioning dominates.
 
         Args:
             x_t: (B, C, H, W) noisy latents
             t: (B,) timesteps
+            cond_ids: (B, K) original condition IDs (pre-dropout)
 
         Returns:
             Scalar additivity loss (0 if no high-t samples or disabled)
         """
-        # Filter to high-t samples only
         high_t_mask = t > self.cfg.additivity_t_threshold
         if not high_t_mask.any():
-            return torch.tensor(0.0, device=x_t.device)
+            return x_t.new_tensor(0.0)
 
-        x_t_h = x_t[high_t_mask]
-        t_h = t[high_t_mask]
-        b = x_t_h.shape[0]
-
-        # Get number of attributes
-        attr_num_classes = self.generator.diffusion_backbone.attr_num_classes
-        K = len(attr_num_classes)
+        x = x_t[high_t_mask]
+        tt = t[high_t_mask]
+        c_full = cond_ids[high_t_mask].clone()
+        b, K = c_full.shape
 
         if K < 2:
-            return torch.tensor(0.0, device=x_t.device)
+            return x_t.new_tensor(0.0)
 
         # Pick two random attribute indices
-        perm = torch.randperm(K)
+        perm = torch.randperm(K, device=x.device)
         i, j = perm[0].item(), perm[1].item()
 
-        # Build condition tensors
-        # uncond: all attributes set to their unconditional token (num_classes)
-        uncond_tokens = torch.tensor(attr_num_classes, device=x_t.device, dtype=torch.long)
-        uncond = uncond_tokens.unsqueeze(0).expand(b, K).clone()
+        # Get unconditional tokens for each attribute
+        attr_num_classes = self.generator.diffusion_backbone.attr_num_classes
+        uncond_tokens = torch.tensor(attr_num_classes, device=x.device, dtype=c_full.dtype)
 
-        # ei: only attribute i is active (set to 1), others unconditional
-        ei = uncond.clone()
-        ei[:, i] = 1
+        # Build dropped conditions using inclusion-exclusion
+        c_drop_i = c_full.clone()
+        c_drop_j = c_full.clone()
+        c_drop_ij = c_full.clone()
+        c_drop_i[:, i] = uncond_tokens[i]
+        c_drop_j[:, j] = uncond_tokens[j]
+        c_drop_ij[:, i] = uncond_tokens[i]
+        c_drop_ij[:, j] = uncond_tokens[j]
 
-        # ej: only attribute j is active (set to 1), others unconditional
-        ej = uncond.clone()
-        ej[:, j] = 1
+        no_drop = torch.zeros(b, device=x.device, dtype=torch.long)
 
-        # eij: both attributes i and j are active
-        eij = uncond.clone()
-        eij[:, i] = 1
-        eij[:, j] = 1
+        # Teacher terms: no grad (save memory, treat as fixed target)
+        with torch.no_grad():
+            v_drop_i = self.generator.velocity_prediction(x, tt, c_drop_i, force_drop_ids=no_drop)
+            v_drop_j = self.generator.velocity_prediction(x, tt, c_drop_j, force_drop_ids=no_drop)
+            v_drop_ij = self.generator.velocity_prediction(x, tt, c_drop_ij, force_drop_ids=no_drop)
+            target = v_drop_i + v_drop_j - v_drop_ij
 
-        # Compute velocities with dropout disabled (force_drop_ids=0 means no CFG dropout)
-        no_drop = torch.zeros(b, device=x_t.device, dtype=torch.long)
+        # Student: full condition prediction (gradients flow here)
+        v_full = self.generator.velocity_prediction(x, tt, c_full, force_drop_ids=no_drop)
 
-        v0 = self.generator.velocity_prediction(x_t_h, t_h, uncond, force_drop_ids=no_drop)
-        vi = self.generator.velocity_prediction(x_t_h, t_h, ei, force_drop_ids=no_drop)
-        vj = self.generator.velocity_prediction(x_t_h, t_h, ej, force_drop_ids=no_drop)
-        vij = self.generator.velocity_prediction(x_t_h, t_h, eij, force_drop_ids=no_drop)
-
-        # Additivity target: vij should equal vi + vj - v0
-        # This assumes attribute effects superpose linearly
-        target = vi + vj - v0
-
-        # MSE loss between actual multi-hot prediction and additive prediction
-        loss = F.mse_loss(vij, target.detach())
-
-        return loss
+        return F.mse_loss(v_full, target)
 
     def training_step(self, batch, batch_idx: int):
-        images, cond_ids = self._unpack_batch(batch)
+        images, cond_ids_raw = self._unpack_batch(batch)
 
         # --- apply condition dropout (compositional generalization) ---
-        cond_ids = self.apply_condition_dropout(cond_ids)
+        cond_ids = self.apply_condition_dropout(cond_ids_raw)
 
         # --- encode to latents ---
         with torch.no_grad():
@@ -253,7 +245,8 @@ class GeneratorPL(pl.LightningModule):
         if self.cfg.additivity_loss_weight > 0:
             # Stochastically apply additivity loss
             if torch.rand(1).item() < self.cfg.additivity_loss_prob:
-                add_loss = self.compute_additivity_loss(x_t, t)
+                # Use pre-dropout conditions for additivity constraint
+                add_loss = self.compute_additivity_loss(x_t, t, cond_ids_raw)
                 loss = loss + self.cfg.additivity_loss_weight * add_loss
 
         self.log("train/loss", loss, prog_bar=True)
