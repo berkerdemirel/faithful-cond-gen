@@ -1,0 +1,20 @@
+# configs/config_celeba_2attr_perattr.yaml
+# Ablation: 2-attribute CelebA with per-attribute modulation
+defaults:
+  - dataset: celeba_2attr
+  - model: generator_celeba_2attr_perattr
+  - pl_module: default
+  - train: ablation_2attr
+  - eval: rfid
+  - logger: wandb_celeba
+  - callbacks: checkpoint
+  - _self_
+
+seed: 1337
+device: cuda
+
+# Override logger name for this experiment
+logger:
+  name: celeba_2attr_per_attr_modulation
+  project: faithful-cond-gen
+  save_dir: ./outputs/wandb

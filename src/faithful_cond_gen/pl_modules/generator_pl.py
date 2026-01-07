@@ -41,6 +41,10 @@ class GeneratorPLConfig:
     warmup_steps: int = 0  # REPA uses warmup
     val_target_conditions: Optional[List[Dict[str, int]]] = None
     cond_dropout_prob: float = 0.0  # Probability of dropping individual attributes (compositional generalization)
+    # Additivity loss for compositional generalization (Proposal 1)
+    additivity_loss_weight: float = 0.0  # Weight for additivity regularizer (0 = disabled)
+    additivity_loss_prob: float = 0.1  # Probability of computing additivity loss per batch
+    additivity_t_threshold: float = 0.5  # Only apply at high noise levels (t > threshold)
 
 
 class GeneratorPL(pl.LightningModule):
@@ -146,6 +150,78 @@ class GeneratorPL(pl.LightningModule):
         # Vectorized replacement: use unconditional token where mask is True
         return torch.where(drop_mask, uncond_mat, cond_ids)
 
+    def compute_additivity_loss(
+        self, x_t: torch.Tensor, t: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute self-consistency additivity loss for compositional generalization.
+
+        Enforces: v(ei + ej) ≈ v(ei) + v(ej) - v(0)
+        where ei, ej are single-attribute conditions.
+
+        Only applied at high noise levels (t > threshold) where conditioning dominates.
+
+        Args:
+            x_t: (B, C, H, W) noisy latents
+            t: (B,) timesteps
+
+        Returns:
+            Scalar additivity loss (0 if no high-t samples or disabled)
+        """
+        # Filter to high-t samples only
+        high_t_mask = t > self.cfg.additivity_t_threshold
+        if not high_t_mask.any():
+            return torch.tensor(0.0, device=x_t.device)
+
+        x_t_h = x_t[high_t_mask]
+        t_h = t[high_t_mask]
+        b = x_t_h.shape[0]
+
+        # Get number of attributes
+        attr_num_classes = self.generator.diffusion_backbone.attr_num_classes
+        K = len(attr_num_classes)
+
+        if K < 2:
+            return torch.tensor(0.0, device=x_t.device)
+
+        # Pick two random attribute indices
+        perm = torch.randperm(K)
+        i, j = perm[0].item(), perm[1].item()
+
+        # Build condition tensors
+        # uncond: all attributes set to their unconditional token (num_classes)
+        uncond_tokens = torch.tensor(attr_num_classes, device=x_t.device, dtype=torch.long)
+        uncond = uncond_tokens.unsqueeze(0).expand(b, K).clone()
+
+        # ei: only attribute i is active (set to 1), others unconditional
+        ei = uncond.clone()
+        ei[:, i] = 1
+
+        # ej: only attribute j is active (set to 1), others unconditional
+        ej = uncond.clone()
+        ej[:, j] = 1
+
+        # eij: both attributes i and j are active
+        eij = uncond.clone()
+        eij[:, i] = 1
+        eij[:, j] = 1
+
+        # Compute velocities with dropout disabled (force_drop_ids=0 means no CFG dropout)
+        no_drop = torch.zeros(b, device=x_t.device, dtype=torch.long)
+
+        v0 = self.generator.velocity_prediction(x_t_h, t_h, uncond, force_drop_ids=no_drop)
+        vi = self.generator.velocity_prediction(x_t_h, t_h, ei, force_drop_ids=no_drop)
+        vj = self.generator.velocity_prediction(x_t_h, t_h, ej, force_drop_ids=no_drop)
+        vij = self.generator.velocity_prediction(x_t_h, t_h, eij, force_drop_ids=no_drop)
+
+        # Additivity target: vij should equal vi + vj - v0
+        # This assumes attribute effects superpose linearly
+        target = vi + vj - v0
+
+        # MSE loss between actual multi-hot prediction and additive prediction
+        loss = F.mse_loss(vij, target.detach())
+
+        return loss
+
     def training_step(self, batch, batch_idx: int):
         images, cond_ids = self._unpack_batch(batch)
 
@@ -169,10 +245,20 @@ class GeneratorPL(pl.LightningModule):
         # AND the whole condition may be dropped (class_dropout) - they compose!
         v_hat = self.generator.velocity_prediction(x_t=x_t, t=t, cond_ids=cond_ids)
 
-        # --- loss ---
+        # --- main velocity loss ---
         loss = F.mse_loss(v_hat, v_tgt)
 
+        # --- additivity loss (compositional generalization) ---
+        add_loss = torch.tensor(0.0, device=loss.device)
+        if self.cfg.additivity_loss_weight > 0:
+            # Stochastically apply additivity loss
+            if torch.rand(1).item() < self.cfg.additivity_loss_prob:
+                add_loss = self.compute_additivity_loss(x_t, t)
+                loss = loss + self.cfg.additivity_loss_weight * add_loss
+
         self.log("train/loss", loss, prog_bar=True)
+        if self.cfg.additivity_loss_weight > 0:
+            self.log("train/add_loss", add_loss, prog_bar=False)
         return loss
 
     @torch.no_grad()

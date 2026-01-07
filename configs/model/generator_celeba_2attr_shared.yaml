@@ -1,0 +1,21 @@
+# configs/model/generator_celeba_2attr_shared.yaml
+# Baseline: Shared modulation (original implementation)
+_target_: faithful_cond_gen.model.generator.GeneratorConfig
+
+image_size: 224
+in_channels: 3            # RGB for CelebA
+
+vae_model_name: "stabilityai/sd-vae-ft-mse"
+vae_freeze: true
+
+sit_arch: "SiT-B/2"       # SiT-B with patch size 2
+attr_num_classes: [2, 2]  # Male (0/1), Smiling (0/1)
+
+# Class dropout for Classifier-Free Guidance (CFG)
+class_dropout_prob: 0.1
+
+# Conditioning mode
+use_per_attr_modulation: false  # Shared modulation (baseline)
+
+path_type: "linear"
+checkpoint: null

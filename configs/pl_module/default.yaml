@@ -5,11 +5,17 @@ lr: 1e-4
 weight_decay: 0.0
 warmup_steps: 1000  # REPA-style warmup
 
-# Condition dropout for compositional generalization (NEW)
+# Condition dropout for compositional generalization
 # - 0.0: No dropout (default, backward compatible)
 # - 0.1-0.2: Moderate compositional learning
 # - 0.3-0.5: Strong compositional learning (marginal models)
 cond_dropout_prob: 0.0
+
+# Additivity loss for compositional generalization (lighter for fullmodels)
+# Enforces v(ei+ej) ≈ v(ei) + v(ej) - v(0) at high noise levels
+additivity_loss_weight: 0.001  # Lighter weight for fullmodels (they see real combos)
+additivity_loss_prob: 0.1  # Apply to 10% of batches
+additivity_t_threshold: 0.5  # Only apply when t > 0.5 (high noise)
 
 # Optional: Fixed targets for the validation buffer logic
 # If null, it will sample random ones.

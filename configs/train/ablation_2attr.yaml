@@ -1,0 +1,24 @@
+# configs/train/ablation_2attr.yaml
+# Shorter training for quick 2-attribute ablation
+_target_: pytorch_lightning.Trainer
+
+accelerator: gpu
+devices: 8
+strategy: ddp
+num_nodes: 1
+
+# Training Duration - shorter for quick ablation
+max_steps: 50000         # ~50k steps for quick comparison
+max_epochs: -1           # -1 means infinite epochs, stops at max_steps
+
+# Optimization
+gradient_clip_val: 1.0
+
+# Logging & Checkpointing - more frequent for short run
+log_every_n_steps: 50
+enable_checkpointing: true
+default_root_dir: "./outputs/ablation_2attr"
+
+# Validation loop settings
+limit_val_batches: 1.0
+check_val_every_n_epoch: 1
