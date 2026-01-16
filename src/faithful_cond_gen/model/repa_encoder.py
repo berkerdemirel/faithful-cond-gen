@@ -424,12 +424,6 @@ class REPAEncoder(nn.Module):
         tokens = self._forward_hf(x)
         return self._ensure_token_grid(tokens)
 
-    def _forward_dinov2(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.encoder.forward_features(x)
-        if isinstance(out, dict):
-            return out["x_norm_patchtokens"]  # already patch tokens
-        return out[:, 1:]
-
     def _forward_bioclip(self, x: torch.Tensor) -> torch.Tensor:
         tokens = self.encoder(x, return_all_tokens=True)
         if isinstance(tokens, (tuple, list)):
