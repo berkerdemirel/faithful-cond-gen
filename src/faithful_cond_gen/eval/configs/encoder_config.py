@@ -68,11 +68,49 @@ SIGLIP_SO400M = EncoderConfig(
     pooling_type="mean",  # SigLIP vision model output is usually spatial map, so we mean pool
 )
 
+SIGLIP_SO400M_224 = EncoderConfig(
+    name="siglip-so400m-patch14-224",
+    hf_path="google/siglip-so400m-patch14-224",
+    image_size=(224, 224),
+    mean=(0.5, 0.5, 0.5),
+    std=(0.5, 0.5, 0.5),
+)
+
 # 6. BioCLIP (Specialized CLIP for Biological Images)
 BIOCLIP = EncoderConfig(
     name="bioclip",
     hf_path="imageomics/bioclip",  # Will be treated as hf-hub:imageomics/bioclip
     image_size=(224, 224),
+    mean=(0.48145466, 0.4578275, 0.40821073),
+    std=(0.26862954, 0.26130258, 0.27577711),
+)
+
+
+# 7. CLIP ViT-B/16 (OpenAI CLIP, HF)
+CLIP_VITB16 = EncoderConfig(
+    name="clip-vitb16",
+    hf_path="openai/clip-vit-base-patch16",
+    image_size=(
+        224,
+        224,
+    ),  # native pretrain size; you can still feed 256 with interpolate_pos_encoding
+    mean=(0.48145466, 0.4578275, 0.40821073),
+    std=(0.26862954, 0.26130258, 0.27577711),
+    pooling_type="cls",
+    model_kwargs={
+        # lets CLIP accept 256x256 (or other sizes) without pos-embed shape mismatch
+        "interpolate_pos_encoding": True
+    },
+)
+
+
+CLIP_VITL14 = EncoderConfig(
+    name="clip-vit-l14",
+    hf_path="openai/clip-vit-large-patch14",
+    image_size=(
+        224,
+        224,
+    ),
     mean=(0.48145466, 0.4578275, 0.40821073),
     std=(0.26862954, 0.26130258, 0.27577711),
 )

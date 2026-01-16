@@ -31,6 +31,7 @@ def hash_condition(cond_ids: torch.Tensor, cond_idx: int = None) -> str:
         # Hash all samples (rare, but handle it)
         return str([tuple(row.tolist()) for row in cond_ids])
 
+
 # -----------------------------------------------------------------------------
 # VAE backbone
 # -----------------------------------------------------------------------------
@@ -180,6 +181,13 @@ class GeneratorConfig:
     path_type: str = "linear"  # "linear" or "cosine" later, but currently linear [0,1]
     # you can extend with EDM-style sigma schedule later
 
+    # REPA (Representation Alignment) loss settings
+    use_repa: bool = False  # Enable REPA projection loss
+    repa_encoder: str = "dinov2-vit-b"  # Encoder for REPA (dinov2-vit-{s,b,l})
+    repa_proj_coeff: float = 0.5  # Weight for projection loss
+    repa_encoder_depth: int = 8  # SiT layer to extract features from
+    repa_projector_dim: int = 2048  # Intermediate dimension for projector MLP
+
     # optional checkpoint
     checkpoint: Optional[str] = None
 
@@ -222,6 +230,35 @@ class GeneratorWrapper(nn.Module):
                 f"Available: {list(SiT_models.keys())}"
             )
         sit_in_channels = self.vae.out_channels
+
+        # Determine encoder embed dim for REPA projectors
+        repa_z_dims = []
+        if cfg.use_repa:
+            # Map encoder name to embed dim
+            # Must match encoders supported in model/repa_encoder.py
+            encoder_dim_map = {
+                # HuggingFace encoders
+                "dinov3": 1024,  # ViT-L/16
+                "dinov2": 1024,  # ViT-L/14
+                # Specialized
+                "openphenom": 384 * 6,  # 384 per channel, 6 channels
+                "clip": 1024,  # ViT-B/16
+                "siglip": 1152,  # ViT-L/14
+            }
+            enc_name = cfg.repa_encoder.lower()
+            # Find matching encoder (prefix match for dinov2 variants)
+            embed_dim = None
+            for key, dim in encoder_dim_map.items():
+                if enc_name == key or enc_name.startswith(key):
+                    embed_dim = dim
+                    break
+            if embed_dim is None:
+                raise ValueError(
+                    f"Unknown REPA encoder: {cfg.repa_encoder}. "
+                    f"Supported: {list(encoder_dim_map.keys())}"
+                )
+            repa_z_dims = [embed_dim]
+
         self.diffusion_backbone = SiT_models[cfg.sit_arch](
             path_type="linear",  # not too important for our wrapper
             input_size=latent_size,  # H_latent == W_latent
@@ -231,6 +268,11 @@ class GeneratorWrapper(nn.Module):
             use_per_attr_modulation=cfg.use_per_attr_modulation,
             qk_norm=cfg.qk_norm,
             fused_attn=cfg.fused_attn,
+            # REPA parameters
+            use_repa=cfg.use_repa,
+            encoder_depth=cfg.repa_encoder_depth,
+            z_dims=repa_z_dims,
+            projector_dim=cfg.repa_projector_dim,
         )
 
         # if you later add alignment / projector loss, you'll have extra flags here
@@ -273,6 +315,7 @@ class GeneratorWrapper(nn.Module):
         t: torch.Tensor,  # (B,) float in [0,1]
         cond_ids: torch.Tensor,  # (B,K) long OR (B,) long
         force_drop_ids: torch.Tensor = None,  # (B,) 0/1 for CFG
+        return_projected: bool = False,  # Return projected features for REPA
     ) -> torch.Tensor:
         """Predict latent velocity v(x_t, t, cond). No noising, no loss, no VAE.
 
@@ -281,11 +324,16 @@ class GeneratorWrapper(nn.Module):
             t: Timestep
             cond_ids: Conditioning IDs
             force_drop_ids: Optional force dropout for CFG (0=conditional, 1=unconditional)
+            return_projected: If True, also return projected features (for REPA loss)
+
+        Returns:
+            v_hat: (B, C, h, w) predicted velocity
+            zs_tilde: List of projected features (only if return_projected=True and REPA enabled)
         """
         if cond_ids.dim() == 1:
             cond_ids = cond_ids.unsqueeze(1)  # (B,) -> (B,1)
 
-        v_hat, _ = self.diffusion_backbone(
+        v_hat, zs_tilde = self.diffusion_backbone(
             x_t,
             t,
             attr_ids=cond_ids.to(device=x_t.device, dtype=torch.long),
@@ -296,6 +344,8 @@ class GeneratorWrapper(nn.Module):
         if v_hat.shape[1] > x_t.shape[1]:
             v_hat = v_hat[:, : x_t.shape[1]]
 
+        if return_projected:
+            return v_hat, zs_tilde
         return v_hat
 
     @staticmethod
@@ -372,12 +422,19 @@ class GeneratorWrapper(nn.Module):
         Returns:
             Dictionary suitable for load_condition_stats()
         """
-        import pandas as pd
         from collections import Counter
+
+        import pandas as pd
 
         if isinstance(metadata, pd.DataFrame):
             # Get condition columns (exclude metadata columns)
-            exclude_cols = ["count", "comp_category", "condition_hash", "numpy_path", "parquet_path"]
+            exclude_cols = [
+                "count",
+                "comp_category",
+                "condition_hash",
+                "numpy_path",
+                "parquet_path",
+            ]
             cond_cols = [c for c in metadata.columns if c not in exclude_cols]
 
             # Create hashes for each row

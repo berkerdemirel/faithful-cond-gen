@@ -128,7 +128,15 @@ class SiTBlock(nn.Module):
     2. Per-attribute modulation: Separate modulators for timestep + each attribute
     """
 
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_per_attr_modulation=False, n_attrs=0, **block_kwargs):
+    def __init__(
+        self,
+        hidden_size,
+        num_heads,
+        mlp_ratio=4.0,
+        use_per_attr_modulation=False,
+        n_attrs=0,
+        **block_kwargs,
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(
@@ -156,10 +164,14 @@ class SiTBlock(nn.Module):
             self.t_modulation = nn.Sequential(
                 nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True)
             )
-            self.attr_modulators = nn.ModuleList([
-                nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True))
-                for _ in range(n_attrs)
-            ])
+            self.attr_modulators = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+                    )
+                    for _ in range(n_attrs)
+                ]
+            )
         else:
             # Shared modulation (backward compatible)
             self.adaLN_modulation = nn.Sequential(
@@ -176,22 +188,26 @@ class SiTBlock(nn.Module):
         """
         if self.use_per_attr_modulation:
             # Per-attribute modulation
-            assert t_emb is not None and attr_embs_list is not None, \
-                "Per-attribute modulation requires t_emb and attr_embs_list"
+            assert (
+                t_emb is not None and attr_embs_list is not None
+            ), "Per-attribute modulation requires t_emb and attr_embs_list"
 
             # Get timestep modulation
             t_mod = self.t_modulation(t_emb)  # (N, 6D)
 
             # Get per-attribute modulations and sum (variance-preserving)
             attr_mod = sum(
-                modulator(emb) for modulator, emb in zip(self.attr_modulators, attr_embs_list)
+                modulator(emb)
+                for modulator, emb in zip(self.attr_modulators, attr_embs_list)
             )
             if len(attr_embs_list) > 0:
                 attr_mod = attr_mod / math.sqrt(len(attr_embs_list))
 
             # Combine
             total_mod = t_mod + attr_mod
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = total_mod.chunk(6, dim=-1)
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                total_mod.chunk(6, dim=-1)
+            )
         else:
             # Shared modulation (original implementation)
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
@@ -213,7 +229,14 @@ class FinalLayer(nn.Module):
     The final layer of SiT.
     """
 
-    def __init__(self, hidden_size, patch_size, out_channels, use_per_attr_modulation=False, n_attrs=0):
+    def __init__(
+        self,
+        hidden_size,
+        patch_size,
+        out_channels,
+        use_per_attr_modulation=False,
+        n_attrs=0,
+    ):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(
@@ -225,10 +248,14 @@ class FinalLayer(nn.Module):
             self.t_modulation = nn.Sequential(
                 nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
             )
-            self.attr_modulators = nn.ModuleList([
-                nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True))
-                for _ in range(n_attrs)
-            ])
+            self.attr_modulators = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+                    )
+                    for _ in range(n_attrs)
+                ]
+            )
         else:
             self.adaLN_modulation = nn.Sequential(
                 nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
@@ -236,12 +263,14 @@ class FinalLayer(nn.Module):
 
     def forward(self, x, c, t_emb=None, attr_embs_list=None):
         if self.use_per_attr_modulation:
-            assert t_emb is not None and attr_embs_list is not None, \
-                "Per-attribute modulation requires t_emb and attr_embs_list"
+            assert (
+                t_emb is not None and attr_embs_list is not None
+            ), "Per-attribute modulation requires t_emb and attr_embs_list"
 
             t_mod = self.t_modulation(t_emb)
             attr_mod = sum(
-                modulator(emb) for modulator, emb in zip(self.attr_modulators, attr_embs_list)
+                modulator(emb)
+                for modulator, emb in zip(self.attr_modulators, attr_embs_list)
             )
             if len(attr_embs_list) > 0:
                 attr_mod = attr_mod / math.sqrt(len(attr_embs_list))
@@ -281,6 +310,7 @@ class SiT(nn.Module):
         projector_dim=2048,
         use_global_alignment=False,
         use_per_attr_modulation=False,
+        use_repa=False,  # Enable REPA projectors
         **block_kwargs,  # fused_attn, qk_norm
     ):
         super().__init__()
@@ -295,6 +325,7 @@ class SiT(nn.Module):
         self.encoder_depth = encoder_depth
         self.use_global_alignment = use_global_alignment
         self.use_per_attr_modulation = use_per_attr_modulation
+        self.use_repa = use_repa
 
         self.x_embedder = PatchEmbed(
             input_size, patch_size, in_channels, hidden_size, bias=True
@@ -322,18 +353,24 @@ class SiT(nn.Module):
                     mlp_ratio=mlp_ratio,
                     use_per_attr_modulation=use_per_attr_modulation,
                     n_attrs=len(attr_num_classes),
-                    **block_kwargs
+                    **block_kwargs,
                 )
                 for _ in range(depth)
             ]
         )
-        # self.projectors = nn.ModuleList(
-        #     [build_mlp(hidden_size, projector_dim, z_dim) for z_dim in z_dims]
-        # )
+        # REPA projectors: project intermediate features to encoder embedding space
+        if use_repa and len(z_dims) > 0:
+            self.projectors = nn.ModuleList(
+                [build_mlp(hidden_size, projector_dim, z_dim) for z_dim in z_dims]
+            )
+        else:
+            self.projectors = None
         self.final_layer = FinalLayer(
-            decoder_hidden_size, patch_size, self.out_channels,
+            decoder_hidden_size,
+            patch_size,
+            self.out_channels,
             use_per_attr_modulation=use_per_attr_modulation,
-            n_attrs=len(attr_num_classes)
+            n_attrs=len(attr_num_classes),
         )
         self.initialize_weights()
 
@@ -448,8 +485,25 @@ class SiT(nn.Module):
                     attr_embs_list.append(emb_j)
 
             # Pass separate embeddings to blocks
+            zs = None
             for i, block in enumerate(self.blocks):
-                x = block(x, c=None, t_emb=t_embed, attr_embs_list=attr_embs_list)  # (N, T, D)
+                x = block(
+                    x, c=None, t_emb=t_embed, attr_embs_list=attr_embs_list
+                )  # (N, T, D)
+                # Extract features at encoder_depth for REPA
+                if (
+                    self.use_repa
+                    and self.projectors is not None
+                    and (i + 1) == self.encoder_depth
+                ):
+                    if self.use_global_alignment:
+                        x_pooled = x.mean(dim=1)  # (N, D)
+                        zs = [projector(x_pooled) for projector in self.projectors]
+                    else:
+                        zs = [
+                            projector(x.reshape(-1, D)).reshape(N, T, -1)
+                            for projector in self.projectors
+                        ]
         else:
             # Shared modulation mode (original): combine into single conditioning vector
             c = t_embed
@@ -470,30 +524,34 @@ class SiT(nn.Module):
                     attr_embs = attr_embs + emb_j
                 c = c + attr_embs * (1.0 / math.sqrt(len(self.attr_embedders)))
 
+            zs = None
             for i, block in enumerate(self.blocks):
                 x = block(x, c)  # (N, T, D)
-            # if (i + 1) == self.encoder_depth:
-            #     if self.use_global_alignment:
-            #         # Global alignment: pool patches first, then project
-            #         # (N, T, D) -> (N, D) -> project -> (N, z_dim)
-            #         x_pooled = x.mean(dim=1)  # Average pool over patches
-            #         zs = [projector(x_pooled) for projector in self.projectors]
-            #     else:
-            #         # Patch-wise alignment: project each patch token
-            #         # (N, T, D) -> (N*T, D) -> project -> (N, T, z_dim)
-            #         zs = [
-            #             projector(x.reshape(-1, D)).reshape(N, T, -1)
-            #             for projector in self.projectors
-            #         ]
+                # Extract features at encoder_depth for REPA
+                if (
+                    self.use_repa
+                    and self.projectors is not None
+                    and (i + 1) == self.encoder_depth
+                ):
+                    if self.use_global_alignment:
+                        x_pooled = x.mean(dim=1)  # (N, D)
+                        zs = [projector(x_pooled) for projector in self.projectors]
+                    else:
+                        zs = [
+                            projector(x.reshape(-1, D)).reshape(N, T, -1)
+                            for projector in self.projectors
+                        ]
 
         # Final layer call - use appropriate mode
         if self.use_per_attr_modulation:
-            x = self.final_layer(x, c=None, t_emb=t_embed, attr_embs_list=attr_embs_list)
+            x = self.final_layer(
+                x, c=None, t_emb=t_embed, attr_embs_list=attr_embs_list
+            )
         else:
             x = self.final_layer(x, c)
 
         x = self.unpatchify(x)  # (N, out_channels, H, W)
-        return x, None  # , zs
+        return x, zs  # zs is None when REPA disabled, List[Tensor] when enabled
 
 
 #################################################################################

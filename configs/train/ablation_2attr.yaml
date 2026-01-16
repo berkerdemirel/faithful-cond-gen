@@ -22,3 +22,6 @@ default_root_dir: "./outputs/ablation_2attr"
 # Validation loop settings
 limit_val_batches: 1.0
 check_val_every_n_epoch: 1
+
+fast_dev_run: false
+

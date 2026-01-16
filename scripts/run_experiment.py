@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import hydra
 import pytorch_lightning as pl
+import torch
 
 # Import your modules
 from faithful_cond_gen.data.celeba import CelebaDataConfig, CelebaDataModule
@@ -15,6 +16,7 @@ from omegaconf import DictConfig, OmegaConf
 def main(cfg: DictConfig):
     # 1. Set Seed & Device logic (handled by PL Trainer usually, but good for setup)
     pl.seed_everything(cfg.get("seed", 1337), workers=True)
+    torch.set_float32_matmul_precision("high")  # or "medium"
 
     print(f"[{cfg.dataset._target_}] Initializing DataModule...")
 

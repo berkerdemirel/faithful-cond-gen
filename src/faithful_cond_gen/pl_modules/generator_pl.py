@@ -15,6 +15,11 @@ from torch.optim import AdamW
 from transformers import get_scheduler
 
 
+def mean_flat(x: torch.Tensor) -> torch.Tensor:
+    """Take the mean over all non-batch dimensions."""
+    return torch.mean(x, dim=list(range(1, len(x.size()))))
+
+
 def dist_on() -> bool:
     return torch.distributed.is_available() and torch.distributed.is_initialized()
 
@@ -40,11 +45,19 @@ class GeneratorPLConfig:
     weight_decay: float = 0.0
     warmup_steps: int = 0  # REPA uses warmup
     val_target_conditions: Optional[List[Dict[str, int]]] = None
-    cond_dropout_prob: float = 0.0  # Probability of dropping individual attributes (compositional generalization)
+    cond_dropout_prob: float = (
+        0.0  # Probability of dropping individual attributes (compositional generalization)
+    )
     # Additivity loss for compositional generalization (Proposal 1)
-    additivity_loss_weight: float = 0.0  # Weight for additivity regularizer (0 = disabled)
-    additivity_loss_prob: float = 0.1  # Probability of computing additivity loss per batch
-    additivity_t_threshold: float = 0.5  # Only apply at high noise levels (t > threshold)
+    additivity_loss_weight: float = (
+        0.0  # Weight for additivity regularizer (0 = disabled)
+    )
+    additivity_loss_prob: float = (
+        0.1  # Probability of computing additivity loss per batch
+    )
+    additivity_t_threshold: float = (
+        0.5  # Only apply at high noise levels (t > threshold)
+    )
 
 
 class GeneratorPL(pl.LightningModule):
@@ -108,7 +121,7 @@ class GeneratorPL(pl.LightningModule):
         if not hasattr(self, "_cond_keys"):
             # First batch: infer and store canonical order (sorted for consistency)
             self._cond_keys = sorted(cond_dict.keys())
-        
+
         # Stack conditioning values in canonical order
         cond_tensors = [cond_dict[k] for k in self._cond_keys]
         cond_ids = torch.stack(cond_tensors, dim=1)
@@ -143,8 +156,12 @@ class GeneratorPL(pl.LightningModule):
 
         # Get unconditional token ID for each attribute
         # Each embedder in the SiT has num_classes as its unconditional token
-        attr_num_classes = self.generator.diffusion_backbone.attr_num_classes  # length k
-        uncond = torch.tensor(attr_num_classes, device=cond_ids.device, dtype=cond_ids.dtype)  # (k,)
+        attr_num_classes = (
+            self.generator.diffusion_backbone.attr_num_classes
+        )  # length k
+        uncond = torch.tensor(
+            attr_num_classes, device=cond_ids.device, dtype=cond_ids.dtype
+        )  # (k,)
         uncond_mat = uncond.unsqueeze(0).expand(b, k)  # (b, k)
 
         # Vectorized replacement: use unconditional token where mask is True
@@ -189,7 +206,9 @@ class GeneratorPL(pl.LightningModule):
 
         # Get unconditional tokens for each attribute
         attr_num_classes = self.generator.diffusion_backbone.attr_num_classes
-        uncond_tokens = torch.tensor(attr_num_classes, device=x.device, dtype=c_full.dtype)
+        uncond_tokens = torch.tensor(
+            attr_num_classes, device=x.device, dtype=c_full.dtype
+        )
 
         # Build dropped conditions using inclusion-exclusion
         c_drop_i = c_full.clone()
@@ -204,13 +223,21 @@ class GeneratorPL(pl.LightningModule):
 
         # Teacher terms: no grad (save memory, treat as fixed target)
         with torch.no_grad():
-            v_drop_i = self.generator.velocity_prediction(x, tt, c_drop_i, force_drop_ids=no_drop)
-            v_drop_j = self.generator.velocity_prediction(x, tt, c_drop_j, force_drop_ids=no_drop)
-            v_drop_ij = self.generator.velocity_prediction(x, tt, c_drop_ij, force_drop_ids=no_drop)
+            v_drop_i = self.generator.velocity_prediction(
+                x, tt, c_drop_i, force_drop_ids=no_drop
+            )
+            v_drop_j = self.generator.velocity_prediction(
+                x, tt, c_drop_j, force_drop_ids=no_drop
+            )
+            v_drop_ij = self.generator.velocity_prediction(
+                x, tt, c_drop_ij, force_drop_ids=no_drop
+            )
             target = v_drop_i + v_drop_j - v_drop_ij
 
         # Student: full condition prediction (gradients flow here)
-        v_full = self.generator.velocity_prediction(x, tt, c_full, force_drop_ids=no_drop)
+        v_full = self.generator.velocity_prediction(
+            x, tt, c_full, force_drop_ids=no_drop
+        )
 
         return F.mse_loss(v_full, target)
 
@@ -231,14 +258,40 @@ class GeneratorPL(pl.LightningModule):
         eps = torch.randn_like(x0)
         x_t, v_tgt = self.linear_interpolant(x0, t, eps)
 
+        # --- REPA: extract encoder features from raw images ---
+        zs = None
+        if self.repa_encoder is not None:
+            with torch.no_grad():
+                # zs: (B, num_patches, embed_dim) - patch tokens from frozen encoder
+                zs = self.repa_encoder(images)
+
         # --- velocity prediction ---
         # Note: class_dropout is applied inside velocity_prediction via LabelEmbedder
         # So cond_ids here may have individual attributes masked (cond_dropout)
         # AND the whole condition may be dropped (class_dropout) - they compose!
-        v_hat = self.generator.velocity_prediction(x_t=x_t, t=t, cond_ids=cond_ids)
+        use_repa = self.repa_encoder is not None
+        if use_repa:
+            v_hat, zs_tilde = self.generator.velocity_prediction(
+                x_t=x_t, t=t, cond_ids=cond_ids, return_projected=True
+            )
+        else:
+            v_hat = self.generator.velocity_prediction(x_t=x_t, t=t, cond_ids=cond_ids)
+            zs_tilde = None
 
         # --- main velocity loss ---
-        loss = F.mse_loss(v_hat, v_tgt)
+        denoising_loss = F.mse_loss(v_hat, v_tgt)
+
+        # --- REPA projection loss ---
+        proj_loss = torch.tensor(0.0, device=denoising_loss.device)
+        breakpoint()
+        if use_repa and zs_tilde is not None and zs is not None:
+            proj_loss = self._compute_repa_loss(zs, zs_tilde)
+
+        # --- total loss ---
+        loss = denoising_loss
+        if use_repa:
+            proj_coeff = self.generator.cfg.repa_proj_coeff
+            loss = loss + proj_coeff * proj_loss
 
         # --- additivity loss (compositional generalization) ---
         add_loss = torch.tensor(0.0, device=loss.device)
@@ -250,9 +303,82 @@ class GeneratorPL(pl.LightningModule):
                 loss = loss + self.cfg.additivity_loss_weight * add_loss
 
         self.log("train/loss", loss, prog_bar=True)
+        self.log("train/denoising_loss", denoising_loss, prog_bar=False)
+        if use_repa:
+            self.log("train/proj_loss", proj_loss, prog_bar=True)
         if self.cfg.additivity_loss_weight > 0:
             self.log("train/add_loss", add_loss, prog_bar=False)
         return loss
+
+    def _compute_repa_loss(
+        self,
+        zs: torch.Tensor,
+        zs_tilde: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """Compute REPA projection loss (negative cosine similarity).
+
+        Following the original REPA paper: direct per-patch alignment between
+        SiT intermediate features (projected) and encoder patch tokens.
+
+        The paper assumes patch counts match:
+        - SiT: latent 32x32 with patch_size=2 → 16x16 = 256 patches
+        - DINOv2: 224x224 input with patch_size=14 → 16x16 = 256 patches
+
+        Args:
+            zs: (B, num_patches, embed_dim) encoder features from real images
+            zs_tilde: List of (B, num_patches, z_dim) projected features from SiT
+
+        Returns:
+            Scalar projection loss
+        """
+        if zs_tilde is None or len(zs_tilde) == 0:
+            return torch.tensor(0.0, device=zs.device)
+
+        proj_loss = 0.0
+        bsz = zs.shape[0]
+
+        for z_tilde in zs_tilde:
+            # z_tilde: (B, T_sit, z_dim) from SiT projector
+            # zs: (B, T_enc, embed_dim) from encoder
+
+            num_patches_sit = z_tilde.shape[1]
+            num_patches_enc = zs.shape[1]
+            if num_patches_sit != num_patches_enc:
+                # Warn once about mismatch (not ideal, paper assumes matching)
+                if not hasattr(self, "_repa_patch_mismatch_warned"):
+                    print(
+                        f"⚠️ [REPA] Patch count mismatch: SiT={num_patches_sit}, Encoder={num_patches_enc}. "
+                        f"Using interpolation (deviates from original paper)."
+                    )
+                    self._repa_patch_mismatch_warned = True
+
+                # Fallback: interpolate SiT features to encoder resolution
+                h_sit = int(num_patches_sit**0.5)
+                h_enc = int(num_patches_enc**0.5)
+                z_tilde_spatial = z_tilde.permute(0, 2, 1).reshape(
+                    bsz, -1, h_sit, h_sit
+                )
+                z_tilde_interp = F.interpolate(
+                    z_tilde_spatial,
+                    size=(h_enc, h_enc),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                z_tilde = z_tilde_interp.reshape(bsz, -1, h_enc * h_enc).permute(
+                    0, 2, 1
+                )
+
+            # Per-patch cosine similarity loss (following REPA paper)
+            # For each batch element, for each patch: compute -cos_sim
+            z_tilde_norm = F.normalize(z_tilde, dim=-1)  # (B, T, D)
+            z_norm = F.normalize(zs, dim=-1)  # (B, T, D)
+
+            # Loss = -mean(cos_sim) across all patches and batch
+            cos_sim = (z_norm * z_tilde_norm).sum(dim=-1)  # (B, T)
+            proj_loss = proj_loss + (-cos_sim).mean()
+
+        proj_loss = proj_loss / len(zs_tilde)
+        return proj_loss
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx: int):
@@ -306,7 +432,7 @@ class GeneratorPL(pl.LightningModule):
             self.ema.load_state_dict(checkpoint["ema"])
 
     def on_train_batch_start(self, batch, batch_idx):
-        if self.trainer.sanity_checking:
+        if self.trainer.sanity_checking or self.trainer.fast_dev_run:
             return
 
         # single GPU: normal
@@ -329,6 +455,8 @@ class GeneratorPL(pl.LightningModule):
             self.trainer.strategy.barrier()
 
     def on_fit_start(self):
+        if self.trainer.sanity_checking:
+            return
         print(f"[GeneratorPL] Rank {self.global_rank} initializing metrics...")
         if not hasattr(self, "ema"):
             self.ema = EMA(self.generator, decay=0.9999)
@@ -337,6 +465,66 @@ class GeneratorPL(pl.LightningModule):
         self.val_buffer = {}
         self.target_keys = []
 
+        # --- REPA encoder loading ---
+        # Use rank-based loading to avoid race conditions with HuggingFace downloads
+        self.repa_encoder = None
+        if self.generator.cfg.use_repa:
+            from faithful_cond_gen.model.repa_encoder import load_repa_encoder
+
+            is_distributed = (
+                self.trainer.world_size > 1 and torch.distributed.is_initialized()
+            )
+
+            if is_distributed:
+                # Rank 0 downloads first, others wait
+                if self.global_rank == 0:
+                    print(
+                        f"[GeneratorPL] Rank 0 loading REPA encoder: {self.generator.cfg.repa_encoder}"
+                    )
+                    self.repa_encoder = load_repa_encoder(
+                        encoder_name=self.generator.cfg.repa_encoder,
+                        resolution=self.generator.cfg.image_size,
+                        in_channels=self.generator.cfg.in_channels,
+                        device=self.device,
+                    )
+                    print(
+                        f"[GeneratorPL] Rank 0 REPA encoder loaded (embed_dim={self.repa_encoder.embed_dim})"
+                    )
+
+                # Wait for rank 0 to finish downloading
+                torch.distributed.barrier()
+
+                # Now other ranks can load from cache
+                if self.global_rank != 0:
+                    print(
+                        f"[GeneratorPL] Rank {self.global_rank} loading REPA encoder from cache"
+                    )
+                    self.repa_encoder = load_repa_encoder(
+                        encoder_name=self.generator.cfg.repa_encoder,
+                        resolution=self.generator.cfg.image_size,
+                        in_channels=self.generator.cfg.in_channels,
+                        device=self.device,
+                    )
+                    print(f"[GeneratorPL] Rank {self.global_rank} REPA encoder loaded")
+
+                # Final barrier to ensure all ranks are ready
+                torch.distributed.barrier()
+            else:
+                # Single GPU - just load directly
+                print(
+                    f"[GeneratorPL] Loading REPA encoder: {self.generator.cfg.repa_encoder}"
+                )
+                self.repa_encoder = load_repa_encoder(
+                    encoder_name=self.generator.cfg.repa_encoder,
+                    resolution=self.generator.cfg.image_size,
+                    in_channels=self.generator.cfg.in_channels,
+                    device=self.device,
+                )
+                print(
+                    f"[GeneratorPL] REPA encoder loaded (embed_dim={self.repa_encoder.embed_dim})"
+                )
+        if self.trainer.fast_dev_run:
+            return
         dm = self.trainer.datamodule
 
         # Initialize _cond_keys before any batch processing
@@ -349,7 +537,9 @@ class GeneratorPL(pl.LightningModule):
                 print(f"[GeneratorPL] Initialized condition keys: {self._cond_keys}")
             else:
                 # Fallback: try to infer from datamodule config
-                print("⚠️ [GeneratorPL] Warning: Could not get sample from train dataset")
+                print(
+                    "⚠️ [GeneratorPL] Warning: Could not get sample from train dataset"
+                )
 
         is_distributed = (
             self.trainer.world_size > 1 and torch.distributed.is_initialized()
@@ -484,7 +674,9 @@ class GeneratorPL(pl.LightningModule):
             for j in range(0, n_gen, batch_size):
                 curr_batch = cond_batch_metric[j : j + batch_size]
                 gen_metric_list.append(
-                    self.generator.sample(curr_batch, num_inference_steps=25, t_cutoff=0.04)
+                    self.generator.sample(
+                        curr_batch, num_inference_steps=25, t_cutoff=0.04
+                    )
                 )
             gen_metric_imgs = torch.cat(gen_metric_list, dim=0)
 
@@ -671,7 +863,7 @@ class GeneratorPL(pl.LightningModule):
             self.ema.restore()
 
     def on_validation_epoch_end(self):
-        if self.trainer.sanity_checking:
+        if self.trainer.sanity_checking or self.trainer.fast_dev_run:
             return
 
         avg = self._last_avg_rfid

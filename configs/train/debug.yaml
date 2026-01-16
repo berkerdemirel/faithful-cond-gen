@@ -11,5 +11,7 @@ limit_train_batches: 50   # The "Quick Run" constraint
 limit_val_batches: 5
 log_every_n_steps: 10
 
+fast_dev_run: false
+
 enable_checkpointing: false
 default_root_dir: "./outputs/debug_run"

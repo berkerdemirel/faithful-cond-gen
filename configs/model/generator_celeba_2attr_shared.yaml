@@ -2,7 +2,7 @@
 # Baseline: Shared modulation (original implementation)
 _target_: faithful_cond_gen.model.generator.GeneratorConfig
 
-image_size: 224
+image_size: 256
 in_channels: 3            # RGB for CelebA
 
 vae_model_name: "stabilityai/sd-vae-ft-mse"
