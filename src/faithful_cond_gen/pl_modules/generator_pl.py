@@ -283,7 +283,6 @@ class GeneratorPL(pl.LightningModule):
 
         # --- REPA projection loss ---
         proj_loss = torch.tensor(0.0, device=denoising_loss.device)
-        breakpoint()
         if use_repa and zs_tilde is not None and zs is not None:
             proj_loss = self._compute_repa_loss(zs, zs_tilde)
 
@@ -343,29 +342,35 @@ class GeneratorPL(pl.LightningModule):
 
             num_patches_sit = z_tilde.shape[1]
             num_patches_enc = zs.shape[1]
-            if num_patches_sit != num_patches_enc:
-                # Warn once about mismatch (not ideal, paper assumes matching)
-                if not hasattr(self, "_repa_patch_mismatch_warned"):
-                    print(
-                        f"⚠️ [REPA] Patch count mismatch: SiT={num_patches_sit}, Encoder={num_patches_enc}. "
-                        f"Using interpolation (deviates from original paper)."
-                    )
-                    self._repa_patch_mismatch_warned = True
+            # if num_patches_sit != num_patches_enc:
+            #     # Warn once about mismatch (not ideal, paper assumes matching)
+            #     if not hasattr(self, "_repa_patch_mismatch_warned"):
+            #         print(
+            #             f"⚠️ [REPA] Patch count mismatch: SiT={num_patches_sit}, Encoder={num_patches_enc}. "
+            #             f"Using interpolation (deviates from original paper)."
+            #         )
+            #         self._repa_patch_mismatch_warned = True
 
-                # Fallback: interpolate SiT features to encoder resolution
-                h_sit = int(num_patches_sit**0.5)
-                h_enc = int(num_patches_enc**0.5)
-                z_tilde_spatial = z_tilde.permute(0, 2, 1).reshape(
-                    bsz, -1, h_sit, h_sit
-                )
-                z_tilde_interp = F.interpolate(
-                    z_tilde_spatial,
-                    size=(h_enc, h_enc),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                z_tilde = z_tilde_interp.reshape(bsz, -1, h_enc * h_enc).permute(
-                    0, 2, 1
+            #     # Fallback: interpolate SiT features to encoder resolution
+            #     h_sit = int(num_patches_sit**0.5)
+            #     h_enc = int(num_patches_enc**0.5)
+            #     z_tilde_spatial = z_tilde.permute(0, 2, 1).reshape(
+            #         bsz, -1, h_sit, h_sit
+            #     )
+            #     z_tilde_interp = F.interpolate(
+            #         z_tilde_spatial,
+            #         size=(h_enc, h_enc),
+            #         mode="bilinear",
+            #         align_corners=False,
+            #     )
+            #     z_tilde = z_tilde_interp.reshape(bsz, -1, h_enc * h_enc).permute(
+            #         0, 2, 1
+            #     )
+
+            if num_patches_sit != num_patches_enc:
+                raise ValueError(
+                    f"[REPA] Patch mismatch: SiT={num_patches_sit}, Enc={num_patches_enc}. "
+                    "Fix teacher input size or SiT tokenization (no interpolation allowed)."
                 )
 
             # Per-patch cosine similarity loss (following REPA paper)
