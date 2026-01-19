@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 from dataclasses import dataclass
@@ -37,6 +38,24 @@ def dprint(*args, **kwargs):
     prefix = f"[rank {rank()}/{world()} pid={os.getpid()}] "
     print(prefix + " ".join(map(str, args)), flush=True, **kwargs)
     sys.stdout.flush()
+
+
+def fingerprint(x: torch.Tensor, name: str = "") -> str:
+    # Cheap, stable-ish fingerprint for debugging only.
+    # Uses simple stats + a few fixed elements.
+    x = x.detach()
+    flat = x.flatten()
+    k = min(flat.numel(), 8)
+    head = flat[:k].float()
+    return (
+        f"{name}"
+        f" shape={tuple(x.shape)}"
+        f" mean={x.float().mean().item():.6f}"
+        f" std={x.float().std().item():.6f}"
+        f" min={x.float().min().item():.6f}"
+        f" max={x.float().max().item():.6f}"
+        f" head={[round(v, 6) for v in head.tolist()]}"
+    )
 
 
 @dataclass
@@ -630,14 +649,12 @@ class GeneratorPL(pl.LightningModule):
         print(
             f"[GeneratorPL] Rank {self.global_rank} entering logging step {self.global_step}..."
         )
+        current_seed = torch.initial_seed() % (2**32 - 100)
+        torch.manual_seed(current_seed + self.global_rank + 1)
+
         self.generator.eval()
         if hasattr(self, "ema"):
             self.ema.apply()
-
-        # We want Rank N to compute FID *only* on its own data, not wait for others.
-        if hasattr(self.fidelity_metrics, "fid"):
-            self.fidelity_metrics.fid.sync_on_compute = False
-            self.fidelity_metrics.fid.dist_sync_on_step = False
 
         # --- Helper: Core Generation Logic ---
         def process_single_target(c_key):
@@ -660,9 +677,9 @@ class GeneratorPL(pl.LightningModule):
             gen_vis = self.generator.sample(
                 cond_batch_vis, num_inference_steps=50, t_cutoff=0.04
             )
-
             # Stack for transport/logging: (24, C, H, W) -> [Real|Rec|Gen]
             vis_imgs = torch.cat([vis_real, rec_imgs, gen_vis], dim=0)
+
             # inside process_single_target, after vis_imgs is created:
             if vis_imgs.shape[1] == 6:
                 vis_imgs = self.fidelity_metrics._ensure_rgb(
@@ -685,13 +702,9 @@ class GeneratorPL(pl.LightningModule):
                 )
             gen_metric_imgs = torch.cat(gen_metric_list, dim=0)
 
-            # Because sync_on_compute=False, this now returns LOCAL FID without waiting
-            self.fidelity_metrics.fid.reset()
-
             rfid, fid_gen, fid_base = self.fidelity_metrics.compute_rfid(
                 real_imgs, gen_metric_imgs
             )
-            self.fidelity_metrics.fid.reset()
 
             return (rfid, fid_gen, fid_base), vis_imgs
 
@@ -711,8 +724,11 @@ class GeneratorPL(pl.LightningModule):
             #     rec_imgs = self.fidelity_metrics._ensure_rgb(rec_imgs)
             #     gen_vis = self.fidelity_metrics._ensure_rgb(gen_vis)
 
-            cond_str = "_".join([f"{v}" for k, v in c_key])  # c_key is tuple of items
-            cond_tag = f"cond_{cond_str}"
+            # cond_str = "_".join([f"{v}" for k, v in c_key])  # c_key is tuple of items
+            # cond_tag = f"cond_{cond_str}"
+            human = "_".join([f"{k}={v}" for k, v in c_key])
+            h = hashlib.md5(str(c_key).encode()).hexdigest()[:6]
+            cond_tag = f"cond_{h}_{human}"
 
             # Log Metrics
             # sync_dist=False is safer here since keys are unique to Rank 0 logging pass
