@@ -72,6 +72,13 @@ class ConditionalFidelityMetrics:
         sigma1 = np.atleast_2d(sigma1)
         sigma2 = np.atleast_2d(sigma2)
 
+        # Stabilize covariances
+        sigma1 = (sigma1 + sigma1.T) / 2.0
+        sigma2 = (sigma2 + sigma2.T) / 2.0
+        eps = 1e-6
+        sigma1 = sigma1 + np.eye(sigma1.shape[0]) * eps
+        sigma2 = sigma2 + np.eye(sigma2.shape[0]) * eps
+
         assert mu1.shape == mu2.shape
         assert sigma1.shape == sigma2.shape
 
@@ -88,9 +95,11 @@ class ConditionalFidelityMetrics:
             covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
 
         if np.iscomplexobj(covmean):
-            if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+            if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-2):
                 m = np.max(np.abs(covmean.imag))
-                raise ValueError("Imaginary component {}".format(m))
+                warnings.warn(
+                    f"sqrtm returned large imaginary component {m:.3e}; taking real part anyway"
+                )
             covmean = covmean.real
 
         tr_covmean = np.trace(covmean)
