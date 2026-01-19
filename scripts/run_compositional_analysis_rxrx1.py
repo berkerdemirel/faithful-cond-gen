@@ -553,6 +553,7 @@ def create_summary_report(df: pd.DataFrame, output_dir: Path):
             df_valid = df_marginal[df_marginal["auroc"].notna()]
             if len(df_valid) > 0:
                 best = df_valid.loc[df_valid.groupby("encoder")["auroc"].idxmax()]
+                best = best.sort_values("auroc", ascending=False)  # Sort by AUROC descending
                 report.append(
                     best[
                         ["encoder", "scorer", "auroc", "fpr95", "delta_score"]
@@ -568,6 +569,7 @@ def create_summary_report(df: pd.DataFrame, output_dir: Path):
                 best = df_valid.loc[
                     df_valid.groupby("encoder")["spearman_rho"].idxmax()
                 ]
+                best = best.sort_values("spearman_rho", ascending=False)
                 report.append(
                     best[
                         ["encoder", "scorer", "spearman_rho", "kendall_tau"]
@@ -576,10 +578,11 @@ def create_summary_report(df: pd.DataFrame, output_dir: Path):
 
         # Summary by Scorer
         report.append("\n\n---\n## Summary: Average Metrics by Scorer\n")
+        report.append("*Note: AUROC/FPR95 only apply to marginalmodel (OOD detection requires unseen combos)*\n")
 
         if len(df_marginal) > 0:
             report.append("\n### marginalmodel\n")
-            cols = ["auroc", "fpr95", "delta_score", "spearman_rho"]
+            cols = ["auroc", "fpr95", "delta_score", "spearman_rho", "kendall_tau"]
             cols = [c for c in cols if c in df_marginal.columns]
             scorer_avg = (
                 df_marginal.groupby("scorer")[cols]
@@ -590,6 +593,7 @@ def create_summary_report(df: pd.DataFrame, output_dir: Path):
 
         if len(df_full) > 0:
             report.append("\n\n### fullmodel\n")
+            report.append("*No OOD metrics (all combos are seen). Showing ranking metrics only.*\n")
             cols = ["spearman_rho", "kendall_tau"]
             cols = [c for c in cols if c in df_full.columns]
             scorer_avg = (
@@ -613,14 +617,26 @@ def create_summary_report(df: pd.DataFrame, output_dir: Path):
         best_rank_rho = df_ok.groupby("scorer")["spearman_rho"].mean().max()
         report.append(f"2. **Best for ranking**: {best_rank} (rho={best_rank_rho:.4f})\n")
 
-        # Encoder comparison
+        # Encoder comparison - separate by model type
         report.append("\n### Encoder Comparison (avg across scorers)\n")
-        enc_avg = (
-            df_ok.groupby("encoder")[["spearman_rho"]]
-            .mean()
-            .sort_values("spearman_rho", ascending=False)
-        )
-        report.append(enc_avg.round(4).to_markdown())
+
+        if len(df_marginal) > 0:
+            report.append("\n**marginalmodel** (OOD detection + ranking):\n")
+            enc_marginal = (
+                df_marginal.groupby("encoder")[["auroc", "fpr95", "spearman_rho", "kendall_tau"]]
+                .mean()
+                .sort_values("auroc", ascending=False)
+            )
+            report.append(enc_marginal.round(4).to_markdown())
+
+        if len(df_full) > 0:
+            report.append("\n\n**fullmodel** (ranking only):\n")
+            enc_full = (
+                df_full.groupby("encoder")[["spearman_rho", "kendall_tau"]]
+                .mean()
+                .sort_values("spearman_rho", ascending=False)
+            )
+            report.append(enc_full.round(4).to_markdown())
 
     with open(output_dir / "COMPOSITIONAL_ANALYSIS_RXRX1.md", "w") as f:
         f.write("\n".join(report))
@@ -633,6 +649,10 @@ def main():
     parser.add_argument(
         "--output-dir", type=str, default="outputs/compositional_analysis_rxrx1"
     )
+    parser.add_argument(
+        "--report-only", action="store_true",
+        help="Load cached results and regenerate report only (skip computation)"
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -643,11 +663,22 @@ def main():
     print(f"Conditioning keys: {COMP_KEYS}")
     print(f"Held-out pairs: {len(HELD_OUT_PAIRS)}")
 
-    df = run_full_analysis()
+    if args.report_only:
+        results_path = output_dir / "results.pt"
+        if not results_path.exists():
+            print(f"ERROR: No cached results at {results_path}")
+            sys.exit(1)
+        print(f"Loading cached results from {results_path}...")
+        cached = torch.load(results_path, weights_only=False)
+        df = pd.DataFrame(cached["results"])
+        print(f"Loaded {len(df)} rows")
+    else:
+        df = run_full_analysis()
 
     if len(df) > 0:
         create_summary_report(df, output_dir)
-        torch.save({"results": df.to_dict()}, output_dir / "results.pt")
+        if not args.report_only:
+            torch.save({"results": df.to_dict()}, output_dir / "results.pt")
 
     print("\n" + "=" * 60)
     print("ANALYSIS COMPLETE")
