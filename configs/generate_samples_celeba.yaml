@@ -4,9 +4,9 @@ defaults:
   - _self_
 
 # Checkpoint: use registry key (preferred) or raw path (fallback)
-# Available keys: celeba_full_v1, celeba_marginal_v1, rxrx1_full_v1, rxrx1_marginal_v1
-checkpoint_key: celeba_marginal_v1
-# checkpoint_key: celeba_full_v1
+# Available keys: celeba_vanilla_full_v1, celeba_vanilla_marginal_v1, rxrx1_vanilla_full_v1, rxrx1_vanilla_marginal_v1
+checkpoint_key: celeba_vanilla_marginal_v1
+# checkpoint_key: celeba_vanilla_full_v1
 ckpt_path: null  # fallback if checkpoint_key not set
 
 # Output
