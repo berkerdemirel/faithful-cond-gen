@@ -77,6 +77,13 @@ class GeneratorPLConfig:
     additivity_t_threshold: float = (
         0.5  # Only apply at high noise levels (t > threshold)
     )
+    # Attribute delta alignment loss (intervention consistency in teacher space)
+    attr_delta_loss_weight: float = (
+        0.0  # Weight for attribute delta alignment (0 = disabled)
+    )
+    attr_delta_loss_prob: float = (
+        0.1  # Probability of computing attr delta loss per batch
+    )
 
 
 class GeneratorPL(pl.LightningModule):
@@ -260,6 +267,84 @@ class GeneratorPL(pl.LightningModule):
 
         return F.mse_loss(v_full, target)
 
+
+    def compute_attr_delta_loss(self, x_t, t, cond_ids, zs, tau_eps=1e-6):
+        if zs is None:
+            return x_t.new_tensor(0.0)
+        B, K = cond_ids.shape
+        if B < 4 or K < 1:
+            return x_t.new_tensor(0.0)
+
+        k = torch.randint(K, (1,), device=cond_ids.device).item()
+        attr_num_classes = self.generator.diffusion_backbone.attr_num_classes
+        num_classes_k = attr_num_classes[k]
+        if num_classes_k != 2:
+            return x_t.new_tensor(0.0)  # keep v1 binary-only; extend later
+
+        # context = all attrs except k
+        ctx = torch.cat([cond_ids[:, :k], cond_ids[:, k+1:]], dim=1)  # (B, K-1)
+        # group indices by context
+        # easiest: hash contexts to buckets
+        ctx_keys = [tuple(row.tolist()) for row in ctx]
+        buckets = {}
+        for i, key in enumerate(ctx_keys):
+            buckets.setdefault(key, []).append(i)
+
+        # build matched pairs (low, high) within same context
+        low_idx, high_idx = [], []
+        for key, idxs in buckets.items():
+            idxs = torch.tensor(idxs, device=cond_ids.device)
+            vals = cond_ids[idxs, k]
+            lo = idxs[vals == 0]
+            hi = idxs[vals == 1]
+            if lo.numel() == 0 or hi.numel() == 0:
+                continue
+            m = min(lo.numel(), hi.numel())
+            low_idx.append(lo[:m])
+            high_idx.append(hi[:m])
+
+        if len(low_idx) == 0:
+            return x_t.new_tensor(0.0)
+
+        low_idx = torch.cat(low_idx, dim=0)
+        high_idx = torch.cat(high_idx, dim=0)
+
+        # teacher delta from matched pairs (interventional proxy)
+        delta_t = zs[high_idx].mean(dim=0) - zs[low_idx].mean(dim=0)  # (P,D)
+        delta_t = F.normalize(delta_t, dim=-1, eps=tau_eps).detach()
+
+        # student delta: same anchors, flip only k
+        anchors = torch.cat([low_idx, high_idx], dim=0).unique()
+        n = min(8, anchors.numel())
+        anchors = anchors[torch.randperm(anchors.numel(), device=anchors.device)[:n]]
+
+        x_sub, t_sub = x_t[anchors], t[anchors]
+        c_sub = cond_ids[anchors].clone()
+        c_low = c_sub.clone();  c_low[:, k] = 0
+        c_high = c_sub.clone(); c_high[:, k] = 1
+        no_drop = torch.zeros(n, device=x_t.device, dtype=torch.long)
+
+        # compute both in one go to save compute
+        x_cat = torch.cat([x_sub, x_sub], dim=0)
+        t_cat = torch.cat([t_sub, t_sub], dim=0)
+        c_cat = torch.cat([c_low, c_high], dim=0)
+        _, zs_tilde_cat = self.generator.velocity_prediction(
+            x_cat, t_cat, c_cat, force_drop_ids=torch.zeros(2*n, device=x_t.device, dtype=torch.long),
+            return_projected=True
+        )
+        if zs_tilde_cat is None or len(zs_tilde_cat) == 0:
+            return x_t.new_tensor(0.0)
+
+        loss = x_t.new_tensor(0.0)
+        for z_cat in zs_tilde_cat:
+            z_low, z_high = z_cat[:n], z_cat[n:]
+            delta_s = F.normalize(z_high - z_low, dim=-1, eps=tau_eps)  # (n,P,D)
+            cos = (delta_s * delta_t.unsqueeze(0)).sum(dim=-1)          # (n,P)
+            loss = loss + (-cos).mean()
+
+        return loss / len(zs_tilde_cat)
+
+
     def training_step(self, batch, batch_idx: int):
         images, cond_ids_raw = self._unpack_batch(batch)
 
@@ -302,14 +387,16 @@ class GeneratorPL(pl.LightningModule):
 
         # --- REPA projection loss ---
         proj_loss = torch.tensor(0.0, device=denoising_loss.device)
+        relational_loss = torch.tensor(0.0, device=denoising_loss.device)
+
         if use_repa and zs_tilde is not None and zs is not None:
             proj_loss = self._compute_repa_loss(zs, zs_tilde)
-
+            relational_loss = self._compute_repa_relational(zs, zs_tilde)
         # --- total loss ---
         loss = denoising_loss
         if use_repa:
             proj_coeff = self.generator.cfg.repa_proj_coeff
-            loss = loss + proj_coeff * proj_loss
+            loss = loss + proj_coeff * (proj_loss + relational_loss)
 
         # --- additivity loss (compositional generalization) ---
         add_loss = torch.tensor(0.0, device=loss.device)
@@ -320,10 +407,23 @@ class GeneratorPL(pl.LightningModule):
                 add_loss = self.compute_additivity_loss(x_t, t, cond_ids_raw)
                 loss = loss + self.cfg.additivity_loss_weight * add_loss
 
+        # --- attribute delta alignment loss (intervention consistency) ---
+        attr_delta_loss = torch.tensor(0.0, device=loss.device)
+        if use_repa and self.cfg.attr_delta_loss_weight > 0:
+            # Stochastically apply attr delta loss (requires REPA encoder)
+            if torch.rand(1).item() < self.cfg.attr_delta_loss_prob:
+                attr_delta_loss = self.compute_attr_delta_loss(
+                    x_t, t, cond_ids_raw, zs
+                )
+                loss = loss + self.cfg.attr_delta_loss_weight * attr_delta_loss
+
         self.log("train/loss", loss, prog_bar=True)
         self.log("train/denoising_loss", denoising_loss, prog_bar=False)
         if use_repa:
             self.log("train/proj_loss", proj_loss, prog_bar=True)
+            self.log("train/relational_loss", relational_loss, prog_bar=True)
+            if self.cfg.attr_delta_loss_weight > 0:
+                self.log("train/attr_delta_loss", attr_delta_loss, prog_bar=False)
         if self.cfg.additivity_loss_weight > 0:
             self.log("train/add_loss", add_loss, prog_bar=False)
         return loss
@@ -361,31 +461,6 @@ class GeneratorPL(pl.LightningModule):
 
             num_patches_sit = z_tilde.shape[1]
             num_patches_enc = zs.shape[1]
-            # if num_patches_sit != num_patches_enc:
-            #     # Warn once about mismatch (not ideal, paper assumes matching)
-            #     if not hasattr(self, "_repa_patch_mismatch_warned"):
-            #         print(
-            #             f"⚠️ [REPA] Patch count mismatch: SiT={num_patches_sit}, Encoder={num_patches_enc}. "
-            #             f"Using interpolation (deviates from original paper)."
-            #         )
-            #         self._repa_patch_mismatch_warned = True
-
-            #     # Fallback: interpolate SiT features to encoder resolution
-            #     h_sit = int(num_patches_sit**0.5)
-            #     h_enc = int(num_patches_enc**0.5)
-            #     z_tilde_spatial = z_tilde.permute(0, 2, 1).reshape(
-            #         bsz, -1, h_sit, h_sit
-            #     )
-            #     z_tilde_interp = F.interpolate(
-            #         z_tilde_spatial,
-            #         size=(h_enc, h_enc),
-            #         mode="bilinear",
-            #         align_corners=False,
-            #     )
-            #     z_tilde = z_tilde_interp.reshape(bsz, -1, h_enc * h_enc).permute(
-            #         0, 2, 1
-            #     )
-
             if num_patches_sit != num_patches_enc:
                 raise ValueError(
                     f"[REPA] Patch mismatch: SiT={num_patches_sit}, Enc={num_patches_enc}. "
@@ -403,6 +478,113 @@ class GeneratorPL(pl.LightningModule):
 
         proj_loss = proj_loss / len(zs_tilde)
         return proj_loss
+
+    def _compute_repa_relational_loss_MSE(
+        self,
+        zs: torch.Tensor,                 # (B, T, D) teacher patch tokens
+        zs_tilde: List[torch.Tensor],     # list of (B, T, D) student projected tokens
+    ) -> torch.Tensor:
+        """
+        Relational (matrix) REPA with the same "cos then mean" spirit as pointwise REPA.
+
+        Target:
+        S_tt[i,j] = mean_p cos(zs[i,p], zs[j,p])
+        Prediction:
+        S_ts[i,j] = mean_p cos(zs[i,p], z_tilde[j,p])
+
+        Loss:
+        MSE(S_ts, S_tt)
+        """
+        if zs_tilde is None or len(zs_tilde) == 0:
+            return torch.tensor(0.0, device=zs.device)
+
+        # Normalize per-token so dot = cosine
+        t = F.normalize(zs, dim=-1)  # (B, T, D)
+
+        # Target matrix: teacher-teacher similarity per (i,j), averaged over patches
+        # (B, B, T) then mean over T -> (B, B)
+        S_tt = torch.einsum("btd,ctd->bct", t, t).mean(dim=-1).clamp(-1, 1).detach()
+
+        loss = 0.0
+        for z_tilde in zs_tilde:
+            if z_tilde.shape[:2] != zs.shape[:2]:
+                raise ValueError(
+                    f"[REPA-REL] Shape mismatch: teacher {tuple(zs.shape[:2])} vs student {tuple(z_tilde.shape[:2])}"
+                )
+            s = F.normalize(z_tilde, dim=-1)  # (B, T, D)
+
+            # Prediction matrix: teacher-student similarity (i vs j), averaged over patches
+            S_ts = torch.einsum("btd,ctd->bct", t, s).mean(dim=-1).clamp(-1, 1)  # (B, B)
+
+            loss = loss + F.mse_loss(S_ts, S_tt)
+
+        return loss / len(zs_tilde)
+
+
+    def _compute_repa_relational(
+        self,
+        zs: torch.Tensor,                 # (B, P, D) teacher tokens
+        zs_tilde: List[torch.Tensor],     # list of (B, P, D) student projected tokens
+        tau_t: float = 0.04,              # teacher sharper
+        tau_s: float = 0.10,              # student softer
+        diag_fill: float = -1e9,
+        eps: float = 1e-12,
+    ) -> torch.Tensor:
+        """
+        Teacher-anchored relational loss, per patch index (no early mean over patches):
+
+        For each patch p:
+        logits_tt[p,i,j] = <t[i,p], t[j,p]> / tau_t
+        logits_ts[p,i,j] = <t[i,p], s[j,p]> / tau_s
+
+        Mask diagonal j=i (so pointwise is handled separately by _compute_repa_loss),
+        then do one-way KL: KL( softmax(tt) || softmax(ts) ), averaged over (p,i).
+        """
+        if zs_tilde is None or len(zs_tilde) == 0:
+            return torch.tensor(0.0, device=zs.device)
+
+        B, P, _ = zs.shape
+        if B < 2:
+            return torch.tensor(0.0, device=zs.device)
+
+        device = zs.device
+
+        # Normalize teacher tokens; detach so teacher is a fixed target
+        t = F.normalize(zs, dim=-1).detach()  # (B, P, D)
+
+        # Build diag mask for (P, B, B)
+        diag_mask = torch.eye(B, device=device, dtype=torch.bool).unsqueeze(0)  # (1,B,B)
+
+        # Teacher-teacher logits per patch: (P, B, B)
+        logits_tt = torch.einsum("bpd,cpd->pbc", t, t) / tau_t
+        logits_tt = logits_tt.masked_fill(diag_mask, diag_fill)
+
+        # Teacher target distribution and log-probs (computed once)
+        log_p_tt = F.log_softmax(logits_tt, dim=-1)
+        p_tt = log_p_tt.exp()
+        # p_tt = F.softmax(logits_tt, dim=-1)                      # (P,B,B)
+        # log_p_tt = torch.log(p_tt + eps)                         # (P,B,B)
+
+        loss = 0.0
+        for z_tilde in zs_tilde:
+            if z_tilde.shape[:2] != zs.shape[:2]:
+                raise ValueError(
+                    f"[REPA-REL-KL] Shape mismatch: teacher {tuple(zs.shape[:2])} vs student {tuple(z_tilde.shape[:2])}"
+                )
+
+            s = F.normalize(z_tilde, dim=-1)                     # (B,P,D)
+
+            # Teacher-student logits per patch: (P, B, B)
+            logits_ts = torch.einsum("bpd,cpd->pbc", t, s) / tau_s
+            logits_ts = logits_ts.masked_fill(diag_mask, diag_fill)
+
+            log_p_ts = F.log_softmax(logits_ts, dim=-1)           # (P,B,B)
+
+            # KL per (patch, anchor): sum over j
+            kl = (p_tt * (log_p_tt - log_p_ts)).sum(dim=-1)       # (P,B)
+            loss = loss + kl.mean()
+
+        return loss / len(zs_tilde)
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx: int):
