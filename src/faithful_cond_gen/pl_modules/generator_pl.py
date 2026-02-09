@@ -84,6 +84,9 @@ class GeneratorPLConfig:
     attr_delta_loss_prob: float = (
         0.1  # Probability of computing attr delta loss per batch
     )
+    relational_loss_weight: float = (
+        0.0  # Weight for relational loss (0 = disabled)
+    )
 
 
 class GeneratorPL(pl.LightningModule):
@@ -268,165 +271,242 @@ class GeneratorPL(pl.LightningModule):
         return F.mse_loss(v_full, target)
 
 
+    # def compute_attr_delta_loss(self, x_t, t, cond_ids, zs, tau_eps=1e-6):
+    #     if zs is None:
+    #         return x_t.new_tensor(0.0)
+    #     B, K = cond_ids.shape
+    #     if B < 4 or K < 1:
+    #         return x_t.new_tensor(0.0)
+
+    #     k = torch.randint(K, (1,), device=cond_ids.device).item()
+    #     attr_num_classes = self.generator.diffusion_backbone.attr_num_classes
+    #     num_classes_k = attr_num_classes[k]
+    #     if num_classes_k != 2:
+    #         return x_t.new_tensor(0.0)  # keep v1 binary-only; extend later
+
+    #     # context = all attrs except k
+    #     ctx = torch.cat([cond_ids[:, :k], cond_ids[:, k+1:]], dim=1)  # (B, K-1)
+    #     # group indices by context
+    #     # easiest: hash contexts to buckets
+    #     ctx_keys = [tuple(row.tolist()) for row in ctx]
+    #     buckets = {}
+    #     for i, key in enumerate(ctx_keys):
+    #         buckets.setdefault(key, []).append(i)
+
+    #     # build matched pairs (low, high) within same context
+    #     low_idx, high_idx = [], []
+    #     for key, idxs in buckets.items():
+    #         idxs = torch.tensor(idxs, device=cond_ids.device)
+    #         vals = cond_ids[idxs, k]
+    #         lo = idxs[vals == 0]
+    #         hi = idxs[vals == 1]
+    #         if lo.numel() == 0 or hi.numel() == 0:
+    #             continue
+    #         m = min(lo.numel(), hi.numel())
+    #         low_idx.append(lo[:m])
+    #         high_idx.append(hi[:m])
+
+    #     if len(low_idx) == 0:
+    #         return x_t.new_tensor(0.0)
+
+    #     low_idx = torch.cat(low_idx, dim=0)
+    #     high_idx = torch.cat(high_idx, dim=0)
+
+    #     # teacher delta from matched pairs (interventional proxy)
+    #     delta_t = zs[high_idx].mean(dim=0) - zs[low_idx].mean(dim=0)  # (P,D)
+    #     delta_t = F.normalize(delta_t, dim=-1, eps=tau_eps).detach()
+
+    #     # student delta: same anchors, flip only k
+    #     anchors = torch.cat([low_idx, high_idx], dim=0).unique()
+    #     n = min(8, anchors.numel())
+    #     anchors = anchors[torch.randperm(anchors.numel(), device=anchors.device)[:n]]
+
+    #     x_sub, t_sub = x_t[anchors], t[anchors]
+    #     c_sub = cond_ids[anchors].clone()
+    #     c_low = c_sub.clone();  c_low[:, k] = 0
+    #     c_high = c_sub.clone(); c_high[:, k] = 1
+    #     no_drop = torch.zeros(n, device=x_t.device, dtype=torch.long)
+
+    #     # compute both in one go to save compute
+    #     x_cat = torch.cat([x_sub, x_sub], dim=0)
+    #     t_cat = torch.cat([t_sub, t_sub], dim=0)
+    #     c_cat = torch.cat([c_low, c_high], dim=0)
+    #     _, zs_tilde_cat = self.generator.velocity_prediction(
+    #         x_cat, t_cat, c_cat, force_drop_ids=torch.zeros(2*n, device=x_t.device, dtype=torch.long),
+    #         return_projected=True
+    #     )
+    #     if zs_tilde_cat is None or len(zs_tilde_cat) == 0:
+    #         return x_t.new_tensor(0.0)
+
+    #     loss = x_t.new_tensor(0.0)
+    #     for z_cat in zs_tilde_cat:
+    #         z_low, z_high = z_cat[:n], z_cat[n:]
+    #         delta_s = F.normalize(z_high - z_low, dim=-1, eps=tau_eps)  # (n,P,D)
+    #         cos = (delta_s * delta_t.unsqueeze(0)).sum(dim=-1)          # (n,P)
+    #         loss = loss + (-cos).mean()
+
+    #     return loss / len(zs_tilde_cat)
+
     def compute_attr_delta_loss(self, x_t, t, cond_ids, zs, tau_eps=1e-6):
         if zs is None:
             return x_t.new_tensor(0.0)
+
         B, K = cond_ids.shape
         if B < 4 or K < 1:
             return x_t.new_tensor(0.0)
 
-        k = torch.randint(K, (1,), device=cond_ids.device).item()
         attr_num_classes = self.generator.diffusion_backbone.attr_num_classes
-        num_classes_k = attr_num_classes[k]
-        if num_classes_k != 2:
-            return x_t.new_tensor(0.0)  # keep v1 binary-only; extend later
+        losses = []
 
-        # context = all attrs except k
-        ctx = torch.cat([cond_ids[:, :k], cond_ids[:, k+1:]], dim=1)  # (B, K-1)
-        # group indices by context
-        # easiest: hash contexts to buckets
-        ctx_keys = [tuple(row.tolist()) for row in ctx]
-        buckets = {}
-        for i, key in enumerate(ctx_keys):
-            buckets.setdefault(key, []).append(i)
+        for k in range(K):
+            if attr_num_classes[k] != 2:
+                continue  # v1: binary-only
 
-        # build matched pairs (low, high) within same context
-        low_idx, high_idx = [], []
-        for key, idxs in buckets.items():
-            idxs = torch.tensor(idxs, device=cond_ids.device)
-            vals = cond_ids[idxs, k]
-            lo = idxs[vals == 0]
-            hi = idxs[vals == 1]
-            if lo.numel() == 0 or hi.numel() == 0:
+            # context = all attrs except k
+            ctx = torch.cat([cond_ids[:, :k], cond_ids[:, k + 1 :]], dim=1)  # (B, K-1)
+            # group by context using torch.unique (stays on device)
+            _, inv = torch.unique(ctx, dim=0, return_inverse=True)  # inv: (B,)
+
+            low_idx_list, high_idx_list = [], []
+
+            for g in inv.unique():
+                idxs = (inv == g).nonzero(as_tuple=False).squeeze(1)  # (n_g,)
+                vals = cond_ids[idxs, k]
+                lo = idxs[vals == 0]
+                hi = idxs[vals == 1]
+                if lo.numel() == 0 or hi.numel() == 0:
+                    continue
+                m = min(lo.numel(), hi.numel())
+                low_idx_list.append(lo[:m])
+                high_idx_list.append(hi[:m])
+
+            if len(low_idx_list) == 0:
                 continue
-            m = min(lo.numel(), hi.numel())
-            low_idx.append(lo[:m])
-            high_idx.append(hi[:m])
 
-        if len(low_idx) == 0:
+            low_idx = torch.cat(low_idx_list, dim=0)
+            high_idx = torch.cat(high_idx_list, dim=0)
+
+            # teacher delta (proxy ATE for this k, within-context matched)
+            delta_t = zs[high_idx].mean(dim=0) - zs[low_idx].mean(dim=0)  # (P,D)
+            delta_t = torch.nn.functional.normalize(delta_t, dim=-1, eps=tau_eps).detach()
+
+            # student delta: flip only k on a few anchors
+            anchors = torch.cat([low_idx, high_idx], dim=0).unique()
+            if anchors.numel() == 0:
+                continue
+            n = min(8, anchors.numel())
+            anchors = anchors[torch.randperm(anchors.numel(), device=anchors.device)[:n]]
+
+            x_sub, t_sub = x_t[anchors], t[anchors]
+            c_sub = cond_ids[anchors].clone()
+            c_low = c_sub.clone()
+            c_high = c_sub.clone()
+            c_low[:, k] = 0
+            c_high[:, k] = 1
+
+            x_cat = torch.cat([x_sub, x_sub], dim=0)
+            t_cat = torch.cat([t_sub, t_sub], dim=0)
+            c_cat = torch.cat([c_low, c_high], dim=0)
+
+            _, zs_tilde_cat = self.generator.velocity_prediction(
+                x_cat,
+                t_cat,
+                c_cat,
+                force_drop_ids=torch.zeros(2 * n, device=x_t.device, dtype=torch.long),
+                return_projected=True,
+            )
+            if zs_tilde_cat is None or len(zs_tilde_cat) == 0:
+                continue
+
+            loss_k = x_t.new_tensor(0.0)
+            for z_cat in zs_tilde_cat:
+                z_low, z_high = z_cat[:n], z_cat[n:]
+                delta_s = torch.nn.functional.normalize(z_high - z_low, dim=-1, eps=tau_eps)  # (n,P,D)
+                cos = (delta_s * delta_t.unsqueeze(0)).sum(dim=-1)  # (n,P)
+                loss_k = loss_k + (-cos).mean()
+
+            losses.append(loss_k / len(zs_tilde_cat))
+
+        if len(losses) == 0:
             return x_t.new_tensor(0.0)
 
-        low_idx = torch.cat(low_idx, dim=0)
-        high_idx = torch.cat(high_idx, dim=0)
-
-        # teacher delta from matched pairs (interventional proxy)
-        delta_t = zs[high_idx].mean(dim=0) - zs[low_idx].mean(dim=0)  # (P,D)
-        delta_t = F.normalize(delta_t, dim=-1, eps=tau_eps).detach()
-
-        # student delta: same anchors, flip only k
-        anchors = torch.cat([low_idx, high_idx], dim=0).unique()
-        n = min(8, anchors.numel())
-        anchors = anchors[torch.randperm(anchors.numel(), device=anchors.device)[:n]]
-
-        x_sub, t_sub = x_t[anchors], t[anchors]
-        c_sub = cond_ids[anchors].clone()
-        c_low = c_sub.clone();  c_low[:, k] = 0
-        c_high = c_sub.clone(); c_high[:, k] = 1
-        no_drop = torch.zeros(n, device=x_t.device, dtype=torch.long)
-
-        # compute both in one go to save compute
-        x_cat = torch.cat([x_sub, x_sub], dim=0)
-        t_cat = torch.cat([t_sub, t_sub], dim=0)
-        c_cat = torch.cat([c_low, c_high], dim=0)
-        _, zs_tilde_cat = self.generator.velocity_prediction(
-            x_cat, t_cat, c_cat, force_drop_ids=torch.zeros(2*n, device=x_t.device, dtype=torch.long),
-            return_projected=True
-        )
-        if zs_tilde_cat is None or len(zs_tilde_cat) == 0:
-            return x_t.new_tensor(0.0)
-
-        loss = x_t.new_tensor(0.0)
-        for z_cat in zs_tilde_cat:
-            z_low, z_high = z_cat[:n], z_cat[n:]
-            delta_s = F.normalize(z_high - z_low, dim=-1, eps=tau_eps)  # (n,P,D)
-            cos = (delta_s * delta_t.unsqueeze(0)).sum(dim=-1)          # (n,P)
-            loss = loss + (-cos).mean()
-
-        return loss / len(zs_tilde_cat)
+        return torch.stack(losses).mean()
 
 
     def training_step(self, batch, batch_idx: int):
+        # 1) get images, cond ids
         images, cond_ids_raw = self._unpack_batch(batch)
-
-        # --- apply condition dropout (compositional generalization) ---
         cond_ids = self.apply_condition_dropout(cond_ids_raw)
 
-        # --- encode to latents ---
+        # 2) encode to latents
         with torch.no_grad():
-            x0 = self.generator.encode(images)  # (B,4,h,w) if VAE frozen
+            x0 = self.generator.encode(images)
 
+        # 3) forward process
         b = x0.shape[0]
-
-        # --- forward/noising process ---
         t = torch.rand(b, device=x0.device, dtype=torch.float32)
         eps = torch.randn_like(x0)
         x_t, v_tgt = self.linear_interpolant(x0, t, eps)
 
-        # --- REPA: extract encoder features from raw images ---
+        # knobs
+        use_repa = self.repa_encoder is not None
+        add_w = float(self.cfg.additivity_loss_weight)
+        proj_w = float(self.generator.cfg.repa_proj_coeff) if use_repa else 0.0
+        rel_w = float(self.cfg.relational_loss_weight) if use_repa else 0.0
+        attr_w = float(self.cfg.attr_delta_loss_weight) if use_repa else 0.0
+
+        # teacher tokens (only if any teacher-dependent loss is active)
         zs = None
-        if self.repa_encoder is not None:
+        if use_repa and (proj_w > 0.0 or rel_w > 0.0 or attr_w > 0.0):
             with torch.no_grad():
-                # zs: (B, num_patches, embed_dim) - patch tokens from frozen encoder
                 zs = self.repa_encoder(images)
 
-        # --- velocity prediction ---
-        # Note: class_dropout is applied inside velocity_prediction via LabelEmbedder
-        # So cond_ids here may have individual attributes masked (cond_dropout)
-        # AND the whole condition may be dropped (class_dropout) - they compose!
-        use_repa = self.repa_encoder is not None
+        # 4) velocity prediction (return_projected = use_repa)
+        zs_tilde = None
         if use_repa:
             v_hat, zs_tilde = self.generator.velocity_prediction(
                 x_t=x_t, t=t, cond_ids=cond_ids, return_projected=True
             )
         else:
             v_hat = self.generator.velocity_prediction(x_t=x_t, t=t, cond_ids=cond_ids)
-            zs_tilde = None
 
-        # --- main velocity loss ---
+        # 5) total_loss and base loss
+        total_loss = torch.tensor(0.0, device=x0.device, dtype=x0.dtype)
+        # init all auxiliaries as 0 so we can log unconditionally
+        add_loss = torch.tensor(0.0, device=x0.device, dtype=x0.dtype)
+        proj_loss = torch.tensor(0.0, device=x0.device, dtype=x0.dtype)
+        relational_loss = torch.tensor(0.0, device=x0.device, dtype=x0.dtype)
+        attr_delta_loss = torch.tensor(0.0, device=x0.device, dtype=x0.dtype)
+
         denoising_loss = F.mse_loss(v_hat, v_tgt)
+        total_loss = total_loss + denoising_loss
 
-        # --- REPA projection loss ---
-        proj_loss = torch.tensor(0.0, device=denoising_loss.device)
-        relational_loss = torch.tensor(0.0, device=denoising_loss.device)
+        # 6) gates (compute + add)
+        if add_w > 0.0 and torch.rand(1).item() < self.cfg.additivity_loss_prob:
+            add_loss = self.compute_additivity_loss(x_t, t, cond_ids_raw)
+            total_loss = total_loss + add_w * add_loss
 
-        if use_repa and zs_tilde is not None and zs is not None:
+        if proj_w > 0.0 and zs is not None and zs_tilde is not None:
             proj_loss = self._compute_repa_loss(zs, zs_tilde)
+            total_loss = total_loss + proj_w * proj_loss
+
+        if rel_w > 0.0 and zs is not None and zs_tilde is not None:
             relational_loss = self._compute_repa_relational(zs, zs_tilde)
-        # --- total loss ---
-        loss = denoising_loss
-        if use_repa:
-            proj_coeff = self.generator.cfg.repa_proj_coeff
-            loss = loss + proj_coeff * (proj_loss + relational_loss)
+            total_loss = total_loss + rel_w * relational_loss
 
-        # --- additivity loss (compositional generalization) ---
-        add_loss = torch.tensor(0.0, device=loss.device)
-        if self.cfg.additivity_loss_weight > 0:
-            # Stochastically apply additivity loss
-            if torch.rand(1).item() < self.cfg.additivity_loss_prob:
-                # Use pre-dropout conditions for additivity constraint
-                add_loss = self.compute_additivity_loss(x_t, t, cond_ids_raw)
-                loss = loss + self.cfg.additivity_loss_weight * add_loss
+        if attr_w > 0.0 and zs is not None and torch.rand(1).item() < self.cfg.attr_delta_loss_prob:
+            attr_delta_loss = self.compute_attr_delta_loss(x_t, t, cond_ids_raw, zs)
+            total_loss = total_loss + attr_w * attr_delta_loss
 
-        # --- attribute delta alignment loss (intervention consistency) ---
-        attr_delta_loss = torch.tensor(0.0, device=loss.device)
-        if use_repa and self.cfg.attr_delta_loss_weight > 0:
-            # Stochastically apply attr delta loss (requires REPA encoder)
-            if torch.rand(1).item() < self.cfg.attr_delta_loss_prob:
-                attr_delta_loss = self.compute_attr_delta_loss(
-                    x_t, t, cond_ids_raw, zs
-                )
-                loss = loss + self.cfg.attr_delta_loss_weight * attr_delta_loss
-
-        self.log("train/loss", loss, prog_bar=True)
+        # 7) log everything (always)
+        self.log("train/loss", total_loss, prog_bar=True)
         self.log("train/denoising_loss", denoising_loss, prog_bar=False)
-        if use_repa:
-            self.log("train/proj_loss", proj_loss, prog_bar=True)
-            self.log("train/relational_loss", relational_loss, prog_bar=True)
-            if self.cfg.attr_delta_loss_weight > 0:
-                self.log("train/attr_delta_loss", attr_delta_loss, prog_bar=False)
-        if self.cfg.additivity_loss_weight > 0:
-            self.log("train/add_loss", add_loss, prog_bar=False)
-        return loss
+        self.log("train/add_loss", add_loss, prog_bar=False)
+        self.log("train/proj_loss", proj_loss, prog_bar=True)
+        self.log("train/relational_loss", relational_loss, prog_bar=True)
+        self.log("train/attr_delta_loss", attr_delta_loss, prog_bar=False)
+
+        return total_loss
 
     def _compute_repa_loss(
         self,
