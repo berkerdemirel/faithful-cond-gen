@@ -8,6 +8,7 @@ from faithful_cond_gen.data.celeba import CelebaDataConfig, CelebaDataModule
 from faithful_cond_gen.data.rxrx1 import RxRx1DataConfig, RxRx1DataModule
 from faithful_cond_gen.model.generator import GeneratorConfig, GeneratorWrapper
 from faithful_cond_gen.pl_modules.generator_pl import GeneratorPL, GeneratorPLConfig
+from faithful_cond_gen.utils.config import maybe_set_run_name
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 
@@ -53,8 +54,7 @@ def main(cfg: DictConfig):
     model = GeneratorPL(generator, cfg=pl_cfg)
 
     # 5. Instantiate Logger
-    print("Initializing WandB Logger...")
-    # This uses the logger config group
+    maybe_set_run_name(cfg)
     logger = instantiate(cfg.logger)
 
     # 6. Instantiate Callbacks (NEW)

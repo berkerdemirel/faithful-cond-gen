@@ -1,12 +1,13 @@
-# configs/config.yaml
+# configs/config_celeba.yaml
 defaults:
-  - dataset: celeba        # celeba, rxrx1
-  - model: generator_celeba # generator_celeba, generator_rxrx1
-  - pl_module: default     # GeneratorPL settings (lr, etc)
-  - train: default_celeba           # Trainer settings (50 batches)
+  - dataset: celeba
+  - model: generator_celeba
+  - pl_module: default
+  - variant: vanilla        # vanilla, repa, compositional, repa_compositional, attr_delta
+  - train: default_celeba
   - eval: rfid
-  - logger: wandb_celeba          # WandB Logger
-  - callbacks: checkpoint # Checkpoint Callback
+  - logger: wandb_celeba
+  - callbacks: checkpoint
   - _self_
 
 seed: 1337

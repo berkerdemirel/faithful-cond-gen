@@ -1,0 +1,16 @@
+# @package _global_
+# configs/variant/attr_delta.yaml
+# Attribute-delta consistency loss (experimental)
+
+model:
+  use_repa: true
+  repa_proj_coeff: 0.0
+
+pl_module:
+  cond_dropout_prob: 0.2
+  additivity_loss_weight: 1.0
+  additivity_loss_prob: 0.25
+  additivity_t_threshold: 0.7
+  attr_delta_loss_weight: 0.05
+  attr_delta_loss_prob: 0.1
+  relational_loss_weight: 0.0

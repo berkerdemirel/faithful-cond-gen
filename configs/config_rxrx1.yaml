@@ -1,12 +1,13 @@
 # configs/config_rxrx1.yaml
 defaults:
-  - dataset: rxrx1        # celeba, rxrx1
-  - model: generator_rxrx1 # generator_celeba, generator_rxrx1
-  - pl_module: default     # GeneratorPL settings (lr, etc)
-  - train: default_rxrx1           # Trainer settings (50 batches)
+  - dataset: rxrx1
+  - model: generator_rxrx1
+  - pl_module: default
+  - variant: vanilla        # vanilla, repa, compositional, repa_compositional, attr_delta
+  - train: default_rxrx1
   - eval: rfid
-  - logger: wandb_rxrx1          # WandB Logger
-  - callbacks: checkpoint # Checkpoint Callback
+  - logger: wandb_rxrx1
+  - callbacks: checkpoint
   - _self_
 
 seed: 1337

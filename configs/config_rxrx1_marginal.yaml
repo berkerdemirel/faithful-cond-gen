@@ -3,13 +3,13 @@
 # Excludes top 100 (cell_type, perturbation) pairs from training
 
 defaults:
-  - dataset: rxrx1_marginal  # Use marginal dataset config with held_out_pairs
-  - model: generator_rxrx1    # generator_celeba, generator_rxrx1
-  - pl_module: marginal       # Lightning module with condition dropout enabled
-  - train: default_rxrx1      # Trainer settings
-  - callbacks: checkpoint     # Checkpointing
-  - logger: wandb_rxrx1_marginal       # WandB Logger
+  - dataset: rxrx1_marginal
+  - model: generator_rxrx1
+  - pl_module: default
+  - variant: compositional    # vanilla, repa, compositional, repa_compositional
+  - train: default_rxrx1
+  - callbacks: checkpoint
+  - logger: wandb_rxrx1_marginal
   - _self_
 
-# Override specific settings if needed
 seed: 1337

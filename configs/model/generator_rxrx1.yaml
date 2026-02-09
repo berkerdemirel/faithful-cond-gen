@@ -21,10 +21,10 @@ checkpoint: null
 
 # REPA (Representation Alignment) loss settings
 # - Aligns intermediate SiT features with frozen pretrained encoder features
-# - Disabled by default for backward compatibility
+# - Disabled by default for vanilla baseline
 # NOTE: For RxRx1 (6-channel), encoder features are extracted from RGB reconstruction
 use_repa: false
 repa_encoder: "dinov2-vit-b"  # dinov2-vit-{s,b,l}
-repa_proj_coeff: 0.5          # Weight for projection loss (0.5 = equal to velocity loss)
+repa_proj_coeff: 0.0          # OFF by default (vanilla baseline); set 0.5 for REPA
 repa_encoder_depth: 8         # SiT layer to extract features from
 repa_projector_dim: 2048      # Intermediate dimension for projector MLP
