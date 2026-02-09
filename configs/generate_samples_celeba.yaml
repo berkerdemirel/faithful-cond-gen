@@ -3,13 +3,15 @@ defaults:
   - model: generator_celeba # Override at CLI
   - _self_
 
-# Path to your trained model
-# ckpt_path: "/mnt/pvc/faithful-cond-gen/outputs/faithful-cond-gen/ekg1mfky/checkpoints/celeba_fullmodel_epoch_279-step_355880-rfid_1.1118.ckpt"
-ckpt_path: "/mnt/pvc/faithful-cond-gen/outputs/faithful-cond-gen/ob8i6pp8/checkpoints/celeba_marginalmodel_epoch_317-step_285882-rfid_1.4006.ckpt"
+# Checkpoint: use registry key (preferred) or raw path (fallback)
+# Available keys: celeba_full_v1, celeba_marginal_v1, rxrx1_full_v1, rxrx1_marginal_v1
+checkpoint_key: celeba_marginal_v1
+# checkpoint_key: celeba_full_v1
+ckpt_path: null  # fallback if checkpoint_key not set
 
 # Output
-# output_dir: "outputs/generated_celeba_fullmodel"
 output_dir: "outputs/generated_celeba_marginalmodel"
+# output_dir: "outputs/generated_celeba_fullmodel"
 
 # Generation params
 samples_per_condition: 1000 # 1000 for CelebA, 50 for RxRx1

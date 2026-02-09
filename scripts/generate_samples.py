@@ -9,6 +9,7 @@ import torch.distributed as dist
 from faithful_cond_gen.data.celeba import CelebaDataConfig, CelebaDataModule
 from faithful_cond_gen.data.rxrx1 import RxRx1DataConfig, RxRx1DataModule
 from faithful_cond_gen.pl_modules.generator_pl import GeneratorPL
+from faithful_cond_gen.utils.checkpoints import get_checkpoint_path
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 from PIL import Image
@@ -109,8 +110,15 @@ def main(cfg: DictConfig):
 
     generator_backbone = GeneratorWrapper(gen_cfg)
 
+    # Resolve checkpoint path: prefer checkpoint_key (registry lookup), fallback to ckpt_path
+    if cfg.get("checkpoint_key"):
+        ckpt_path = get_checkpoint_path(cfg.checkpoint_key)
+        log.info(f"[Rank {rank}] Using checkpoint key '{cfg.checkpoint_key}' -> {ckpt_path}")
+    else:
+        ckpt_path = cfg.ckpt_path
+
     pl_module = GeneratorPL.load_from_checkpoint(
-        cfg.ckpt_path, generator=generator_backbone, map_location=device, strict=False
+        ckpt_path, generator=generator_backbone, map_location=device, strict=False
     )
     pl_module.to(device)
     pl_module.eval()

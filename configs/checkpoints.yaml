@@ -1,0 +1,44 @@
+# Canonical checkpoint registry for faithful-cond-gen
+# Usage: from faithful_cond_gen.utils.checkpoints import get_checkpoint_path
+#        path = get_checkpoint_path("celeba_full_v1")
+
+checkpoints:
+  celeba_full_v1:
+    dataset: celeba
+    setting: full_support
+    model: vanilla
+    ckpt_path: outputs/faithful-cond-gen/ekg1mfky/checkpoints/celeba_fullmodel_epoch_279-step_355880-rfid_1.1118.ckpt
+    train_config: config_celeba
+    gen_config: generate_samples_celeba
+    paper_ready: true
+    notes: "Best CelebA full-support model (rFID=1.1118)"
+
+  celeba_marginal_v1:
+    dataset: celeba
+    setting: support_shift
+    model: vanilla
+    ckpt_path: outputs/faithful-cond-gen/ob8i6pp8/checkpoints/celeba_marginalmodel_epoch_317-step_285882-rfid_1.4006.ckpt
+    train_config: config_celeba_marginal
+    gen_config: generate_samples_celeba
+    paper_ready: true
+    notes: "Best CelebA stress-test model (rFID=1.4006)"
+
+  rxrx1_full_v1:
+    dataset: rxrx1
+    setting: full_support
+    model: vanilla
+    ckpt_path: outputs/faithful-cond-gen/hemmlww5/checkpoints/rxrx1_fullmodel_epoch_085-step_392934-rfid_0.9122.ckpt
+    train_config: config_rxrx1
+    gen_config: generate_samples_rxrx1
+    paper_ready: true
+    notes: "Best RxRx1 full-support model (rFID=0.9122)"
+
+  rxrx1_marginal_v1:
+    dataset: rxrx1
+    setting: support_shift
+    model: vanilla
+    ckpt_path: outputs/faithful-cond-gen/uz1n1q3l/checkpoints/rxrx1_marginal_model_epoch_093-step_388784-rfid_2.2607.ckpt
+    train_config: config_rxrx1_marginal
+    gen_config: generate_samples_rxrx1
+    paper_ready: true
+    notes: "Best RxRx1 pair-heldout model (rFID=2.2607)"
