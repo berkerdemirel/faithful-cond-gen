@@ -8,28 +8,28 @@
 #   setting: full (full_support), marginal (support_shift)
 
 checkpoints:
-  # ============ CelebA Baselines ============
+  # ============ CelebA Baselines (256x256) ============
   celeba_vanilla_full_v1:
     dataset: celeba
     setting: full_support
     model: vanilla
     regularizers: []
-    ckpt_path: outputs/faithful-cond-gen/ekg1mfky/checkpoints/celeba_fullmodel_epoch_279-step_355880-rfid_1.1118.ckpt
+    ckpt_path: outputs/faithful-cond-gen/6xj1m5ss/checkpoints/epoch_094-step_120745-rfid_1.1223.ckpt
     train_config: config_celeba
     gen_config: generate_samples_celeba
     paper_ready: true
-    notes: "Baseline CelebA full-support (rFID=1.1118)"
+    notes: "Baseline CelebA full-support 256x256 (rFID=1.1223)"
 
   celeba_vanilla_marginal_v1:
     dataset: celeba
     setting: support_shift
     model: vanilla
     regularizers: []
-    ckpt_path: outputs/faithful-cond-gen/ob8i6pp8/checkpoints/celeba_marginalmodel_epoch_317-step_285882-rfid_1.4006.ckpt
+    ckpt_path: outputs/faithful-cond-gen/bn2kg85d/checkpoints/epoch_344-step_310155-rfid_1.2345.ckpt
     train_config: config_celeba_marginal
     gen_config: generate_samples_celeba
     paper_ready: true
-    notes: "Baseline CelebA stress-test (rFID=1.4006)"
+    notes: "Baseline CelebA stress-test 256x256 (rFID=1.2345)"
 
   # ============ RxRx1 Baselines ============
   rxrx1_vanilla_full_v1:
@@ -53,6 +53,51 @@ checkpoints:
     gen_config: generate_samples_rxrx1
     paper_ready: true
     notes: "Baseline RxRx1 pair-heldout (rFID=2.2607)"
+
+  # ============ REPA Aligned Models ============
+  celeba_repa_full_v1:
+    dataset: celeba
+    setting: full_support
+    model: repa
+    regularizers: [repa]
+    ckpt_path: outputs/faithful-cond-gen/zqym9yye/checkpoints/epoch_212-step_270723-rfid_1.1253.ckpt
+    train_config: config_celeba
+    gen_config: generate_samples_celeba
+    paper_ready: true
+    notes: "REPA CelebA full-support (rFID=1.1253, DINOv3 aligned)"
+
+  celeba_repa_marginal_v1:
+    dataset: celeba
+    setting: support_shift
+    model: repa
+    regularizers: [repa]
+    ckpt_path: outputs/faithful-cond-gen/6uzopvyl/checkpoints/epoch_194-step_175305-rfid_1.2772.ckpt
+    train_config: config_celeba_marginal
+    gen_config: generate_samples_celeba
+    paper_ready: true
+    notes: "REPA CelebA stress-test (rFID=1.2772, DINOv3 aligned)"
+
+  rxrx1_repa_full_v1:
+    dataset: rxrx1
+    setting: full_support
+    model: repa
+    regularizers: [repa]
+    ckpt_path: outputs/faithful-cond-gen/gjb8rcfp/checkpoints/epoch_071-step_328968-rfid_1.0632.ckpt
+    train_config: config_rxrx1
+    gen_config: generate_samples_rxrx1
+    paper_ready: true
+    notes: "REPA RxRx1 full-support (rFID=1.0632, DINOv3 aligned)"
+
+  rxrx1_repa_marginal_v1:
+    dataset: rxrx1
+    setting: support_shift
+    model: repa
+    regularizers: [repa]
+    ckpt_path: outputs/faithful-cond-gen/slhq3f0r/checkpoints/epoch_050-step_210936-rfid_1.9897.ckpt
+    train_config: config_rxrx1_marginal
+    gen_config: generate_samples_rxrx1
+    paper_ready: true
+    notes: "REPA RxRx1 pair-heldout (rFID=1.9897, DINOv3 aligned)"
 
   # ============ Regularized Variants (placeholder) ============
   # celeba_relational_marginal_v1:

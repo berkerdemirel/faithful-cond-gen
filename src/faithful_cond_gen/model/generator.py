@@ -525,7 +525,8 @@ class GeneratorWrapper(nn.Module):
         t: torch.Tensor,
         cond_ids: torch.Tensor,
         cfg_scale: torch.Tensor,
-    ) -> torch.Tensor:
+        return_features: bool = False,
+    ):
         """Apply classifier-free guidance to velocity prediction.
 
         Args:
@@ -533,9 +534,11 @@ class GeneratorWrapper(nn.Module):
             t: Timestep (B,)
             cond_ids: Conditioning IDs (B, K)
             cfg_scale: Guidance scale (B,) or scalar
+            return_features: If True, also return projected features from conditional pass
 
         Returns:
             Guided velocity (B, C, H, W)
+            If return_features=True: (velocity, zs_tilde) tuple
         """
         b = x.shape[0]
 
@@ -550,13 +553,15 @@ class GeneratorWrapper(nn.Module):
 
         if not needs_cfg:
             # No guidance needed, just predict conditional
-            v_cond, _ = self.diffusion_backbone(x, t, cond_ids)
+            v_cond, zs_tilde = self.diffusion_backbone(x, t, cond_ids)
             if v_cond.shape[1] > x.shape[1]:
                 v_cond = v_cond[:, : x.shape[1]]
+            if return_features:
+                return v_cond, zs_tilde
             return v_cond
 
         # Predict conditional velocity
-        v_cond, _ = self.diffusion_backbone(x, t, cond_ids)
+        v_cond, zs_tilde = self.diffusion_backbone(x, t, cond_ids)
         if v_cond.shape[1] > x.shape[1]:
             v_cond = v_cond[:, : x.shape[1]]
 
@@ -571,6 +576,8 @@ class GeneratorWrapper(nn.Module):
         cfg_scale_expanded = cfg_scale.view(b, 1, 1, 1)  # (B, 1, 1, 1) for broadcasting
         v_guided = v_uncond + cfg_scale_expanded * (v_cond - v_uncond)
 
+        if return_features:
+            return v_guided, zs_tilde
         return v_guided
 
     # ------------------------------------------------------------------
@@ -664,7 +671,9 @@ class GeneratorWrapper(nn.Module):
         t_cutoff: float = 0.04,
         cfg_scale: float = 1.0,
         adaptive_cfg: bool = False,
-    ) -> torch.Tensor:
+        return_aligned_features: bool = False,
+        feature_capture_t: Optional[float] = None,
+    ):
         """REPA-style two-stage sampling (default sampler).
 
         Stage 1 (SDE): t=1.0 → t=0.04 with score-based drift correction
@@ -677,9 +686,15 @@ class GeneratorWrapper(nn.Module):
             cfg_scale: Classifier-free guidance scale (1.0 = no guidance)
                       If adaptive_cfg=True, this is ignored and per-sample scales are computed
             adaptive_cfg: If True, use condition-adaptive CFG based on rarity
+            return_aligned_features: If True, also return aligned features from REPA projectors
+            feature_capture_t: Timestep at which to capture features.
+                              None (default): capture at final step (t=t_cutoff)
+                              Float value: capture when t <= feature_capture_t
 
         Returns:
             Decoded images in [0, 1]
+            If return_aligned_features=True: (images, aligned_features) tuple
+                aligned_features is List[Tensor] or None if REPA not enabled
         """
         # Compute adaptive CFG scales if requested
         if adaptive_cfg:
@@ -706,6 +721,11 @@ class GeneratorWrapper(nn.Module):
 
         cond_ids = cond_ids.to(device=device, dtype=torch.long)
 
+        # Feature capture setup
+        captured_features = None
+        # Default: capture at final step (t_cutoff)
+        capture_threshold = feature_capture_t if feature_capture_t is not None else t_cutoff
+
         # --- Timestep Grid (REPA-style) ---
         # Create grid from 1.0 → t_cutoff, then append 0.0
         t_steps = torch.linspace(
@@ -724,8 +744,20 @@ class GeneratorWrapper(nn.Module):
 
             t_in = t_cur.expand(b)
 
-            # Predict velocity with classifier-free guidance
-            v = self.apply_cfg(x, t_in, cond_ids, cfg_scale_tensor)
+            # Check if we should capture features at this timestep
+            should_capture = (
+                return_aligned_features
+                and captured_features is None
+                and t_cur.item() <= capture_threshold
+            )
+
+            if should_capture:
+                v, zs_tilde = self.apply_cfg(
+                    x, t_in, cond_ids, cfg_scale_tensor, return_features=True
+                )
+                captured_features = zs_tilde
+            else:
+                v = self.apply_cfg(x, t_in, cond_ids, cfg_scale_tensor)
 
             # Convert velocity to score
             score = self.get_score_from_velocity(v, x, t_in)
@@ -748,8 +780,18 @@ class GeneratorWrapper(nn.Module):
         # REPA: Single deterministic Euler step with score-corrected drift (NO noise)
         t_final = torch.full((b,), t_cutoff, device=device, dtype=model_dtype)
 
-        # Predict velocity with classifier-free guidance
-        v_final = self.apply_cfg(x, t_final, cond_ids, cfg_scale_tensor)
+        # Capture features at final step if not yet captured
+        should_capture_final = (
+            return_aligned_features and captured_features is None
+        )
+
+        if should_capture_final:
+            v_final, zs_tilde = self.apply_cfg(
+                x, t_final, cond_ids, cfg_scale_tensor, return_features=True
+            )
+            captured_features = zs_tilde
+        else:
+            v_final = self.apply_cfg(x, t_final, cond_ids, cfg_scale_tensor)
 
         # Convert to score
         score_final = self.get_score_from_velocity(v_final, x, t_final)
@@ -762,4 +804,8 @@ class GeneratorWrapper(nn.Module):
         dt_final = 0.0 - t_cutoff  # = -0.04
         x = x + dt_final * drift_final
 
-        return self.decode(x)
+        images = self.decode(x)
+
+        if return_aligned_features:
+            return images, captured_features
+        return images

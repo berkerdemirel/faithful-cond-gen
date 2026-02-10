@@ -35,6 +35,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 TRUST_SCORES_DIR = Path("outputs/trust_scores")
 OUTPUT_DIR = Path("outputs/trust_evaluation")
 
+# Path mappings for generated samples
+GEN_PATH_MAP = {
+    ("celeba", "fullmodel"): "celeba_vanilla_full",
+    ("celeba", "marginalmodel"): "celeba_vanilla_marginal",
+    ("celeba", "repamodel"): "celeba_repa_full",
+    ("celeba", "repa_marginalmodel"): "celeba_repa_marginal",
+    ("rxrx1", "fullmodel"): "rxrx1_vanilla_full",
+    ("rxrx1", "marginalmodel"): "rxrx1_vanilla_marginal",
+}
+
 CONDITION_ATTRS = {
     "celeba": ["Male", "Smiling", "Blond_Hair", "Eyeglasses"],
     "rxrx1": ["cell_type_id", "sirna_id"],
@@ -873,24 +883,28 @@ def load_features_for_dataset(
     dataset: str, encoder: str, model: str = "fullmodel"
 ) -> Tuple[torch.Tensor, Dict, torch.Tensor, Dict]:
     """Load real and generated features for a specific model."""
-    real_path = (
-        Path("feature_cache/real_samples") / dataset / encoder / "train_features.pt"
-    )
-    gen_path = Path("feature_cache/generated_samples") / dataset / model / encoder
+    # Use outputs/ directory structure
+    real_path = Path(f"outputs/real_{dataset}_{encoder}/train_features.pt")
+
+    # Map model name to generated directory
+    gen_dir = GEN_PATH_MAP.get((dataset, model))
+    if gen_dir is None:
+        print(f"  Warning: no path mapping for ({dataset}, {model})")
+        return None, None, None, None
+    gen_path = Path(f"outputs/gen/{gen_dir}/{encoder}_features.pt")
 
     if not real_path.exists():
         print(f"  Warning: real features not found at {real_path}")
         return None, None, None, None
 
-    gen_files = list(gen_path.glob("*features.pt"))
-    if not gen_files:
-        print(f"  Warning: no generated features in {gen_path}")
+    if not gen_path.exists():
+        print(f"  Warning: generated features not found at {gen_path}")
         return None, None, None, None
 
     data = torch.load(real_path, map_location="cpu", weights_only=False)
     real_feats, real_meta = data["features"], data.get("metadata", {})
 
-    data = torch.load(gen_files[0], map_location="cpu", weights_only=False)
+    data = torch.load(gen_path, map_location="cpu", weights_only=False)
     gen_feats, gen_meta = data["features"], data.get("metadata", {})
 
     return real_feats, real_meta, gen_feats, gen_meta

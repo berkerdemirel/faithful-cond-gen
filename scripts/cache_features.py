@@ -293,7 +293,7 @@ def extract_and_save(loader, encoder, save_path, device):
 
 @hydra.main(config_path="../configs", config_name="cache_celeba", version_base=None)
 def main(cfg: DictConfig):
-    device = "cuda:4" if torch.cuda.is_available() else "cpu"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     # 1. Select Encoder
     enc_name = cfg.get("encoder_name", "dinov2")
@@ -341,13 +341,14 @@ def main(cfg: DictConfig):
             persistent_workers=True,
         )
 
-        # Save to feature_cache/{encoder}/generated_{foldername}.pt
-        folder_name = os.path.basename(os.path.normpath(generated_path))
-        base_cache_dir = "."
-        feature_cache_dir = os.path.join(base_cache_dir, "feature_cache", enc_name)
-        save_path = os.path.join(
-            feature_cache_dir, f"generated_{folder_name}_features.pt"
-        )
+        # Save to outputs/gen/<model_name>/{encoder}_features.pt
+        # Use parent folder if path ends with 'images'
+        norm_path = os.path.normpath(generated_path)
+        if os.path.basename(norm_path) == "images":
+            model_dir = os.path.dirname(norm_path)
+        else:
+            model_dir = norm_path
+        save_path = os.path.join(model_dir, f"{enc_name}_features.pt")
 
         extract_and_save(loader, encoder, save_path, device)
 
@@ -385,8 +386,9 @@ def main(cfg: DictConfig):
                     # Encoder transform now handles ToTensor + type conversion + normalization
                     ds.transform = enc_transform
 
-        base_cache_dir = "."
-        feature_cache_dir = os.path.join(base_cache_dir, "feature_cache", enc_name)
+        # Determine dataset name from config
+        dataset_name = "celeba" if "Celeba" in cfg.dataset._target_ else "rxrx1"
+        feature_cache_dir = os.path.join("outputs", f"real_{dataset_name}_{enc_name}")
         os.makedirs(feature_cache_dir, exist_ok=True)
         log.info(f"Output Directory: {feature_cache_dir}")
 

@@ -35,8 +35,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 # Configuration
 # ============================================================================
 
-FEATURE_CACHE_ROOT = Path("feature_cache")
 OUTPUT_DIR = Path("outputs/trust_scores")
+
+# Path mappings for generated samples
+# Maps (dataset, model) -> directory name under outputs/gen/
+GEN_PATH_MAP = {
+    ("celeba", "fullmodel"): "celeba_vanilla_full",
+    ("celeba", "marginalmodel"): "celeba_vanilla_marginal",
+    ("celeba", "repamodel"): "celeba_repa_full",
+    ("celeba", "repa_marginalmodel"): "celeba_repa_marginal",
+    ("rxrx1", "fullmodel"): "rxrx1_vanilla_full",
+    ("rxrx1", "marginalmodel"): "rxrx1_vanilla_marginal",
+}
 
 # Condition attributes per dataset
 CONDITION_ATTRS = {
@@ -752,19 +762,22 @@ def process_single_config(
 ) -> Dict:
     """Process a single dataset/model/encoder configuration."""
 
-    # Paths
-    real_path = (
-        FEATURE_CACHE_ROOT / "real_samples" / dataset / encoder / "train_features.pt"
-    )
-    gen_root = FEATURE_CACHE_ROOT / "generated_samples" / dataset / model / encoder
+    # Paths - using outputs/ directory structure
+    real_path = Path(f"outputs/real_{dataset}_{encoder}/train_features.pt")
+
+    # Map model name to generated directory
+    gen_dir = GEN_PATH_MAP.get((dataset, model))
+    if gen_dir is None:
+        print(f"  Skip: no path mapping for ({dataset}, {model})")
+        return None
+    gen_path = Path(f"outputs/gen/{gen_dir}/{encoder}_features.pt")
 
     if not real_path.exists():
         print(f"  Skip: real features not found at {real_path}")
         return None
 
-    gen_files = list(gen_root.glob("*features.pt"))
-    if not gen_files:
-        print(f"  Skip: no generated features in {gen_root}")
+    if not gen_path.exists():
+        print(f"  Skip: generated features not found at {gen_path}")
         return None
 
     print(f"\n=== {dataset} / {model} / {encoder} ===")
@@ -772,7 +785,7 @@ def process_single_config(
     # Load features
     print("  Loading features...")
     real_feats, real_meta = load_features(real_path)
-    gen_feats, gen_meta = load_features(gen_files[0])
+    gen_feats, gen_meta = load_features(gen_path)
     print(f"  Real: {real_feats.shape}, Generated: {gen_feats.shape}")
 
     real_feats, real_meta = filter_real_by_model(
