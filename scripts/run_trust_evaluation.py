@@ -35,14 +35,26 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 TRUST_SCORES_DIR = Path("outputs/trust_scores")
 OUTPUT_DIR = Path("outputs/trust_evaluation")
 
-# Path mappings for generated samples
-GEN_PATH_MAP = {
-    ("celeba", "fullmodel"): "celeba_vanilla_full",
-    ("celeba", "marginalmodel"): "celeba_vanilla_marginal",
-    ("celeba", "repamodel"): "celeba_repa_full",
-    ("celeba", "repa_marginalmodel"): "celeba_repa_marginal",
-    ("rxrx1", "fullmodel"): "rxrx1_vanilla_full",
-    ("rxrx1", "marginalmodel"): "rxrx1_vanilla_marginal",
+# Feature configurations matching compute_trust_scores.py
+FEATURE_CONFIGS = {
+    ("celeba", "vanilla_full", "dinov3"): ("celeba_vanilla_full", "dinov3_features.pt"),
+    ("celeba", "vanilla_marginal", "dinov3"): (
+        "celeba_vanilla_marginal",
+        "dinov3_features.pt",
+    ),
+    ("celeba", "repa_full", "dinov3"): ("celeba_repa_full", "dinov3_features.pt"),
+    ("celeba", "repa_marginal", "dinov3"): (
+        "celeba_repa_marginal",
+        "dinov3_features.pt",
+    ),
+    ("celeba", "repa_full", "aligned_mean"): (
+        "celeba_repa_full",
+        "aligned_mean_features.pt",
+    ),
+    ("celeba", "repa_marginal", "aligned_mean"): (
+        "celeba_repa_marginal",
+        "aligned_mean_features.pt",
+    ),
 }
 
 CONDITION_ATTRS = {
@@ -679,29 +691,29 @@ def evaluate_alaa_correlation(trust_results: Dict) -> Dict:
 
 def evaluate_multi_backbone(all_results: List[Dict], model: str) -> Dict:
     """
-    Layer 5: Multi-backbone robustness analysis.
+    Layer 5: Multi-feature-type analysis.
 
-    Reports per-backbone aggregate statistics only.
-    NOTE: Sample-level correlations across backbones removed because there's
-    no guarantee samples are in the same order across different encoder caches.
+    Reports per-feature-type aggregate statistics only.
+    NOTE: Sample-level correlations across feature types removed because there's
+    no guarantee samples are in the same order across different feature caches.
     """
     # Filter to single model
     model_results = [r for r in all_results if r["model"] == model]
     if len(model_results) < 1:
-        return {"n_backbones": 0}
+        return {"n_feature_types": 0}
 
-    backbones = [r["encoder"] for r in model_results]
+    feature_types = [r.get("feature_type", r.get("encoder", "unknown")) for r in model_results]
 
-    # Per-backbone aggregate statistics (don't rely on same ordering)
-    backbone_stats = []
+    # Per-feature-type aggregate statistics
+    feature_stats = []
     for r in model_results:
         trust = r["trust_updated"]
         realism = r["realism_global_z"]
         faithfulness = r["faithfulness_margin_z"]
 
-        backbone_stats.append(
+        feature_stats.append(
             {
-                "backbone": r["encoder"],
+                "feature_type": r.get("feature_type", r.get("encoder", "unknown")),
                 "n_samples": r["n_samples"],
                 "trust_mean": float(np.mean(trust)),
                 "trust_std": float(np.std(trust)),
@@ -714,9 +726,9 @@ def evaluate_multi_backbone(all_results: List[Dict], model: str) -> Dict:
         )
 
     result = {
-        "n_backbones": len(backbones),
-        "backbones": backbones,
-        "backbone_stats": pd.DataFrame(backbone_stats),
+        "n_feature_types": len(feature_types),
+        "feature_types": feature_types,
+        "feature_stats": pd.DataFrame(feature_stats),
     }
 
     return result
@@ -747,54 +759,54 @@ def create_report(
     report.append("## Summary\n")
     report.append(f"- **Dataset**: {dataset}")
     report.append(f"- **Models**: {set(r['model'] for r in all_results)}")
-    report.append(f"- **Encoders**: {set(r['encoder'] for r in all_results)}\n")
+    feature_types = set(r.get('feature_type', r.get('encoder', 'unknown')) for r in all_results)
+    report.append(f"- **Feature Types**: {feature_types}\n")
 
     # Layer 1: Ranking Validity
     report.append("---\n## Layer 1: Condition-Level Ranking Validity\n")
     report.append("*Does trust-based ranking correlate with ground-truth KID?*\n")
 
-    for model in ["fullmodel", "marginalmodel"]:
-        if model in ranking_results:
-            r = ranking_results[model]
-            report.append(f"\n### {model}\n")
-            if isinstance(r, dict) and "spearman_rho" in r:
-                report.append("**Trust scores (lower = better):**")
+    for config_key in sorted(ranking_results.keys()):
+        r = ranking_results[config_key]
+        report.append(f"\n### {config_key}\n")
+        if isinstance(r, dict) and "spearman_rho" in r:
+            report.append("**Trust scores (lower = better):**")
+            report.append(
+                f"- Spearman ρ (trust vs ΔKID): **{r.get('spearman_rho', np.nan):.4f}**"
+            )
+            report.append(
+                f"- Kendall τ (trust vs ΔKID): {r.get('kendall_tau', np.nan):.4f}"
+            )
+
+            # Component correlations
+            if "spearman_rho_realism" in r:
+                report.append("\n**Components:**")
                 report.append(
-                    f"- Spearman ρ (trust vs ΔKID): **{r.get('spearman_rho', np.nan):.4f}**"
+                    f"- Spearman ρ (realism vs ΔKID): {r.get('spearman_rho_realism', np.nan):.4f}"
                 )
                 report.append(
-                    f"- Kendall τ (trust vs ΔKID): {r.get('kendall_tau', np.nan):.4f}"
+                    f"- Spearman ρ (faithfulness vs ΔKID): {r.get('spearman_rho_faithfulness', np.nan):.4f}"
                 )
 
-                # Component correlations
-                if "spearman_rho_realism" in r:
-                    report.append("\n**Components:**")
+            report.append(f"\n- N conditions: {r.get('n_conditions', 0)}")
+
+            # Top-k overlap
+            for k in [5, 10, 20]:
+                key = f"topk_overlap_{k}"
+                if key in r:
                     report.append(
-                        f"- Spearman ρ (realism vs ΔKID): {r.get('spearman_rho_realism', np.nan):.4f}"
-                    )
-                    report.append(
-                        f"- Spearman ρ (faithfulness vs ΔKID): {r.get('spearman_rho_faithfulness', np.nan):.4f}"
+                        f"- Top-{k} overlap (trust vs KID ranking): {r[key]:.4f}"
                     )
 
-                report.append(f"\n- N conditions: {r.get('n_conditions', 0)}")
-
-                # Top-k overlap
-                for k in [5, 10, 20]:
-                    key = f"topk_overlap_{k}"
-                    if key in r:
+            # Stratified correlation
+            if "stratified_correlation" in r:
+                report.append("\n**Stratified by support size:**")
+                for bin_name, stats in r["stratified_correlation"].items():
+                    if stats["n"] > 0:
                         report.append(
-                            f"- Top-{k} overlap (trust vs KID ranking): {r[key]:.4f}"
+                            f"  - {bin_name} samples (n={stats['n']}): ρ={stats.get('spearman_rho', np.nan):.4f}"
                         )
-
-                # Stratified correlation
-                if "stratified_correlation" in r:
-                    report.append("\n**Stratified by support size:**")
-                    for bin_name, stats in r["stratified_correlation"].items():
-                        if stats["n"] > 0:
-                            report.append(
-                                f"  - {bin_name} samples (n={stats['n']}): ρ={stats.get('spearman_rho', np.nan):.4f}"
-                            )
-                report.append("")
+            report.append("")
 
     # Layer 2: Failure Detection
     if failure_results:
@@ -802,11 +814,13 @@ def create_report(
         report.append(
             "*Can trust score detect unseen attribute combinations? (condition-level)*\n"
         )
-        report.append(f"- AUROC: **{failure_results.get('auroc', np.nan):.4f}**")
-        report.append(f"- AUPRC: {failure_results.get('auprc', np.nan):.4f}")
-        report.append(
-            f"- N seen conditions: {failure_results.get('n_seen_conds', 0)}, N unseen conditions: {failure_results.get('n_unseen_conds', 0)}\n"
-        )
+        for config_key, fr in sorted(failure_results.items()):
+            report.append(f"\n### {config_key}\n")
+            report.append(f"- AUROC: **{fr.get('auroc', np.nan):.4f}**")
+            report.append(f"- AUPRC: {fr.get('auprc', np.nan):.4f}")
+            report.append(
+                f"- N seen conditions: {fr.get('n_seen_conds', 0)}, N unseen conditions: {fr.get('n_unseen_conds', 0)}\n"
+            )
 
     # Layer 3: Selective Generation
     if selective_curves:
@@ -815,8 +829,8 @@ def create_report(
             "*Does filtering by trust improve KID? (with bootstrap 95% CI)*\n"
         )
 
-        for model, df in selective_curves.items():
-            report.append(f"\n### {model}\n")
+        for config_key, df in sorted(selective_curves.items()):
+            report.append(f"\n### {config_key}\n")
             if not df.empty:
                 # Show key columns with formatting
                 cols_to_show = [
@@ -847,28 +861,28 @@ def create_report(
         report.append("---\n## Layer 4: Correlation with Alaa et al. Metrics\n")
         report.append("*Does our score align with α-precision/authenticity?*\n")
 
-        for model, results in alaa_results.items():
-            report.append(f"\n### {model}\n")
+        for config_key, results in sorted(alaa_results.items()):
+            report.append(f"\n### {config_key}\n")
             for metric, vals in results.items():
                 if isinstance(vals, dict) and "spearman_rho" in vals:
                     report.append(f"- {metric}: ρ = {vals['spearman_rho']:.4f}")
             report.append("")
 
-    # Layer 5: Multi-backbone
+    # Layer 5: Multi-feature-type
     if multi_backbone:
-        report.append("---\n## Layer 5: Multi-Backbone Aggregate Statistics\n")
+        report.append("---\n## Layer 5: Multi-Feature-Type Aggregate Statistics\n")
         report.append(
-            "*Per-backbone aggregate scores (sample-level correlations not computed due to ordering uncertainty)*\n"
+            "*Per-feature-type aggregate scores*\n"
         )
 
-        for model, results in multi_backbone.items():
-            report.append(f"\n### {model}\n")
-            report.append(f"- N backbones: {results.get('n_backbones', 0)}")
+        for config_key, results in sorted(multi_backbone.items()):
+            report.append(f"\n### {config_key}\n")
+            report.append(f"- N feature types: {results.get('n_feature_types', 0)}")
 
-            if "backbone_stats" in results:
-                report.append("\n**Per-backbone statistics:**\n")
+            if "feature_stats" in results:
+                report.append("\n**Per-feature-type statistics:**\n")
                 report.append(
-                    results["backbone_stats"].round(4).to_markdown(index=False)
+                    results["feature_stats"].round(4).to_markdown(index=False)
                 )
             report.append("")
 
@@ -880,18 +894,20 @@ def create_report(
 
 
 def load_features_for_dataset(
-    dataset: str, encoder: str, model: str = "fullmodel"
+    dataset: str, model: str, feature_type: str
 ) -> Tuple[torch.Tensor, Dict, torch.Tensor, Dict]:
-    """Load real and generated features for a specific model."""
-    # Use outputs/ directory structure
-    real_path = Path(f"outputs/real_{dataset}_{encoder}/train_features.pt")
-
-    # Map model name to generated directory
-    gen_dir = GEN_PATH_MAP.get((dataset, model))
-    if gen_dir is None:
-        print(f"  Warning: no path mapping for ({dataset}, {model})")
+    """Load real and generated features for a specific model/feature_type."""
+    # Get feature config
+    config_key = (dataset, model, feature_type)
+    if config_key not in FEATURE_CONFIGS:
+        print(f"  Warning: no config for {config_key}")
         return None, None, None, None
-    gen_path = Path(f"outputs/gen/{gen_dir}/{encoder}_features.pt")
+
+    gen_dir, feature_file = FEATURE_CONFIGS[config_key]
+
+    # Real features - always use dinov3 as reference
+    real_path = Path(f"outputs/real_{dataset}_dinov3/train_features.pt")
+    gen_path = Path(f"outputs/gen/{gen_dir}/{feature_file}")
 
     if not real_path.exists():
         print(f"  Warning: real features not found at {real_path}")
@@ -931,13 +947,15 @@ def main():
     all_results = load_trust_scores(args.dataset)
     print(f"Loaded results for {len(all_results)} configurations")
 
-    # Group by model
-    by_model = {}
+    # Group by (model, feature_type)
+    by_config = {}
     for r in all_results:
         model = r["model"]
-        if model not in by_model:
-            by_model[model] = []
-        by_model[model].append(r)
+        feature_type = r.get("feature_type", r.get("encoder", "unknown"))
+        config_key = f"{model}/{feature_type}"
+        if config_key not in by_config:
+            by_config[config_key] = []
+        by_config[config_key].append(r)
 
     # Run evaluations
     ranking_results = {}
@@ -946,47 +964,46 @@ def main():
     alaa_results = {}
     multi_backbone = {}
 
-    for model in by_model:
-        model_results = by_model[model]
-        first_result = model_results[0]
-        # Use the encoder that matches this result (not first_encoder which may differ)
-        encoder_for_eval = first_result["encoder"]
+    for config_key in by_config:
+        config_results = by_config[config_key]
+        first_result = config_results[0]
+        model = first_result["model"]
+        feature_type = first_result.get("feature_type", first_result.get("encoder", "unknown"))
 
-        print(f"\n--- Evaluating {model} ---")
+        print(f"\n--- Evaluating {config_key} ---")
 
-        # Load model-specific features (critical: each model has different generated samples)
-        # Must use encoder matching first_result to ensure indices align
-        print(f"  Loading features ({encoder_for_eval}, {model})...")
+        # Load features for this configuration
+        print(f"  Loading features...")
         real_feats, real_meta, gen_feats, gen_meta = load_features_for_dataset(
-            args.dataset, encoder_for_eval, model
+            args.dataset, model, feature_type
         )
 
         # Layer 1: Ranking validity
         if real_feats is not None and gen_feats is not None:
             print("  Layer 1: Ranking validity...")
-            ranking_results[model] = evaluate_ranking_validity(
+            ranking_results[config_key] = evaluate_ranking_validity(
                 first_result, real_feats, real_meta, gen_feats, condition_keys
             )
 
-        # Layer 2: Failure detection (marginal only)
-        if model == "marginalmodel":
+        # Layer 2: Failure detection (marginal models only)
+        if "marginal" in model:
             print("  Layer 2: Failure detection...")
-            failure_results = evaluate_failure_detection(first_result, args.dataset)
+            failure_results[config_key] = evaluate_failure_detection(first_result, args.dataset)
 
         # Layer 3: Selective generation curves
         if real_feats is not None and gen_feats is not None:
             print("  Layer 3: Selective generation curves...")
-            selective_curves[model] = compute_selective_generation_curve(
+            selective_curves[config_key] = compute_selective_generation_curve(
                 first_result, real_feats, real_meta, gen_feats, condition_keys
             )
 
         # Layer 4: Alaa correlation
         print("  Layer 4: Alaa et al. correlation...")
-        alaa_results[model] = evaluate_alaa_correlation(first_result)
+        alaa_results[config_key] = evaluate_alaa_correlation(first_result)
 
-        # Layer 5: Multi-backbone
+        # Layer 5: Multi-backbone (per model, aggregating feature types)
         print("  Layer 5: Multi-backbone aggregation...")
-        multi_backbone[model] = evaluate_multi_backbone(all_results, model)
+        multi_backbone[config_key] = evaluate_multi_backbone(all_results, model)
 
     # Create report
     print("\nGenerating report...")

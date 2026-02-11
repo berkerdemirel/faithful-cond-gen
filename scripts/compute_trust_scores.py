@@ -37,15 +37,37 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 OUTPUT_DIR = Path("outputs/trust_scores")
 
-# Path mappings for generated samples
-# Maps (dataset, model) -> directory name under outputs/gen/
-GEN_PATH_MAP = {
-    ("celeba", "fullmodel"): "celeba_vanilla_full",
-    ("celeba", "marginalmodel"): "celeba_vanilla_marginal",
-    ("celeba", "repamodel"): "celeba_repa_full",
-    ("celeba", "repa_marginalmodel"): "celeba_repa_marginal",
-    ("rxrx1", "fullmodel"): "rxrx1_vanilla_full",
-    ("rxrx1", "marginalmodel"): "rxrx1_vanilla_marginal",
+# Feature configurations: (model_name, feature_type) -> (gen_dir, feature_filename_pattern)
+# model_name: vanilla_full, vanilla_marginal, repa_full, repa_marginal
+# feature_type: dinov3 (extracted from rendered images), aligned_mean (REPA intermediate)
+FEATURE_CONFIGS = {
+    # Vanilla models - only extracted features
+    ("celeba", "vanilla_full", "dinov3"): ("celeba_vanilla_full", "dinov3_features.pt"),
+    ("celeba", "vanilla_marginal", "dinov3"): (
+        "celeba_vanilla_marginal",
+        "dinov3_features.pt",
+    ),
+    # REPA models - extracted features
+    ("celeba", "repa_full", "dinov3"): ("celeba_repa_full", "dinov3_features.pt"),
+    ("celeba", "repa_marginal", "dinov3"): (
+        "celeba_repa_marginal",
+        "dinov3_features.pt",
+    ),
+    # REPA models - aligned features (intermediate representations)
+    ("celeba", "repa_full", "aligned_mean"): (
+        "celeba_repa_full",
+        "aligned_mean_features.pt",
+    ),
+    ("celeba", "repa_marginal", "aligned_mean"): (
+        "celeba_repa_marginal",
+        "aligned_mean_features.pt",
+    ),
+    # RxRx1 - TBD
+    ("rxrx1", "vanilla_full", "dinov3"): ("rxrx1_vanilla_full", "dinov3_features.pt"),
+    ("rxrx1", "vanilla_marginal", "dinov3"): (
+        "rxrx1_vanilla_marginal",
+        "dinov3_features.pt",
+    ),
 }
 
 # Condition attributes per dataset
@@ -757,20 +779,27 @@ def compute_authenticity_scores(
 def process_single_config(
     dataset: str,
     model: str,
-    encoder: str,
+    feature_type: str,
     condition_keys: List[str],
 ) -> Dict:
-    """Process a single dataset/model/encoder configuration."""
+    """Process a single dataset/model/feature_type configuration."""
 
-    # Paths - using outputs/ directory structure
-    real_path = Path(f"outputs/real_{dataset}_{encoder}/train_features.pt")
-
-    # Map model name to generated directory
-    gen_dir = GEN_PATH_MAP.get((dataset, model))
-    if gen_dir is None:
-        print(f"  Skip: no path mapping for ({dataset}, {model})")
+    # Get feature config
+    config_key = (dataset, model, feature_type)
+    if config_key not in FEATURE_CONFIGS:
+        print(f"  Skip: no config for {config_key}")
         return None
-    gen_path = Path(f"outputs/gen/{gen_dir}/{encoder}_features.pt")
+
+    gen_dir, feature_file = FEATURE_CONFIGS[config_key]
+
+    # Real features path - use dinov3 for all (calibration reference)
+    # For aligned features, we still compare against dinov3 real features
+    # since aligned features are in the same space (REPA aligns to DINOv3)
+    real_encoder = "dinov3"  # Always use dinov3 real features as reference
+    real_path = Path(f"outputs/real_{dataset}_{real_encoder}/train_features.pt")
+
+    # Generated features path
+    gen_path = Path(f"outputs/gen/{gen_dir}/{feature_file}")
 
     if not real_path.exists():
         print(f"  Skip: real features not found at {real_path}")
@@ -780,16 +809,19 @@ def process_single_config(
         print(f"  Skip: generated features not found at {gen_path}")
         return None
 
-    print(f"\n=== {dataset} / {model} / {encoder} ===")
+    print(f"\n=== {dataset} / {model} / {feature_type} ===")
 
     # Load features
     print("  Loading features...")
     real_feats, real_meta = load_features(real_path)
     gen_feats, gen_meta = load_features(gen_path)
     print(f"  Real: {real_feats.shape}, Generated: {gen_feats.shape}")
+    print(f"  Gen features from: {gen_path}")
 
+    # Filter real data for marginal models (they didn't see all combos)
+    model_for_filter = "marginalmodel" if "marginal" in model else "fullmodel"
     real_feats, real_meta = filter_real_by_model(
-        dataset, model, real_feats, real_meta, condition_keys
+        dataset, model_for_filter, real_feats, real_meta, condition_keys
     )
     print(f"  Real used for stats (after holdout filter): {len(real_feats)}")
 
@@ -863,7 +895,7 @@ def process_single_config(
     results = {
         "dataset": dataset,
         "model": model,
-        "encoder": encoder,
+        "feature_type": feature_type,
         "n_samples": len(gen_feats),
         "n_real_used_for_stats": int(len(real_feats)),
         # Alaa et al. metrics
@@ -909,16 +941,17 @@ def run_analysis(dataset: str) -> List[Dict]:
         print(f"No condition attributes defined for {dataset}")
         return []
 
-    encoders = ENCODERS.get(dataset, [])
-    models = ["fullmodel", "marginalmodel"]
-
     all_results = []
 
-    for model in models:
-        for encoder in encoders:
-            result = process_single_config(dataset, model, encoder, condition_keys)
-            if result is not None:
-                all_results.append(result)
+    # Iterate over all feature configurations for this dataset
+    for config_key in FEATURE_CONFIGS:
+        cfg_dataset, model, feature_type = config_key
+        if cfg_dataset != dataset:
+            continue
+
+        result = process_single_config(dataset, model, feature_type, condition_keys)
+        if result is not None:
+            all_results.append(result)
 
     return all_results
 
@@ -938,7 +971,7 @@ def save_results(results: List[Dict], dataset: str, output_dir: Path):
         row = {
             "dataset": r["dataset"],
             "model": r["model"],
-            "encoder": r["encoder"],
+            "feature_type": r["feature_type"],
             "n_samples": r["n_samples"],
             "realism_global_z_mean": np.nanmean(r["realism_global_z"]),
             "realism_global_z_std": np.nanstd(r["realism_global_z"]),
