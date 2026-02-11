@@ -46,6 +46,9 @@ def get_conditions_list(cfg, dm):
             if dm.selected_attrs
             else ["Male", "Smiling", "Blond_Hair", "Eyeglasses"]
         )
+        # CRITICAL: Sort alphabetically to match model's internal ordering
+        # Model uses sorted(cond_dict.keys()) during training
+        attrs = sorted(attrs)
         combos = list(itertools.product([0, 1], repeat=len(attrs)))
 
         for c in combos:
@@ -143,10 +146,21 @@ def main(cfg: DictConfig):
     batch_size = cfg.batch_size
     feature_capture_t = cfg.get("feature_capture_t", None)  # None = final step
 
+    # Resume support: check for existing aligned features
+    resume = cfg.get("resume", False)
+    skipped = 0
+
     for cond_data in tqdm(my_conditions, desc=f"Rank {rank}"):
         cond_ids_list = cond_data["cond_ids"]
         signature = cond_data["signature"]
         data_type = cond_data["type"]
+
+        # Skip if aligned features already exist (resume mode)
+        if resume:
+            feat_fname = f"{signature}_aligned_feats.pt"
+            if os.path.exists(os.path.join(feat_dir, feat_fname)):
+                skipped += 1
+                continue
 
         generated_count = 0
         batch_idx = 0
@@ -205,6 +219,8 @@ def main(cfg: DictConfig):
             feat_fname = f"{signature}_aligned_feats.pt"
             torch.save(cond_features, os.path.join(feat_dir, feat_fname))
 
+    if resume and skipped > 0:
+        log.info(f"[Rank {rank}] Skipped {skipped} conditions (already completed).")
     log.info(f"[Rank {rank}] Finished generation with feature extraction.")
     if is_ddp:
         dist.destroy_process_group()

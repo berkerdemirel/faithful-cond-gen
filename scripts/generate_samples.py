@@ -49,6 +49,9 @@ def get_conditions_list(cfg, dm):
             if dm.selected_attrs
             else ["Male", "Smiling", "Blond_Hair", "Eyeglasses"]
         )
+        # CRITICAL: Sort alphabetically to match model's internal ordering
+        # Model uses sorted(cond_dict.keys()) during training
+        attrs = sorted(attrs)
         combos = list(itertools.product([0, 1], repeat=len(attrs)))
 
         for c in combos:
@@ -142,10 +145,24 @@ def main(cfg: DictConfig):
     samples_per_cond = cfg.samples_per_condition
     batch_size = cfg.batch_size
 
+    # Resume support: skip completed conditions
+    resume = cfg.get("resume", False)
+    skipped = 0
+
     for cond_data in tqdm(my_conditions, desc=f"Rank {rank}"):
         cond_ids_list = cond_data["cond_ids"]
         signature = cond_data["signature"]
         data_type = cond_data["type"]
+
+        # Skip if last sample exists (resume mode)
+        if resume:
+            if data_type == "celeba":
+                last_fname = f"{signature}_{samples_per_cond - 1}.png"
+            else:
+                last_fname = f"{signature}_{samples_per_cond - 1}.pt"
+            if os.path.exists(os.path.join(img_dir, last_fname)):
+                skipped += 1
+                continue
 
         generated_count = 0
         batch_idx = 0
@@ -194,6 +211,8 @@ def main(cfg: DictConfig):
             generated_count += current_bs
             batch_idx += 1
 
+    if resume and skipped > 0:
+        log.info(f"[Rank {rank}] Skipped {skipped} conditions (already completed).")
     log.info(f"[Rank {rank}] Finished generation.")
     if is_ddp:
         dist.destroy_process_group()
