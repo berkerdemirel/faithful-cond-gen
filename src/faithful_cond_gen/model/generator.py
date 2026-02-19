@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -672,7 +672,7 @@ class GeneratorWrapper(nn.Module):
         cfg_scale: float = 1.0,
         adaptive_cfg: bool = False,
         return_aligned_features: bool = False,
-        feature_capture_t: Optional[float] = None,
+        feature_capture_idx: Optional[Union[int, List[int], str]] = None,
     ):
         """REPA-style two-stage sampling (default sampler).
 
@@ -687,14 +687,20 @@ class GeneratorWrapper(nn.Module):
                       If adaptive_cfg=True, this is ignored and per-sample scales are computed
             adaptive_cfg: If True, use condition-adaptive CFG based on rarity
             return_aligned_features: If True, also return aligned features from REPA projectors
-            feature_capture_t: Timestep at which to capture features.
-                              None (default): capture at final step (t=t_cutoff)
-                              Float value: capture when t <= feature_capture_t
+            feature_capture_idx: Step index/indices at which to capture features (only used if return_aligned_features=True).
+                              None (default): capture at final Stage 2 call (index num_inference_steps-1)
+                              int: capture at that Stage 1 index k (0 <= k <= num_inference_steps-2), or -1 for final Stage 2
+                              List[int]: capture at each listed index; -1 allowed for final Stage 2
+                              "all": capture at every Stage 1 step (0 to num_inference_steps-2) + final Stage 2
 
         Returns:
             Decoded images in [0, 1]
-            If return_aligned_features=True: (images, aligned_features) tuple
-                aligned_features is List[Tensor] or None if REPA not enabled
+            If return_aligned_features=True: (images, aligned_features) tuple where:
+                - Single capture (int/None): aligned_features is List[Tensor] or None (unpooled patch features)
+                - Multiple captures (list/"all"): aligned_features is List[(k_idx, t_val, Tensor)] where:
+                  - k_idx (int): step index (0 to num_inference_steps-2 for Stage 1, num_inference_steps-1 for Stage 2)
+                  - t_val (float): actual timestep value at that index
+                  - Tensor: pooled features (B, D) on CPU for memory efficiency
         """
         # Compute adaptive CFG scales if requested
         if adaptive_cfg:
@@ -722,9 +728,52 @@ class GeneratorWrapper(nn.Module):
         cond_ids = cond_ids.to(device=device, dtype=torch.long)
 
         # Feature capture setup
-        captured_features = None
-        # Default: capture at final step (t_cutoff)
-        capture_threshold = feature_capture_t if feature_capture_t is not None else t_cutoff
+        capture_mode = None  # "single", "multiple", or "all"
+        capture_list = []  # List of (k_idx, t_val, features) tuples for multiple capture
+        captured_features = None  # For single capture mode
+        capture_indices_set = None
+        final_idx = num_inference_steps - 1  # Index for Stage 2 capture
+
+        if return_aligned_features:
+            if feature_capture_idx is None:
+                # Default: capture at final Stage 2 call (single mode)
+                capture_mode = "single"
+                capture_indices_set = {final_idx}
+            elif isinstance(feature_capture_idx, str) and feature_capture_idx.lower() == "all":
+                # Capture at every Stage 1 step + final Stage 2
+                capture_mode = "all"
+                # Will capture at indices 0 to num_inference_steps-2 (Stage 1) + final_idx (Stage 2)
+            elif isinstance(feature_capture_idx, (list, tuple)):
+                # Capture at specific indices
+                capture_mode = "multiple"
+                # Validate indices
+                for idx in feature_capture_idx:
+                    if idx == -1:
+                        continue  # -1 is allowed (means final Stage 2)
+                    if not isinstance(idx, int) or idx < 0 or idx > num_inference_steps - 2:
+                        raise ValueError(
+                            f"Invalid capture index {idx}. Must be in [0, {num_inference_steps-2}] "
+                            f"for Stage 1 steps, or -1 for final Stage 2 call."
+                        )
+                # Replace -1 with actual final index
+                capture_indices_set = {final_idx if idx == -1 else idx for idx in feature_capture_idx}
+            elif isinstance(feature_capture_idx, int):
+                # Capture once at specified index (single mode)
+                capture_mode = "single"
+                if feature_capture_idx == -1:
+                    capture_indices_set = {final_idx}
+                elif 0 <= feature_capture_idx <= num_inference_steps - 2:
+                    capture_indices_set = {feature_capture_idx}
+                else:
+                    raise ValueError(
+                        f"Invalid capture index {feature_capture_idx}. Must be in [0, {num_inference_steps-2}] "
+                        f"for Stage 1 steps, or -1 for final Stage 2 call."
+                    )
+            else:
+                raise ValueError(
+                    f"Invalid feature_capture_idx: {feature_capture_idx}. "
+                    f"Must be None, int, list of ints, or 'all'"
+                )
 
         # --- Timestep Grid (REPA-style) ---
         # Create grid from 1.0 → t_cutoff, then append 0.0
@@ -744,18 +793,36 @@ class GeneratorWrapper(nn.Module):
 
             t_in = t_cur.expand(b)
 
-            # Check if we should capture features at this timestep
-            should_capture = (
-                return_aligned_features
-                and captured_features is None
-                and t_cur.item() <= capture_threshold
-            )
+            # Determine if we should capture features at this step index
+            should_capture = False
+            if return_aligned_features:
+                if capture_mode == "all":
+                    should_capture = True
+                elif capture_mode == "multiple" and k in capture_indices_set:
+                    should_capture = True
+                elif capture_mode == "single" and k in capture_indices_set and captured_features is None:
+                    should_capture = True
 
             if should_capture:
                 v, zs_tilde = self.apply_cfg(
                     x, t_in, cond_ids, cfg_scale_tensor, return_features=True
                 )
-                captured_features = zs_tilde
+
+                # Validate REPA features are available
+                if zs_tilde is None or len(zs_tilde) == 0:
+                    raise ValueError(
+                        f"REPA features not available at step {k}. "
+                        f"Ensure model has use_repa=True and REPA projectors are enabled."
+                    )
+
+                # Store features based on capture mode
+                if capture_mode in ["all", "multiple"]:
+                    # Pool over patches and move to CPU for memory efficiency
+                    # Take first projector: (B, num_patches, D) -> (B, D)
+                    pooled = zs_tilde[0].mean(dim=1).cpu()
+                    capture_list.append((k, t_cur.item(), pooled))
+                else:  # single mode
+                    captured_features = zs_tilde
             else:
                 v = self.apply_cfg(x, t_in, cond_ids, cfg_scale_tensor)
 
@@ -780,16 +847,32 @@ class GeneratorWrapper(nn.Module):
         # REPA: Single deterministic Euler step with score-corrected drift (NO noise)
         t_final = torch.full((b,), t_cutoff, device=device, dtype=model_dtype)
 
-        # Capture features at final step if not yet captured
-        should_capture_final = (
-            return_aligned_features and captured_features is None
-        )
+        # Capture features at final Stage 2 call based on mode
+        should_capture_final = False
+        if return_aligned_features:
+            if capture_mode == "all":
+                should_capture_final = True
+            elif capture_mode in ["multiple", "single"] and final_idx in capture_indices_set:
+                should_capture_final = True
 
         if should_capture_final:
             v_final, zs_tilde = self.apply_cfg(
                 x, t_final, cond_ids, cfg_scale_tensor, return_features=True
             )
-            captured_features = zs_tilde
+
+            # Validate REPA features are available
+            if zs_tilde is None or len(zs_tilde) == 0:
+                raise ValueError(
+                    f"REPA features not available at final step (index {final_idx}). "
+                    f"Ensure model has use_repa=True and REPA projectors are enabled."
+                )
+
+            # Store based on mode
+            if capture_mode in ["all", "multiple"]:
+                pooled = zs_tilde[0].mean(dim=1).cpu()
+                capture_list.append((final_idx, t_cutoff, pooled))
+            else:  # single mode
+                captured_features = zs_tilde
         else:
             v_final = self.apply_cfg(x, t_final, cond_ids, cfg_scale_tensor)
 
@@ -807,5 +890,15 @@ class GeneratorWrapper(nn.Module):
         images = self.decode(x)
 
         if return_aligned_features:
-            return images, captured_features
+            # Return format depends on capture mode
+            if capture_mode in ["all", "multiple"]:
+                # Validation for "all" mode
+                if capture_mode == "all" and len(capture_list) != num_inference_steps:
+                    raise ValueError(
+                        f"Expected {num_inference_steps} captures in 'all' mode, "
+                        f"got {len(capture_list)}. This indicates a bug in feature capture logic."
+                    )
+                return images, capture_list if capture_list else None
+            else:
+                return images, captured_features
         return images
