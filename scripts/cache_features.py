@@ -6,8 +6,10 @@ from typing import Dict, List, Optional
 
 import hydra
 import torch
+import torchvision.transforms as T
 from faithful_cond_gen.data.celeba import CelebaDataModule
 from faithful_cond_gen.data.rxrx1 import RxRx1DataModule, to_rgb
+from faithful_cond_gen.model.repa_encoder import REPAEncoder
 
 # Import Encoders
 from faithful_cond_gen.eval.configs.encoder_config import (
@@ -30,6 +32,7 @@ log = logging.getLogger(__name__)
 CONFIG_MAP = {
     "dinov2": DINOV2_L14,
     "dinov3": DINOV3_L16,
+    "dinov3_meanpatch": None,  # Special: uses REPAEncoder, not eval encoder
     "mae": MAE_LARGE,
     "siglip": SIGLIP_SO400M,
     "bioclip": BIOCLIP,
@@ -163,6 +166,74 @@ class GeneratedDataset(Dataset):
         return img, {"cond": cond}
 
 
+class GeneratedDatasetRaw(Dataset):
+    """
+    Like GeneratedDataset but returns raw [0,1] images without encoder-specific normalization.
+    For use with REPAEncoder which does its own normalization.
+    """
+
+    def __init__(self, root_dir: str, dataset_type: str, image_size: int = 256):
+        self.root_dir = root_dir
+        self.dataset_type = dataset_type.lower()
+        self.image_size = image_size
+
+        if "rxrx1" in self.dataset_type:
+            self.files = sorted(glob.glob(os.path.join(root_dir, "*.pt")))
+        else:
+            self.files = sorted(glob.glob(os.path.join(root_dir, "*.png")))
+
+        if len(self.files) == 0:
+            raise FileNotFoundError(f"No files found in {root_dir}")
+
+        log.info(f"[Raw] Found {len(self.files)} generated files")
+
+        # Simple transform: just resize to target size and convert to tensor
+        self.transform = T.Compose([
+            T.Resize((image_size, image_size), interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+            T.ToTensor(),  # Converts to [0, 1] range
+        ])
+
+    def __len__(self):
+        return len(self.files)
+
+    def _parse_celeba_filename(self, fname: str) -> Dict[str, int]:
+        basename = os.path.basename(fname)
+        name_no_ext = os.path.splitext(basename)[0]
+        parts = name_no_ext.split("_")
+        parts = parts[:-1]  # Remove index
+
+        cond_dict = {}
+        buffer = []
+        for p in parts:
+            if not p:
+                continue
+            if p[-1] in ["0", "1"] and p[:-1].isalnum():
+                attr_name = "_".join(buffer + [p[:-1]])
+                val = int(p[-1])
+                cond_dict[attr_name] = torch.tensor(val, dtype=torch.long)
+                buffer = []
+            else:
+                buffer.append(p)
+        return cond_dict
+
+    def __getitem__(self, idx):
+        fpath = self.files[idx]
+
+        if "rxrx1" in self.dataset_type:
+            img = torch.load(fpath, map_location="cpu")
+            if img.shape[0] == 6:
+                img = to_rgb(img.unsqueeze(0))[0]
+            # Normalize to [0, 1] if needed
+            if img.max() > 1.0:
+                img = img / 255.0
+        else:
+            img_pil = Image.open(fpath).convert("RGB")
+            img = self.transform(img_pil)
+
+        cond = self._parse_celeba_filename(fpath) if "celeba" in self.dataset_type else {}
+        return img, {"cond": cond}
+
+
 # --- Core Logic ---
 
 
@@ -180,6 +251,131 @@ def adapt_batch(images: torch.Tensor, target_channels: int) -> torch.Tensor:
 
     # Case C: Pass-through (6->6 for OpenPhenom, 3->3 for CelebA)
     return images
+
+
+@torch.no_grad()
+def extract_and_save_meanpatch(loader, device, save_path, encoder_name="dinov3-vit-l", image_size=256):
+    """
+    Extract features using REPAEncoder mean-pooled patch tokens.
+
+    This provides consistent features matching REPA training pipeline.
+    """
+    if os.path.exists(save_path):
+        log.warning(f"Cache file already exists at {save_path}. Skipping.")
+        return
+
+    log.info(f"Starting meanpatch extraction -> {save_path}")
+    log.info(f"  encoder_name={encoder_name}, image_size={image_size}")
+
+    # Initialize REPAEncoder
+    enc = REPAEncoder(
+        encoder_name=encoder_name,
+        resolution=image_size,
+        in_channels=3,
+        target_grid=16,
+        device=device,
+    )
+    enc.eval()
+
+    all_features = []
+    all_metadata = []
+    all_filenames = []
+
+    for batch in tqdm(loader, desc="Extracting meanpatch"):
+        images = None
+        meta_batch = {}
+        filenames_batch = []
+
+        # --- Batch Unpacking Logic (same as extract_and_save) ---
+        if (
+            isinstance(batch, (list, tuple))
+            and len(batch) == 2
+            and isinstance(batch[1], dict)
+        ):
+            images = batch[0]
+            cond_wrapper = batch[1]
+
+            if "cond" in cond_wrapper and isinstance(cond_wrapper["cond"], dict):
+                for attr_name, attr_val in cond_wrapper["cond"].items():
+                    meta_batch[attr_name] = (
+                        attr_val.cpu()
+                        if isinstance(attr_val, torch.Tensor)
+                        else attr_val
+                    )
+
+            for k, v in cond_wrapper.items():
+                if k == "cond":
+                    continue
+                meta_batch[k] = v.cpu() if isinstance(v, torch.Tensor) else v
+
+        elif isinstance(batch, (list, tuple)):
+            images = batch[0]
+            meta_batch["labels"] = (
+                batch[1].cpu() if isinstance(batch[1], torch.Tensor) else batch[1]
+            )
+        elif isinstance(batch, dict) and "image" in batch:
+            images = batch["image"]
+            for k, v in batch.items():
+                if k != "image":
+                    meta_batch[k] = v.cpu() if isinstance(v, torch.Tensor) else v
+        else:
+            raise ValueError(f"Unknown batch format: {type(batch)}")
+
+        # Images should be in [0, 1] range for REPAEncoder
+        images = images.to(device)
+        if images.max() > 1.5:  # Likely normalized with ImageNet stats
+            # Skip normalization, REPAEncoder does its own
+            pass
+
+        # REPAEncoder expects [0,1] RGB, does its own normalization
+        # But our images come from encoder transform which may have normalized them
+        # We need raw [0,1] images
+
+        # Forward pass: (B, 3, H, W) -> (B, 256, D) patch tokens
+        patch_tokens = enc(images)
+
+        # Mean pool over patches: (B, 256, D) -> (B, D)
+        feats = patch_tokens.mean(dim=1).cpu()
+
+        all_features.append(feats)
+        all_metadata.append(meta_batch)
+
+    if not all_features:
+        log.error("No features extracted!")
+        return
+
+    # Collate
+    features_cat = torch.cat(all_features, dim=0)
+
+    collated_meta = {}
+    if all_metadata:
+        keys = all_metadata[0].keys()
+        for k in keys:
+            vals = [m[k] for m in all_metadata]
+            if isinstance(vals[0], torch.Tensor):
+                if vals[0].ndim == 0:
+                    collated_meta[k] = torch.stack(vals, dim=0)
+                else:
+                    collated_meta[k] = torch.cat(vals, dim=0)
+            elif isinstance(vals[0], (list, tuple)):
+                flat_list = []
+                for v in vals:
+                    flat_list.extend(list(v))
+                collated_meta[k] = flat_list
+            else:
+                collated_meta[k] = vals
+
+    # Save
+    payload = {
+        "features": features_cat,
+        "metadata": collated_meta,
+        "encoder_name": f"{encoder_name}_meanpatch",
+        "feature_dim": features_cat.shape[1],
+    }
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save(payload, save_path)
+    log.info(f"Saved {features_cat.shape[0]} samples to {save_path}")
 
 
 @torch.no_grad()
@@ -303,12 +499,20 @@ def main(cfg: DictConfig):
         )
 
     enc_config = CONFIG_MAP[enc_name]
-    log.info(f"Selected Encoder: {enc_name} ({enc_config.name})")
 
-    # 2. Load Encoder Model
-    encoder = load_encoder(enc_config, device=device)
-    enc_transform = encoder.get_transform()
-    log.info(f"Injecting Encoder Transform: {enc_transform}")
+    # Special case: dinov3_meanpatch uses REPAEncoder, not eval encoder
+    is_meanpatch = enc_name == "dinov3_meanpatch"
+
+    if is_meanpatch:
+        log.info(f"Selected Encoder: {enc_name} (REPAEncoder meanpatch mode)")
+        encoder = None
+        enc_transform = None
+    else:
+        log.info(f"Selected Encoder: {enc_name} ({enc_config.name})")
+        # 2. Load Encoder Model
+        encoder = load_encoder(enc_config, device=device)
+        enc_transform = encoder.get_transform()
+        log.info(f"Injecting Encoder Transform: {enc_transform}")
 
     # 3. Determine Mode: Real DataModule OR Generated Folder
     generated_path = cfg.get("generated_path", None)
@@ -325,22 +529,6 @@ def main(cfg: DictConfig):
             f"Mode: GENERATED DATA | Type: {dataset_type} | Path: {generated_path}"
         )
 
-        gen_dataset = GeneratedDataset(
-            root_dir=generated_path,
-            dataset_type=dataset_type,
-            transform=enc_transform,
-            input_channels=enc_config.input_channels,
-        )
-        bsize = cfg.dataset.get("batch_size", 32)
-        loader = DataLoader(
-            gen_dataset,
-            batch_size=128,
-            shuffle=False,
-            num_workers=32,  # cfg.dataset.num_workers,
-            pin_memory=True,
-            persistent_workers=True,
-        )
-
         # Save to outputs/gen/<model_name>/{encoder}_features.pt
         # Use parent folder if path ends with 'images'
         norm_path = os.path.normpath(generated_path)
@@ -348,9 +536,61 @@ def main(cfg: DictConfig):
             model_dir = os.path.dirname(norm_path)
         else:
             model_dir = norm_path
-        save_path = os.path.join(model_dir, f"{enc_name}_features.pt")
 
-        extract_and_save(loader, encoder, save_path, device)
+        if is_meanpatch:
+            # Use raw dataset for meanpatch (no encoder normalization)
+            gen_dataset_raw = GeneratedDatasetRaw(
+                root_dir=generated_path,
+                dataset_type=dataset_type,
+                image_size=256,
+            )
+            loader_raw = DataLoader(
+                gen_dataset_raw,
+                batch_size=128,
+                shuffle=False,
+                num_workers=32,
+                pin_memory=True,
+                persistent_workers=True,
+            )
+            save_path_meanpatch = os.path.join(model_dir, "dinov3_meanpatch_features.pt")
+            extract_and_save_meanpatch(loader_raw, device, save_path_meanpatch, encoder_name="dinov3-vit-l", image_size=256)
+        else:
+            gen_dataset = GeneratedDataset(
+                root_dir=generated_path,
+                dataset_type=dataset_type,
+                transform=enc_transform,
+                input_channels=enc_config.input_channels,
+            )
+            bsize = cfg.dataset.get("batch_size", 32)
+            loader = DataLoader(
+                gen_dataset,
+                batch_size=128,
+                shuffle=False,
+                num_workers=32,  # cfg.dataset.num_workers,
+                pin_memory=True,
+                persistent_workers=True,
+            )
+            save_path = os.path.join(model_dir, f"{enc_name}_features.pt")
+            extract_and_save(loader, encoder, save_path, device)
+
+        # Also save meanpatch features if requested
+        if not is_meanpatch and cfg.get("also_save_meanpatch", False):
+            # Create raw dataset (no encoder normalization)
+            gen_dataset_raw = GeneratedDatasetRaw(
+                root_dir=generated_path,
+                dataset_type=dataset_type,
+                image_size=256,
+            )
+            loader_raw = DataLoader(
+                gen_dataset_raw,
+                batch_size=128,
+                shuffle=False,
+                num_workers=32,
+                pin_memory=True,
+                persistent_workers=True,
+            )
+            save_path_meanpatch = os.path.join(model_dir, "dinov3_meanpatch_features.pt")
+            extract_and_save_meanpatch(loader_raw, device, save_path_meanpatch, encoder_name="dinov3-vit-l", image_size=256)
 
     else:
         # --- PATH B: Real DataModule (Original Logic) ---
@@ -367,8 +607,17 @@ def main(cfg: DictConfig):
             raise ValueError(f"Unknown dataset target: {cfg.dataset._target_}")
 
         # Inject Transform
-        # Encoder transforms now include ToTensor/ConvertImageDtype and are robust
-        # to both PIL images and Tensors, so we can safely replace dataset transforms
+        # For meanpatch: use raw [0,1] images (REPAEncoder does its own normalization)
+        # For eval encoders: use encoder-specific normalization
+        if is_meanpatch:
+            # Raw transform: resize + to tensor (no normalization)
+            raw_transform = T.Compose([
+                T.Resize((256, 256), interpolation=T.InterpolationMode.BICUBIC, antialias=True),
+                T.ToTensor(),  # Converts to [0, 1] range
+            ])
+            target_transform = raw_transform
+        else:
+            target_transform = enc_transform
 
         # Patch datasets inside DM if they exist
         for split_name in [
@@ -383,8 +632,7 @@ def main(cfg: DictConfig):
                 ds = getattr(dm, split_name)
                 # CelebaDataset / RxRx1Dataset have self.transform
                 if ds is not None and hasattr(ds, "transform"):
-                    # Encoder transform now handles ToTensor + type conversion + normalization
-                    ds.transform = enc_transform
+                    ds.transform = target_transform
 
         # Determine dataset name from config
         dataset_name = "celeba" if "Celeba" in cfg.dataset._target_ else "rxrx1"
@@ -403,7 +651,10 @@ def main(cfg: DictConfig):
                 continue
             save_path = os.path.join(feature_cache_dir, f"{split_name}_features.pt")
             log.info(f"Processing split: {split_name}...")
-            extract_and_save(loader, encoder, save_path, device)
+            if is_meanpatch:
+                extract_and_save_meanpatch(loader, device, save_path, encoder_name="dinov3-vit-l", image_size=256)
+            else:
+                extract_and_save(loader, encoder, save_path, device)
 
 
 if __name__ == "__main__":
