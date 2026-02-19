@@ -2,10 +2,15 @@
 
 This script extends generate_samples.py to also extract and save the aligned
 layer features during generation, avoiding the need to re-run DINOv3.
+
+Features are automatically consolidated into aligned_mean_features.pt at the end.
 """
+import glob
 import itertools
 import logging
 import os
+from pathlib import Path
+from typing import Dict, List, Tuple
 
 import hydra
 import numpy as np
@@ -21,6 +26,188 @@ from PIL import Image
 from tqdm import tqdm
 
 log = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Consolidation utilities
+# =============================================================================
+
+
+def parse_condition_from_signature(signature: str) -> Dict[str, int]:
+    """Parse condition values from signature string."""
+    parts = signature.split("_")
+    cond_dict = {}
+    buffer = []
+    for p in parts:
+        if not p:
+            continue
+        if p[-1] in ["0", "1"] and len(p) > 1:
+            attr_name = "_".join(buffer + [p[:-1]])
+            cond_dict[attr_name] = int(p[-1])
+            buffer = []
+        else:
+            buffer.append(p)
+    return cond_dict
+
+
+def parse_filename(fname: str) -> Tuple[str, int]:
+    """Parse filename into (signature, local_idx)."""
+    stem = Path(fname).stem
+    sig, idx_str = stem.rsplit("_", 1)
+    return sig, int(idx_str)
+
+
+def consolidate_aligned_features(
+    out_dir: str,
+    pooling: str = "mean",
+    condition_keys: List[str] = None,
+) -> Dict:
+    """
+    Consolidate aligned feature shards into a single file using index-based joining.
+
+    Uses image filenames as the source of truth for global ordering.
+    Ensures features[i] corresponds to sorted_images[i].
+
+    Args:
+        out_dir: Output directory containing images/ and aligned_features/
+        pooling: Pooling method for patch features
+        condition_keys: List of condition keys (auto-detected if None)
+
+    Returns:
+        Dict with features, metadata, indices
+    """
+    images_dir = Path(out_dir) / "images"
+    aligned_dir = Path(out_dir) / "aligned_features"
+
+    # Step 1: Build global index mapping from images
+    log.info("Consolidating: Building global index mapping...")
+    png_files = list(images_dir.glob("*.png"))
+    pt_files = list(images_dir.glob("*.pt"))
+    image_files = png_files if png_files else pt_files
+
+    if not image_files:
+        raise FileNotFoundError(f"No image files in {images_dir}")
+
+    sorted_files = sorted(image_files, key=lambda p: p.name)
+    sorted_filenames = [f.name for f in sorted_files]
+    N = len(sorted_filenames)
+    log.info(f"  Found {N} images")
+
+    # Build (signature, local_idx) -> global_idx mapping
+    idx_mapping: Dict[Tuple[str, int], int] = {}
+    for global_idx, fname in enumerate(sorted_filenames):
+        sig, local_idx = parse_filename(fname)
+        key = (sig, local_idx)
+        if key in idx_mapping:
+            raise ValueError(f"Duplicate (signature, local_idx): {key}")
+        idx_mapping[key] = global_idx
+
+    # Step 2: Load shards
+    shard_files = sorted(aligned_dir.glob("*_aligned_feats.pt"))
+    if not shard_files:
+        raise FileNotFoundError(f"No aligned feature shards in {aligned_dir}")
+    log.info(f"  Loading {len(shard_files)} shards...")
+
+    feature_dim = None
+    idx_to_feature: Dict[int, torch.Tensor] = {}
+    idx_to_condition: Dict[int, Dict[str, int]] = {}
+    all_condition_keys = set()
+
+    for shard_path in tqdm(shard_files, desc="Loading shards", disable=True):
+        sig = shard_path.stem.replace("_aligned_feats", "")
+        data = torch.load(shard_path, map_location="cpu")
+
+        # Handle dict format (new) or raw tensor (legacy)
+        if isinstance(data, dict):
+            features = data.get("aligned_features", data.get("features"))
+            local_indices = data.get("indices", list(range(features.shape[0])))
+            if isinstance(local_indices, torch.Tensor):
+                local_indices = local_indices.tolist()
+            condition = data.get("condition", parse_condition_from_signature(sig))
+        else:
+            features = data
+            local_indices = list(range(features.shape[0]))
+            condition = parse_condition_from_signature(sig)
+
+        all_condition_keys.update(condition.keys())
+
+        # Pool if needed (N, patches, dim) -> (N, dim)
+        if features.ndim == 3:
+            if pooling == "mean":
+                features = features.mean(dim=1)
+            elif pooling == "cls":
+                features = features[:, 0, :]
+            elif pooling == "max":
+                features = features.max(dim=1)[0]
+
+        if feature_dim is None:
+            feature_dim = features.shape[1]
+
+        # Map to global indices
+        for i, local_idx in enumerate(local_indices):
+            key = (sig, local_idx)
+            if key not in idx_mapping:
+                log.warning(f"Sample {key} not in image index mapping, skipping")
+                continue
+            global_idx = idx_mapping[key]
+            if global_idx in idx_to_feature:
+                raise ValueError(f"Duplicate global index {global_idx}")
+            idx_to_feature[global_idx] = features[i]
+            idx_to_condition[global_idx] = condition.copy()
+
+    # Step 3: Build output tensors in sorted index order
+    if condition_keys is None:
+        condition_keys = sorted(all_condition_keys)
+
+    sorted_indices = sorted(idx_to_feature.keys())
+    actual_N = len(sorted_indices)
+
+    features_tensor = torch.stack([idx_to_feature[i] for i in sorted_indices], dim=0)
+    indices_tensor = torch.tensor(sorted_indices, dtype=torch.long)
+
+    metadata = {}
+    for key in condition_keys:
+        vals = [idx_to_condition[i].get(key, 0) for i in sorted_indices]
+        metadata[key] = torch.tensor(vals, dtype=torch.long)
+
+    filenames = [sorted_filenames[i] for i in sorted_indices]
+
+    # Step 4: Integrity checks
+    log.info("  Running integrity checks...")
+    assert len(set(sorted_indices)) == len(sorted_indices), "Duplicate indices"
+
+    for key, vals in metadata.items():
+        assert len(vals) == actual_N, f"Metadata {key} length mismatch"
+
+    # Spot check
+    rng = np.random.default_rng(42)
+    check_indices = rng.choice(sorted_indices, size=min(5, len(sorted_indices)), replace=False)
+    for idx in check_indices:
+        fname = sorted_filenames[idx]
+        sig, _ = parse_filename(fname)
+        expected_cond = parse_condition_from_signature(sig)
+        for key in condition_keys:
+            pos = sorted_indices.index(idx)
+            if expected_cond.get(key, 0) != metadata[key][pos].item():
+                raise ValueError(f"Spot check failed at index {idx}")
+
+    log.info(f"  ✓ Consolidated {actual_N}/{N} samples, shape {features_tensor.shape}")
+
+    return {
+        "features": features_tensor,
+        "metadata": metadata,
+        "indices": indices_tensor,
+        "filenames": filenames,
+        "encoder_name": "dinov3-vit-l_meanpatch_aligned",
+        "feature_dim": feature_dim,
+        "pooling_method": pooling,
+        "n_samples": actual_N,
+    }
+
+
+# =============================================================================
+# DDP and generation utilities
+# =============================================================================
 
 
 def setup_ddp():
@@ -144,7 +331,7 @@ def main(cfg: DictConfig):
     # 5. Generation Loop with Feature Extraction
     samples_per_cond = cfg.samples_per_condition
     batch_size = cfg.batch_size
-    feature_capture_t = cfg.get("feature_capture_t", None)  # None = final step
+    feature_capture_idx = cfg.get("feature_capture_idx", None)  # None = final step (index num_inference_steps-1)
 
     # Resume support: check for existing aligned features
     resume = cfg.get("resume", False)
@@ -182,7 +369,7 @@ def main(cfg: DictConfig):
                     cfg_scale=cfg.get("cfg_scale", 1.0),
                     adaptive_cfg=cfg.get("adaptive_cfg", False),
                     return_aligned_features=True,
-                    feature_capture_t=feature_capture_t,
+                    feature_capture_idx=feature_capture_idx,
                 )
                 images = torch.clamp(images, 0, 1)
 
@@ -213,15 +400,41 @@ def main(cfg: DictConfig):
             generated_count += current_bs
             batch_idx += 1
 
-        # Save aligned features for this condition
+        # Save aligned features for this condition with metadata
         if all_features_for_cond:
             cond_features = torch.cat(all_features_for_cond, dim=0)
             feat_fname = f"{signature}_aligned_feats.pt"
-            torch.save(cond_features, os.path.join(feat_dir, feat_fname))
+
+            # Parse condition from signature for metadata
+            cond_dict = parse_condition_from_signature(signature)
+
+            # Save with metadata for robust consolidation
+            shard_data = {
+                "aligned_features": cond_features,
+                "indices": list(range(cond_features.shape[0])),  # Local indices within condition
+                "condition": cond_dict,
+                "signature": signature,
+            }
+            torch.save(shard_data, os.path.join(feat_dir, feat_fname))
 
     if resume and skipped > 0:
         log.info(f"[Rank {rank}] Skipped {skipped} conditions (already completed).")
     log.info(f"[Rank {rank}] Finished generation with feature extraction.")
+
+    # Consolidate aligned features (rank 0 only, after all ranks finish)
+    if is_ddp:
+        dist.barrier()  # Wait for all ranks to finish
+
+    if rank == 0:
+        log.info("Consolidating aligned features...")
+        try:
+            result = consolidate_aligned_features(out_dir, pooling="mean")
+            output_path = os.path.join(out_dir, "aligned_mean_features.pt")
+            torch.save(result, output_path)
+            log.info(f"Saved consolidated features to {output_path}")
+        except Exception as e:
+            log.error(f"Consolidation failed: {e}")
+
     if is_ddp:
         dist.destroy_process_group()
 
