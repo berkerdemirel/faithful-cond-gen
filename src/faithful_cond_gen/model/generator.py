@@ -673,6 +673,7 @@ class GeneratorWrapper(nn.Module):
         adaptive_cfg: bool = False,
         return_aligned_features: bool = False,
         feature_capture_idx: Optional[Union[int, List[int], str]] = None,
+        capture_at_t0: bool = False,
     ):
         """REPA-style two-stage sampling (default sampler).
 
@@ -692,13 +693,16 @@ class GeneratorWrapper(nn.Module):
                               int: capture at that Stage 1 index k (0 <= k <= num_inference_steps-2), or -1 for final Stage 2
                               List[int]: capture at each listed index; -1 allowed for final Stage 2
                               "all": capture at every Stage 1 step (0 to num_inference_steps-2) + final Stage 2
+            capture_at_t0: If True and feature_capture_idx="all", also capture features at t=0.0 after ODE refinement.
+                          This adds an extra forward pass on the final denoised latent.
 
         Returns:
             Decoded images in [0, 1]
             If return_aligned_features=True: (images, aligned_features) tuple where:
                 - Single capture (int/None): aligned_features is List[Tensor] or None (unpooled patch features)
                 - Multiple captures (list/"all"): aligned_features is List[(k_idx, t_val, Tensor)] where:
-                  - k_idx (int): step index (0 to num_inference_steps-2 for Stage 1, num_inference_steps-1 for Stage 2)
+                  - k_idx (int): step index (0 to num_inference_steps-2 for Stage 1, num_inference_steps-1 for Stage 2,
+                                 num_inference_steps for t=0.0 capture if capture_at_t0=True)
                   - t_val (float): actual timestep value at that index
                   - Tensor: pooled features (B, D) on CPU for memory efficiency
         """
@@ -887,16 +891,28 @@ class GeneratorWrapper(nn.Module):
         dt_final = 0.0 - t_cutoff  # = -0.04
         x = x + dt_final * drift_final
 
+        # Optional: Capture features at t=0 after ODE refinement
+        if return_aligned_features and capture_at_t0 and capture_mode == "all":
+            t_zero = torch.zeros(b, device=device, dtype=model_dtype)
+            _, zs_tilde_t0 = self.apply_cfg(
+                x, t_zero, cond_ids, cfg_scale_tensor, return_features=True
+            )
+            if zs_tilde_t0 is not None and len(zs_tilde_t0) > 0:
+                pooled_t0 = zs_tilde_t0[0].mean(dim=1).cpu()
+                capture_list.append((num_inference_steps, 0.0, pooled_t0))
+
         images = self.decode(x)
 
         if return_aligned_features:
             # Return format depends on capture mode
             if capture_mode in ["all", "multiple"]:
                 # Validation for "all" mode
-                if capture_mode == "all" and len(capture_list) != num_inference_steps:
+                expected_captures = num_inference_steps + (1 if capture_at_t0 else 0)
+                if capture_mode == "all" and len(capture_list) != expected_captures:
                     raise ValueError(
-                        f"Expected {num_inference_steps} captures in 'all' mode, "
-                        f"got {len(capture_list)}. This indicates a bug in feature capture logic."
+                        f"Expected {expected_captures} captures in 'all' mode "
+                        f"(capture_at_t0={capture_at_t0}), got {len(capture_list)}. "
+                        f"This indicates a bug in feature capture logic."
                     )
                 return images, capture_list if capture_list else None
             else:

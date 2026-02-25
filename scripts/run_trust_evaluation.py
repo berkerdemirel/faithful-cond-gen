@@ -43,7 +43,9 @@ logger = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from faithful_cond_gen.eval.trust_eval_extensions import (
+    bin_samples_within_conditioning,
     bootstrap_kid_for_bin,
+    build_condition_class_map,
     compute_real_sample_scores,
     compute_trust_results_from_features,
     condition_to_signature,
@@ -264,27 +266,6 @@ def get_effective_kid_mode(normalize_mode: str, feature_type: str) -> str:
             return "cosine"  # Norms weren't optimized, normalize internally
         else:
             return "standard"  # Use raw features with dimension scaling
-
-
-# def load_trust_scores(dataset: str) -> List[Dict]:
-#     """
-#     Load precomputed trust scores from disk.
-
-#     Args:
-#         dataset: Dataset name (e.g., "celeba", "rxrx1")
-
-#     Returns:
-#         List of trust score result dictionaries
-
-#     Raises:
-#         FileNotFoundError: If trust scores file doesn't exist
-#     """
-#     path = TRUST_SCORES_DIR / f"trust_scores_{dataset}.pt"
-#     if not path.exists():
-#         raise FileNotFoundError(
-#             f"Trust scores not found at {path}. Run compute_trust_scores.py first."
-#         )
-#     return torch.load(path, map_location="cpu", weights_only=False)
 
 
 def get_per_condition_stats(results: Dict) -> pd.DataFrame:
@@ -986,7 +967,8 @@ def evaluate_full_condition_ranking(
         max_gap = gaps.max()
         gap_analysis = {"mean_gap": float(mean_gap), "max_gap": float(max_gap)}
 
-        # Pearson correlation
+        # Correlations (both Spearman and Pearson for cross-reference with Layer 1)
+        spearman_rho, spearman_p = spearmanr(valid["trust_mean"], valid["delta_kid"])
         pearson_rho, pearson_p = pearsonr(valid["trust_mean"], valid["delta_kid"])
 
         cols = ["condition_str"]
@@ -1018,6 +1000,8 @@ def evaluate_full_condition_ranking(
 
         return {
             "status": "success",
+            "spearman_rho": float(spearman_rho),
+            "spearman_p": float(spearman_p),
             "pearson_rho": float(pearson_rho),
             "pearson_p": float(pearson_p),
             "gap_analysis": gap_analysis,
@@ -1289,6 +1273,8 @@ def evaluate_sample_ood_detection(
     max_real: int = 10000,
     n_resamples: int = 3,
     fit_fraction: float = 0.5,
+    scoring_method: str = "mahalanobis",
+    knn_k: int = 10,
 ) -> Dict:
     """
     Task 3: Sample-based OOD detection (real vs generated).
@@ -1333,7 +1319,11 @@ def evaluate_sample_ood_detection(
         gen_conditions = []
         for i in range(n_gen):
             cond = tuple(
-                int(gen_meta[k][i].item() if isinstance(gen_meta[k][i], torch.Tensor) else gen_meta[k][i])
+                int(
+                    gen_meta[k][i].item()
+                    if isinstance(gen_meta[k][i], torch.Tensor)
+                    else gen_meta[k][i]
+                )
                 for k in condition_keys
             )
             gen_conditions.append(cond)
@@ -1353,7 +1343,9 @@ def evaluate_sample_ood_detection(
             elif isinstance(gen_meta[k], np.ndarray):
                 gen_meta_split[k] = gen_meta[k][gen_mask]
             else:
-                gen_meta_split[k] = [gen_meta[k][i] for i, m in enumerate(gen_mask) if m]
+                gen_meta_split[k] = [
+                    gen_meta[k][i] for i, m in enumerate(gen_mask) if m
+                ]
 
         if len(gen_feats_split) == 0:
             continue
@@ -1414,27 +1406,35 @@ def evaluate_sample_ood_detection(
             from faithful_cond_gen.eval.trust_eval_extensions import (
                 _filter_feats_and_meta_by_seen_combos,
             )
+
             if filter_by_seen and seen_combos:
-                fit_feats_filtered, fit_meta_filtered = _filter_feats_and_meta_by_seen_combos(
-                    fit_feats, fit_meta, condition_keys, seen_combos
+                fit_feats_filtered, fit_meta_filtered = (
+                    _filter_feats_and_meta_by_seen_combos(
+                        fit_feats, fit_meta, condition_keys, seen_combos
+                    )
                 )
             else:
                 fit_feats_filtered, fit_meta_filtered = fit_feats, fit_meta
 
             # Fit scoring components on fit_set only (LDA-style shared cov for fair margin comparison)
             components = fit_trust_scoring_components(
-                fit_feats_filtered, fit_meta_filtered, condition_keys,
-                regularization=1e-5, use_shared_cov=True,
+                fit_feats_filtered,
+                fit_meta_filtered,
+                condition_keys,
+                regularization=1e-5,
+                use_shared_cov=True,
+                scoring_method=scoring_method,
+                knn_k=knn_k,
             )
 
             # Score held-out real samples using fitted components
-            real_realism_z, real_faithfulness_z, real_trust_z = score_trust_from_components(
-                score_feats, score_meta, components
+            real_realism_z, real_faithfulness_z, real_trust_z = (
+                score_trust_from_components(score_feats, score_meta, components)
             )
 
             # Score generated samples using the SAME fitted components
-            gen_realism_z, gen_faithfulness_z, gen_trust_z = score_trust_from_components(
-                gen_feats_split, gen_meta_split, components
+            gen_realism_z, gen_faithfulness_z, gen_trust_z = (
+                score_trust_from_components(gen_feats_split, gen_meta_split, components)
             )
 
             n_real = len(real_trust_z)
@@ -1722,6 +1722,282 @@ def evaluate_decile_binning(
     return df
 
 
+def evaluate_downstream_bin_selection_from_scores(
+    trust_results: Dict,
+    gen_feats_downstream: torch.Tensor,
+    real_feats_downstream: torch.Tensor,
+    real_meta: Dict,
+    condition_keys: List[str],
+    model_name: str,
+    scoring_feature_type: str,
+    downstream_feature_type: str,
+    output_dir: Path,
+    n_bins: int = 10,
+    n_seeds: int = 5,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """
+    Task 5: Downstream bin-selection evaluation.
+
+    Tests whether trust-based scoring helps select better samples for downstream
+    classification. Key insight: scoring feature space may differ from downstream
+    feature space where classifiers are trained.
+
+    Args:
+        trust_results: Dict with scores (trust_updated, realism_global_z, faithfulness_margin_z)
+                      and true_conditions
+        gen_feats_downstream: Generated features in downstream feature space (N, D)
+        real_feats_downstream: Real features in downstream feature space (M, D)
+        real_meta: Real metadata dict with condition keys
+        condition_keys: List of condition attribute names
+        model_name: Model name for output naming
+        scoring_feature_type: Feature type used for scoring (e.g., "aligned_mean")
+        downstream_feature_type: Feature type for downstream task (e.g., "dinov3")
+        output_dir: Output directory for CSV and plots
+        n_bins: Number of bins (default 10 = deciles)
+        n_seeds: Number of seeds for classifier training
+        seed: Base random seed
+
+    Returns:
+        DataFrame with results per (ranking_mode, bin_idx, seed)
+    """
+    from faithful_cond_gen.eval.trust_eval_extensions import (
+        bin_samples_within_conditioning,
+        build_condition_class_map,
+    )
+    from sklearn.linear_model import LogisticRegression
+
+    # Extract scores
+    trust_scores = trust_results["trust_updated"]
+    realism_scores = trust_results["realism_global_z"]
+    faithfulness_scores = trust_results["faithfulness_margin_z"]
+    true_conditions = trust_results["true_conditions"]
+
+    n_gen = len(trust_scores)
+    n_real = len(real_feats_downstream)
+
+    # Sanity checks
+    assert len(gen_feats_downstream) == n_gen, (
+        f"Feature count mismatch: gen_feats_downstream has {len(gen_feats_downstream)} "
+        f"but trust_results has {n_gen} samples"
+    )
+
+    # Build condition-to-class mapping (deterministic, sorted)
+    cond_to_class, class_to_cond = build_condition_class_map(true_conditions)
+    n_classes = len(class_to_cond)
+    print(f"    {n_classes}-way classification task")
+
+    # Check samples per condition
+    cond_counts = {}
+    for cond in true_conditions:
+        cond_counts[cond] = cond_counts.get(cond, 0) + 1
+
+    for cond, count in cond_counts.items():
+        if count < n_bins:
+            print(
+                f"    WARNING: condition {cond} has only {count} samples (< n_bins={n_bins})"
+            )
+
+    # Build fixed stratified real test set (30% per condition, deterministic seed)
+    rng = np.random.default_rng(seed)
+
+    # Group real samples by condition
+    real_by_cond: Dict[Tuple, List[int]] = {}
+    for i in range(n_real):
+        cond = tuple(
+            int(
+                real_meta[k][i].item()
+                if isinstance(real_meta[k][i], torch.Tensor)
+                else real_meta[k][i]
+            )
+            for k in condition_keys
+        )
+        real_by_cond.setdefault(cond, []).append(i)
+
+    # Select 30% per condition for test set
+    test_indices = []
+    for cond in class_to_cond:
+        cond_indices = real_by_cond.get(cond, [])
+        if len(cond_indices) == 0:
+            print(f"    WARNING: No real samples for condition {cond}")
+            continue
+        n_test = max(1, int(len(cond_indices) * 0.3))
+        test_idx = rng.choice(cond_indices, size=n_test, replace=False)
+        test_indices.extend(test_idx)
+
+    test_indices = np.array(test_indices, dtype=int)
+    X_test = real_feats_downstream[test_indices].numpy()
+    y_test = np.array(
+        [
+            cond_to_class[
+                tuple(
+                    int(
+                        real_meta[k][i].item()
+                        if isinstance(real_meta[k][i], torch.Tensor)
+                        else real_meta[k][i]
+                    )
+                    for k in condition_keys
+                )
+            ]
+            for i in test_indices
+        ],
+        dtype=int,
+    )
+
+    print(
+        f"    Fixed test set: {len(test_indices)} real samples, class balance: {np.bincount(y_test, minlength=n_classes)}"
+    )
+
+    # Ranking modes
+    ranking_modes = {
+        "trust": trust_scores,
+        "realism": realism_scores,
+        "faithfulness": faithfulness_scores,
+        "random": rng.random(n_gen),  # Random baseline
+    }
+
+    all_results = []
+    gen_feats_np = gen_feats_downstream.numpy()
+
+    for mode_name, scores in ranking_modes.items():
+        # Bin samples within each conditioning (ascending=True: lower score = better = bin 0)
+        # For random mode, ascending doesn't matter
+        ascending = True if mode_name != "random" else True
+        binned = bin_samples_within_conditioning(
+            true_conditions, np.asarray(scores), n_bins, ascending=ascending
+        )
+
+        # Sanity check: binning is per-conditioning
+        total_binned = sum(sum(len(b) for b in bins) for bins in binned.values())
+        assert total_binned == n_gen, f"Binning lost samples: {total_binned} vs {n_gen}"
+
+        for bin_idx in range(n_bins):
+            # Gather features from this bin across all conditions
+            bin_indices = []
+            bin_labels = []
+            for cond in class_to_cond:
+                if cond in binned and bin_idx < len(binned[cond]):
+                    cond_bin_indices = binned[cond][bin_idx]
+                    bin_indices.extend(cond_bin_indices)
+                    bin_labels.extend([cond_to_class[cond]] * len(cond_bin_indices))
+
+            if len(bin_indices) == 0:
+                print(f"    WARNING: bin {bin_idx} for mode {mode_name} has no samples")
+                continue
+
+            X_train = gen_feats_np[bin_indices]
+            y_train = np.array(bin_labels, dtype=int)
+
+            bin_samples_per_cond = len(bin_indices) // n_classes if n_classes > 0 else 0
+
+            # Train classifier with multiple seeds
+            for s in range(n_seeds):
+                clf_seed = seed + s * 1000 + bin_idx * 100
+                try:
+                    clf = LogisticRegression(
+                        solver="lbfgs",
+                        max_iter=2000,
+                        random_state=clf_seed,
+                    )
+                    clf.fit(X_train, y_train)
+                    accuracy = clf.score(X_test, y_test)
+                except Exception as e:
+                    print(
+                        f"    WARNING: Classifier failed for {mode_name} bin {bin_idx} seed {s}: {e}"
+                    )
+                    accuracy = np.nan
+
+                all_results.append(
+                    {
+                        "model_name": model_name,
+                        "scoring_feature_type": scoring_feature_type,
+                        "downstream_feature_type": downstream_feature_type,
+                        "ranking_mode": mode_name,
+                        "bin_idx": bin_idx,
+                        "seed": s,
+                        "n_train": len(bin_indices),
+                        "n_test": len(test_indices),
+                        "accuracy": accuracy,
+                        "bin_samples_per_condition": bin_samples_per_cond,
+                        "n_conditions": n_classes,
+                    }
+                )
+
+    df = pd.DataFrame(all_results)
+
+    # Save detailed CSV
+    config_key = f"{model_name}_{scoring_feature_type}_to_{downstream_feature_type}"
+    csv_path = output_dir / f"downstream_bin_selection_{config_key}.csv"
+    df.to_csv(csv_path, index=False)
+
+    # Create summary (mean/std by ranking_mode, bin_idx)
+    summary = (
+        df.groupby(["ranking_mode", "bin_idx"])
+        .agg(
+            {
+                "accuracy": ["mean", "std", "count"],
+                "n_train": "first",
+            }
+        )
+        .reset_index()
+    )
+    summary.columns = [
+        "ranking_mode",
+        "bin_idx",
+        "accuracy_mean",
+        "accuracy_std",
+        "n_seeds",
+        "n_train",
+    ]
+
+    summary_path = output_dir / f"downstream_bin_selection_summary_{config_key}.csv"
+    summary.to_csv(summary_path, index=False)
+
+    # Create plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    colors = {"trust": "C0", "realism": "C1", "faithfulness": "C2", "random": "gray"}
+    linestyles = {"trust": "-", "realism": "--", "faithfulness": ":", "random": "-."}
+
+    for mode_name in ["trust", "realism", "faithfulness", "random"]:
+        mode_summary = summary[summary["ranking_mode"] == mode_name]
+        if len(mode_summary) == 0:
+            continue
+
+        x = mode_summary["bin_idx"]
+        y = mode_summary["accuracy_mean"]
+        yerr = mode_summary["accuracy_std"]
+
+        ax.errorbar(
+            x,
+            y,
+            yerr=yerr,
+            label=mode_name.capitalize(),
+            marker="o",
+            capsize=4,
+            alpha=0.8,
+            color=colors.get(mode_name, "C0"),
+            linestyle=linestyles.get(mode_name, "-"),
+        )
+
+    ax.set_xlabel("Bin Index (0=best scores, 9=worst scores)")
+    ax.set_ylabel(f"Downstream {n_classes}-way Classification Accuracy")
+    ax.set_title(
+        f"Downstream Bin-Selection: {scoring_feature_type} → {downstream_feature_type}\n{model_name}"
+    )
+    ax.legend()
+    ax.grid(alpha=0.3)
+    ax.set_xticks(range(n_bins))
+
+    plot_path = output_dir / f"downstream_bin_selection_{config_key}.png"
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"    Saved: {csv_path.name}, {summary_path.name}, {plot_path.name}")
+
+    return df
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -1741,6 +2017,7 @@ def create_report(
     task4_results: Dict,
     output_dir: Path,
     normalize_mode: str = "none",
+    task5_results: Optional[Dict] = None,
 ):
     """
     Create comprehensive markdown report.
@@ -1759,6 +2036,7 @@ def create_report(
         task4_results: Task 4 decile binning results
         output_dir: Output directory for report
         normalize_mode: Feature normalization mode used
+        task5_results: Task 5 downstream bin-selection results
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1927,10 +2205,11 @@ def create_report(
         for config_key, r in sorted(task1_results.items()):
             report.append(f"\n### {config_key}\n")
             if r.get("status") == "success":
-                report.append(f"- **Pearson ρ**: {r.get('pearson_rho', np.nan):.4f}")
+                # Report both correlations for cross-reference with Layer 1
                 report.append(
-                    f"- **Pearson p-value**: {r.get('pearson_p', np.nan):.4f}"
+                    f"- **Spearman ρ**: {r.get('spearman_rho', np.nan):.4f} (same as Layer 1)"
                 )
+                report.append(f"- **Pearson ρ**: {r.get('pearson_rho', np.nan):.4f}")
                 report.append(
                     f"- **Mean ΔKID gap**: {r['gap_analysis']['mean_gap']:.6f}"
                 )
@@ -2037,6 +2316,88 @@ def create_report(
                 report.append(f"- **Plot**: {plot_name}")
             report.append("")
 
+    # Task 5: Downstream Bin-Selection Evaluation
+    if task5_results:
+        report.append("---\n## Task 5: Downstream Sample-Selection Evaluation\n")
+        report.append(
+            "*Classification accuracy by trust-score bin (16-way condition task)*\n"
+        )
+        report.append(
+            "\n**Key Question**: Does scoring in space X help select samples for downstream task in space Y?\n"
+        )
+
+        for config_key, df in sorted(task5_results.items()):
+            report.append(f"\n### {config_key}\n")
+            if df is not None and not df.empty:
+                # Create summary pivot table: bin_idx vs ranking_mode
+                summary = (
+                    df.groupby(["ranking_mode", "bin_idx"])
+                    .agg(
+                        {
+                            "accuracy": ["mean", "std"],
+                        }
+                    )
+                    .reset_index()
+                )
+                summary.columns = [
+                    "ranking_mode",
+                    "bin_idx",
+                    "accuracy_mean",
+                    "accuracy_std",
+                ]
+
+                # Highlight key findings
+                for mode in ["trust", "realism", "faithfulness", "random"]:
+                    mode_df = summary[summary["ranking_mode"] == mode]
+                    if len(mode_df) >= 2:
+                        bin0_acc = mode_df[mode_df["bin_idx"] == 0][
+                            "accuracy_mean"
+                        ].values
+                        bin9_acc = mode_df[
+                            mode_df["bin_idx"] == mode_df["bin_idx"].max()
+                        ]["accuracy_mean"].values
+                        if len(bin0_acc) > 0 and len(bin9_acc) > 0:
+                            gap = bin0_acc[0] - bin9_acc[0]
+                            report.append(
+                                f"- **{mode.capitalize()}**: Bin 0 acc = {bin0_acc[0]:.4f}, Bin 9 acc = {bin9_acc[0]:.4f}, Gap = {gap:+.4f}"
+                            )
+
+                # Show trust mode table
+                trust_summary = summary[summary["ranking_mode"] == "trust"]
+                if not trust_summary.empty:
+                    report.append("\n**Trust ranking (accuracy by bin):**\n")
+                    table_df = trust_summary[
+                        ["bin_idx", "accuracy_mean", "accuracy_std"]
+                    ].copy()
+                    table_df.columns = ["Bin", "Accuracy (mean)", "Accuracy (std)"]
+                    report.append(table_df.round(4).to_markdown(index=False))
+
+                # Extract model/feature info from dataframe
+                model_name = (
+                    df["model_name"].iloc[0]
+                    if "model_name" in df.columns
+                    else "unknown"
+                )
+                scoring_type = (
+                    df["scoring_feature_type"].iloc[0]
+                    if "scoring_feature_type" in df.columns
+                    else "unknown"
+                )
+                downstream_type = (
+                    df["downstream_feature_type"].iloc[0]
+                    if "downstream_feature_type" in df.columns
+                    else "unknown"
+                )
+
+                config_suffix = f"{model_name}_{scoring_type}_to_{downstream_type}"
+                csv_name = f"downstream_bin_selection_{config_suffix}.csv"
+                plot_name = f"downstream_bin_selection_{config_suffix}.png"
+                report.append(f"\n- **Scoring space**: {scoring_type}")
+                report.append(f"- **Downstream space**: {downstream_type}")
+                report.append(f"- **Full CSV**: {csv_name}")
+                report.append(f"- **Plot**: {plot_name}")
+            report.append("")
+
     # Write report
     with open(output_dir / f"TRUST_EVALUATION_{dataset}.md", "w") as f:
         f.write("\n".join(report))
@@ -2124,9 +2485,13 @@ def verify_consolidated_features(
                             f"but metadata has {key}={meta_val}"
                         )
 
-        logger.info(f"  ✓ Spot-checked {len(check_indices)} samples: conditions match filenames")
+        logger.info(
+            f"  ✓ Spot-checked {len(check_indices)} samples: conditions match filenames"
+        )
 
-    logger.info(f"  ✓ Metadata integrity verified: {N} samples, {len(condition_keys)} condition keys")
+    logger.info(
+        f"  ✓ Metadata integrity verified: {N} samples, {len(condition_keys)} condition keys"
+    )
     return True
 
 
@@ -2368,6 +2733,9 @@ def print_cosine_kid_transitivity_checks(
         cos_rg_d = _paired_cos_mean(real_a, gen_d)
         cos_rg_a = _paired_cos_mean(real_a, gen_a)
         cos_gg = _paired_cos_mean(gen_d, gen_a)
+        # Permuted comparison: shuffle gen_aligned to break the matching
+        perm_idx = rng.permutation(k_eff)
+        cos_gg_permuted = _paired_cos_mean(gen_d, gen_a[perm_idx])
 
         # Norm stats (pre-normalization; should not matter for cosine-kid but helps spot degeneracy)
         real_med, real_mean, real_std = _l2norm_stats(real_a)
@@ -2389,7 +2757,12 @@ def print_cosine_kid_transitivity_checks(
         print(f"  mean cos(real_a, real_b)      = {cos_rr:.4f}")
         print(f"  mean cos(real_a, gen_dino)    = {cos_rg_d:.4f}")
         print(f"  mean cos(real_a, gen_aligned) = {cos_rg_a:.4f}")
-        print(f"  mean cos(gen_dino, gen_aligned)= {cos_gg:.4f}")
+        print(
+            f"  mean cos(gen_dino, gen_aligned)         = {cos_gg:.4f}  [matched pairs]"
+        )
+        print(
+            f"  mean cos(gen_dino, gen_aligned_permuted)= {cos_gg_permuted:.4f}  [random pairs]"
+        )
         print("Median/mean/std of L2 norms (pre-normalization):")
         print(
             f"  real_a  norm: med={real_med:.3f} mean={real_mean:.3f} std={real_std:.3f}"
@@ -2460,17 +2833,36 @@ Examples:
         help="Feature normalization mode. 'none': no normalization (default, backward-compatible). "
         "'l2': L2-normalize all feature vectors immediately after loading.",
     )
+    parser.add_argument(
+        "--scoring-method",
+        type=str,
+        choices=["mahalanobis", "knn"],
+        default="mahalanobis",
+        help="Scoring method for realism/faithfulness. 'mahalanobis': Mahalanobis distance (default). "
+        "'knn': kNN radius-based scoring (sanity check alternative).",
+    )
+    parser.add_argument(
+        "--knn-k",
+        type=int,
+        default=10,
+        help="Number of neighbors for kNN scoring (only used if --scoring-method=knn). Default: 10.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     condition_keys = CONDITION_ATTRS.get(args.dataset, [])
     normalize_mode = args.normalize_features
+    scoring_method = args.scoring_method
+    knn_k = args.knn_k
 
     print("=" * 60)
     print("TRUST SCORE EVALUATION")
     print("=" * 60)
     print(f"Dataset: {args.dataset}")
     print(f"Normalize features: {normalize_mode}")
+    print(f"Scoring method: {scoring_method}")
+    if scoring_method == "knn":
+        print(f"  kNN k: {knn_k}")
     if normalize_mode == "l2":
         logger.info(
             "L2 normalization enabled: ALL feature vectors will be normalized after loading"
@@ -2524,6 +2916,8 @@ Examples:
             condition_keys=condition_keys,
             filter_by_seen=filter_by_seen,
             seen_combos=seen_combos,
+            scoring_method=scoring_method,
+            knn_k=knn_k,
         )
         all_results.append(trust_res)
 
@@ -2549,6 +2943,7 @@ Examples:
     task2_results = {}
     task3_results = {}
     task4_results = {}
+    task5_results = {}
 
     for config_key in by_config:
         config_results = by_config[config_key]
@@ -2684,6 +3079,8 @@ Examples:
                 model,
                 output_dir,
                 config_key,
+                scoring_method=scoring_method,
+                knn_k=knn_k,
             )
 
         # Task 4: Decile binning with ablations (after Layer 3)
@@ -2701,6 +3098,60 @@ Examples:
                 kid_mode=effective_kid_mode,  # Use effective mode based on normalization
             )
 
+        # Task 5: Downstream bin-selection evaluation
+        if real_feats is not None and gen_feats is not None:
+            print("  Task 5: Downstream bin-selection evaluation...")
+
+            # Downstream features always use dinov3 for fair comparison
+            downstream_feature_type = "dinov3"
+
+            if feature_type != downstream_feature_type:
+                # Load dinov3 features for same generated samples
+                cache_key_downstream = (model, downstream_feature_type)
+                if cache_key_downstream in feature_cache:
+                    _, _, gen_feats_downstream, gen_meta_downstream = feature_cache[cache_key_downstream]
+                else:
+                    # Try to load dinov3 features
+                    _, _, gen_feats_downstream, gen_meta_downstream = load_features_for_dataset(
+                        args.dataset, model, downstream_feature_type, normalize_mode
+                    )
+            else:
+                gen_feats_downstream = gen_feats
+                gen_meta_downstream = gen_meta
+
+            if gen_feats_downstream is not None:
+                # Verify feature ordering between scoring and downstream spaces
+                try:
+                    verify_feature_ordering(
+                        gen_meta,
+                        gen_meta_downstream,
+                        f"scoring_{feature_type}",
+                        f"downstream_{downstream_feature_type}"
+                    )
+                    print(f"    ✓ Verified: scoring and downstream features have matching sample order")
+                except ValueError as e:
+                    print(f"    ✗ SKIPPING Task 5: Feature ordering mismatch - {e}")
+                    gen_feats_downstream = None
+
+            if gen_feats_downstream is not None:
+                task5_results[config_key] = (
+                    evaluate_downstream_bin_selection_from_scores(
+                        trust_results=first_result,
+                        gen_feats_downstream=gen_feats_downstream,
+                        real_feats_downstream=real_feats,  # Real features (already in dinov3 space)
+                        real_meta=real_meta,
+                        condition_keys=condition_keys,
+                        model_name=model,
+                        scoring_feature_type=feature_type,
+                        downstream_feature_type=downstream_feature_type,
+                        output_dir=output_dir,
+                    )
+                )
+            else:
+                print(
+                    f"    Skipping Task 5: could not load {downstream_feature_type} features for downstream task"
+                )
+
     # Create report
     print("\nGenerating report...")
     create_report(
@@ -2717,6 +3168,7 @@ Examples:
         task4_results,
         output_dir,
         normalize_mode=normalize_mode,
+        task5_results=task5_results,
     )
 
     # Save detailed results
@@ -2731,6 +3183,7 @@ Examples:
             "task2_results": task2_results,
             "task3_results": task3_results,
             "task4_results": task4_results,
+            "task5_results": task5_results,
         },
         output_dir / f"detailed_results_{args.dataset}.pt",
     )
