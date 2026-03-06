@@ -1,0 +1,24 @@
+# Config for extracting aligned features from real samples
+# Usage: PYTHONPATH=src uv run python scripts/extract_aligned_features_real.py dataset=celeba checkpoint_key=celeba_repa_full_v1
+
+defaults:
+  - dataset: celeba
+  - model: generator_celeba
+  - _self_
+
+# Core parameters
+checkpoint_key: celeba_repa_full_v1  # celeba_repa_full_v1, celeba_repa_marginal_v1, rxrx1_repa_full_v1, rxrx1_repa_marginal_v1
+output_dir: outputs/real_celeba_aligned
+batch_size: 32
+noise_timestep: 0.01  # Minimal noise level
+split: train  # train or val
+num_workers: 4
+device: 0
+
+# Override model to enable REPA
+model:
+  use_repa: true
+  repa_encoder: "dinov3-vit-l"
+  repa_proj_coeff: 1.0
+  repa_encoder_depth: 8
+  repa_projector_dim: 2048
