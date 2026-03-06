@@ -1,32 +1,40 @@
 """
-Backward compatibility shim - import from trust_eval package.
+Trust evaluation package.
 
-This module re-exports all public functions from the new trust_eval package
-to maintain backward compatibility with existing code.
+This package provides modular trust score computation and evaluation
+for conditional generative models.
+
+Public API (backward compatible with trust_eval_extensions.py):
+- condition_to_signature
+- get_image_path
+- create_image_grid
+- compute_trust_results_from_features
+- fit_trust_scoring_components
+- score_trust_from_components
+- compute_real_sample_scores
+- calculate_kid_same_m
+- bootstrap_kid_for_bin
+- build_condition_class_map
+- bin_samples_within_conditioning
+- dedupe_generated
 """
 
-# Image utilities
+# Public API exports - lazy import to avoid import-time side effects
 from faithful_cond_gen.eval.trust_eval.image_utils import (
     condition_to_signature,
     get_image_path,
     create_image_grid,
 )
-
-# KID metrics
 from faithful_cond_gen.eval.trust_eval.metrics_kid import (
     calculate_kid_same_m,
     bootstrap_kid_for_bin,
 )
-
-# Condition utilities
 from faithful_cond_gen.eval.trust_eval.condition_utils import (
     get_condition_key,
     build_condition_class_map,
     bin_samples_within_conditioning,
-    filter_feats_and_meta_by_seen_combos as _filter_feats_and_meta_by_seen_combos,
+    filter_feats_and_meta_by_seen_combos,
 )
-
-# Scoring core
 from faithful_cond_gen.eval.trust_eval.scoring_core import (
     normalize_features,
     compute_mahalanobis,
@@ -68,7 +76,7 @@ __all__ = [
     "get_condition_key",
     "build_condition_class_map",
     "bin_samples_within_conditioning",
-    "_filter_feats_and_meta_by_seen_combos",
+    "filter_feats_and_meta_by_seen_combos",
     # Scoring core
     "normalize_features",
     "compute_mahalanobis",

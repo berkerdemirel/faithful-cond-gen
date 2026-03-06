@@ -331,6 +331,10 @@ def extract_and_save_meanpatch(loader, device, save_path, encoder_name="dinov3-v
         # But our images come from encoder transform which may have normalized them
         # We need raw [0,1] images
 
+        # Convert 6ch -> 3ch RGB for RxRx1 datasets (before encoder)
+        if images.shape[1] == 6:
+            images = to_rgb(images)
+
         # Forward pass: (B, 3, H, W) -> (B, 256, D) patch tokens
         patch_tokens = enc(images)
 
