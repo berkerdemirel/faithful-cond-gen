@@ -76,8 +76,10 @@ def verify_feature_ordering(meta1: Dict, meta2: Dict, name1: str, name2: str) ->
     """
     Verify that two feature caches have matching sample ordering.
 
-    Checks filename metadata if available. Raises ValueError if mismatch detected.
-    Emits warning if metadata not available.
+    Verification hierarchy:
+    1. Filename metadata (strongest - exact sample matching)
+    2. Condition metadata (fallback - verifies attribute values match)
+    3. No metadata (fails - cannot verify)
 
     Args:
         meta1, meta2: Metadata dictionaries from feature caches
@@ -87,11 +89,12 @@ def verify_feature_ordering(meta1: Dict, meta2: Dict, name1: str, name2: str) ->
         True if verified matching, False if could not verify (no metadata)
 
     Raises:
-        ValueError: If filenames exist but don't match
+        ValueError: If filenames/conditions exist but don't match
     """
     names1 = get_filenames_from_meta(meta1) if isinstance(meta1, dict) else None
     names2 = get_filenames_from_meta(meta2) if isinstance(meta2, dict) else None
 
+    # Primary check: filename metadata
     if names1 is not None and names2 is not None:
         if len(names1) != len(names2):
             raise ValueError(
@@ -112,20 +115,55 @@ def verify_feature_ordering(meta1: Dict, meta2: Dict, name1: str, name2: str) ->
                 f"'{first_mismatch[1]}' vs '{first_mismatch[2]}'. "
                 f"Regenerate caches with consistent ordering."
             )
-        logger.info(f"  Verified: {name1} and {name2} have matching sample order")
+        logger.info(f"  Verified (filenames): {name1} and {name2} have matching sample order")
         return True
-    else:
-        missing = []
-        if names1 is None:
-            missing.append(name1)
-        if names2 is None:
-            missing.append(name2)
-        warnings.warn(
-            f"Cannot verify feature ordering: {', '.join(missing)} missing filename metadata. "
-            f"Assuming same ordering. Consider regenerating caches with filenames.",
-            UserWarning,
-        )
-        return False
+
+    # Fallback check: condition metadata (same-model features should have identical conditions)
+    if isinstance(meta1, dict) and isinstance(meta2, dict):
+        # Find common condition keys (exclude 'filenames', 'paths', etc.)
+        exclude_keys = {"filenames", "file_names", "paths", "image_paths", "img_paths"}
+        cond_keys1 = set(meta1.keys()) - exclude_keys
+        cond_keys2 = set(meta2.keys()) - exclude_keys
+        common_keys = cond_keys1 & cond_keys2
+
+        if common_keys:
+            # Verify all common condition values match
+            for key in common_keys:
+                v1, v2 = meta1[key], meta2[key]
+                # Convert to numpy for comparison
+                if hasattr(v1, "numpy"):
+                    v1 = v1.numpy()
+                if hasattr(v2, "numpy"):
+                    v2 = v2.numpy()
+                if hasattr(v1, "__len__") and hasattr(v2, "__len__"):
+                    if len(v1) != len(v2):
+                        raise ValueError(
+                            f"Condition metadata length mismatch for '{key}': "
+                            f"{name1} has {len(v1)}, {name2} has {len(v2)}."
+                        )
+                    if not (v1 == v2).all():
+                        raise ValueError(
+                            f"Condition metadata mismatch for '{key}' between {name1} and {name2}. "
+                            f"Features may have different ordering."
+                        )
+            logger.info(
+                f"  Verified (conditions): {name1} and {name2} have matching condition metadata "
+                f"({len(common_keys)} keys: {', '.join(sorted(common_keys))})"
+            )
+            return True
+
+    # No verification possible
+    missing = []
+    if names1 is None:
+        missing.append(name1)
+    if names2 is None:
+        missing.append(name2)
+    warnings.warn(
+        f"Cannot verify feature ordering: {', '.join(missing)} missing filename metadata "
+        f"and no common condition metadata found.",
+        UserWarning,
+    )
+    return False
 
 
 def verify_consolidated_features(

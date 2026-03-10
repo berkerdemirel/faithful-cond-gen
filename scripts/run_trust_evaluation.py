@@ -281,9 +281,21 @@ Examples:
         # Trust scores are computed in the feature space (aligned or dino)
         # but KID should always be in DINO space for valid quality measurement
         if feature_type != "dinov3" and model in kid_feature_cache:
-            kid_real_feats, kid_real_meta, kid_gen_feats, _ = kid_feature_cache[model]
+            kid_real_feats, kid_real_meta, kid_gen_feats, kid_gen_meta = kid_feature_cache[model]
             kid_feature_type = "dinov3"
             print(f"  Using DINO features for KID ground truth (scoring in {feature_type} space)")
+            # Verify ordering between scoring and KID features (abort if unverifiable)
+            try:
+                verified = verify_feature_ordering(
+                    gen_meta, kid_gen_meta, f"scoring_{feature_type}", "kid_dinov3"
+                )
+                if not verified:
+                    logger.error(f"FATAL: Cannot verify KID feature ordering (missing metadata)")
+                    raise ValueError("KID feature ordering unverifiable - missing filename metadata")
+                print(f"    ✓ Verified: scoring and KID features have matching sample order")
+            except ValueError as e:
+                logger.error(f"FATAL: KID feature ordering mismatch - {e}")
+                raise
         else:
             kid_real_feats, kid_real_meta, kid_gen_feats = real_feats, real_meta, gen_feats
             kid_feature_type = feature_type
@@ -394,8 +406,9 @@ Examples:
                 dataset=args.dataset,
             )
 
-        # Task 5: Downstream bin-selection evaluation
-        if real_feats is not None and gen_feats is not None:
+        # Task 5: Downstream bin-selection evaluation (celeba only)
+        # For rxrx1, use decomposed classification and celltype classification instead
+        if real_feats is not None and gen_feats is not None and args.dataset != "rxrx1":
             print("  Task 5: Downstream bin-selection evaluation...")
 
             # Downstream features always use dinov3 for fair comparison
@@ -405,32 +418,39 @@ Examples:
                 # Load dinov3 features for same generated samples
                 cache_key_downstream = (model, downstream_feature_type)
                 if cache_key_downstream in feature_cache:
-                    _, _, gen_feats_downstream, gen_meta_downstream = feature_cache[
+                    real_feats_downstream, real_meta_downstream, gen_feats_downstream, gen_meta_downstream = feature_cache[
                         cache_key_downstream
                     ]
                 else:
-                    # Try to load dinov3 features
-                    _, _, gen_feats_downstream, gen_meta_downstream = (
+                    # Try to load dinov3 features for both real and gen
+                    real_feats_downstream, real_meta_downstream, gen_feats_downstream, gen_meta_downstream = (
                         load_features_for_dataset(
                             args.dataset, model, downstream_feature_type, normalize_mode
                         )
                     )
             else:
+                # Same feature space for scoring and downstream - no change needed
                 gen_feats_downstream = gen_feats
                 gen_meta_downstream = gen_meta
+                real_feats_downstream = real_feats
+                real_meta_downstream = real_meta
 
             if gen_feats_downstream is not None:
-                # Verify feature ordering between scoring and downstream spaces
+                # Verify feature ordering between scoring and downstream spaces (abort if unverifiable)
                 try:
-                    verify_feature_ordering(
+                    verified = verify_feature_ordering(
                         gen_meta,
                         gen_meta_downstream,
                         f"scoring_{feature_type}",
                         f"downstream_{downstream_feature_type}",
                     )
-                    print(
-                        f"    ✓ Verified: scoring and downstream features have matching sample order"
-                    )
+                    if not verified:
+                        print(f"    ✗ SKIPPING Task 5: Cannot verify feature ordering (missing metadata)")
+                        gen_feats_downstream = None
+                    else:
+                        print(
+                            f"    ✓ Verified: scoring and downstream features have matching sample order"
+                        )
                 except ValueError as e:
                     print(f"    ✗ SKIPPING Task 5: Feature ordering mismatch - {e}")
                     gen_feats_downstream = None
@@ -440,8 +460,8 @@ Examples:
                     evaluate_downstream_bin_selection_from_scores(
                         trust_results=first_result,
                         gen_feats_downstream=gen_feats_downstream,
-                        real_feats_downstream=real_feats,  # Real features (already in dinov3 space)
-                        real_meta=real_meta,
+                        real_feats_downstream=real_feats_downstream,  # Now correctly in DINO space
+                        real_meta=real_meta_downstream,  # Matching metadata
                         condition_keys=condition_keys,
                         model_name=model,
                         scoring_feature_type=feature_type,

@@ -20,14 +20,19 @@ def auto_run_name(cfg: DictConfig) -> str:
     elif rel_w > 0:
         variant = "relational"
     elif use_repa and proj_coeff > 0:
-        variant = "repa"
+        # Include encoder name for distinct REPA variants
+        encoder = cfg.model.get("repa_encoder", "dinov3")
+        encoder_base = encoder.split("-")[0] if "-" in encoder else encoder
+        variant = f"repa_{encoder_base}"
     elif add_w > 0:
         variant = "compositional"
     else:
         variant = "vanilla"
 
-    # Detect setting (full vs marginal)
-    setting = "marginal" if "marginal" in cfg.dataset._target_.lower() else "full"
+    # Detect setting (full vs marginal) - check logger name or held_out_pairs
+    logger_name = cfg.logger.get("name", "")
+    has_held_out = cfg.dataset.get("held_out_pairs") is not None
+    setting = "marginal" if ("marginal" in logger_name or has_held_out) else "full"
 
     return f"{dataset}_{variant}_{setting}"
 
