@@ -21,6 +21,8 @@ dependencies = [
   "accelerate",
   "timm",
   "pytorch_lightning",
+  "fvcore",
+  "torchmetrics",
 
   # diffusion / transformers stack
   "diffusers",

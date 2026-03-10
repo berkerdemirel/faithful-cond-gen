@@ -448,7 +448,15 @@ class SiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
         return imgs
 
-    def forward(self, x, t, attr_ids=None, return_logvar=False, force_drop_ids=None):
+    def forward(
+        self,
+        x,
+        t,
+        attr_ids=None,
+        return_logvar=False,
+        force_drop_ids=None,
+        return_zs=True,
+    ):
         """
         Forward pass of SiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -456,6 +464,7 @@ class SiT(nn.Module):
         attr_ids: (N, K) tensor of attribute labels
         return_logvar: (unused) for compatibility
         force_drop_ids: (N,) tensor of 0/1 to force conditional/unconditional (for CFG)
+        return_zs: whether to return intermediate features for REPA; if False, returns None instead of List[Tensor]
         """
         x = (
             self.x_embedder(x) + self.pos_embed
@@ -495,6 +504,7 @@ class SiT(nn.Module):
                     self.use_repa
                     and self.projectors is not None
                     and (i + 1) == self.encoder_depth
+                    and return_zs
                 ):
                     if self.use_global_alignment:
                         x_pooled = x.mean(dim=1)  # (N, D)
@@ -532,6 +542,7 @@ class SiT(nn.Module):
                     self.use_repa
                     and self.projectors is not None
                     and (i + 1) == self.encoder_depth
+                    and return_zs
                 ):
                     if self.use_global_alignment:
                         x_pooled = x.mean(dim=1)  # (N, D)
