@@ -553,7 +553,9 @@ class GeneratorWrapper(nn.Module):
 
         if not needs_cfg:
             # No guidance needed, just predict conditional
-            v_cond, zs_tilde = self.diffusion_backbone(x, t, cond_ids)
+            v_cond, zs_tilde = self.diffusion_backbone(
+                x, t, cond_ids, return_zs=return_features
+            )
             if v_cond.shape[1] > x.shape[1]:
                 v_cond = v_cond[:, : x.shape[1]]
             if return_features:
@@ -561,13 +563,17 @@ class GeneratorWrapper(nn.Module):
             return v_cond
 
         # Predict conditional velocity
-        v_cond, zs_tilde = self.diffusion_backbone(x, t, cond_ids)
+        v_cond, zs_tilde = self.diffusion_backbone(
+            x, t, cond_ids, return_zs=return_features
+        )
         if v_cond.shape[1] > x.shape[1]:
             v_cond = v_cond[:, : x.shape[1]]
 
         # Predict unconditional velocity (force all conditions to be dropped)
         force_drop = torch.ones(b, device=x.device, dtype=torch.long)
-        v_uncond, _ = self.diffusion_backbone(x, t, cond_ids, force_drop_ids=force_drop)
+        v_uncond, _ = self.diffusion_backbone(
+            x, t, cond_ids, force_drop_ids=force_drop, return_zs=False
+        )
         if v_uncond.shape[1] > x.shape[1]:
             v_uncond = v_uncond[:, : x.shape[1]]
 

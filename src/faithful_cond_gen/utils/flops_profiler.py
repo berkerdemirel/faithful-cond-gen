@@ -963,6 +963,8 @@ def profile_e2e_vanilla_score(
     Returns:
         (total_ms, posthoc_encoder_ms, extra_info)
     """
+    import math
+
     gen = _unwrap_generator(generator).eval().to(device)
     posthoc_encoder = posthoc_encoder.eval().to(device)
 
@@ -982,27 +984,55 @@ def profile_e2e_vanilla_score(
 
     # Profile VAE decode
     decode_ms = 0.0
+    decode_std = 0.0
+    decode_extra = {}
     if include_vae_decode:
 
         def decode_fn():
             with torch.inference_mode():
                 gen.vae.decode(latents)
 
-        decode_ms, _ = profile_time(decode_fn, warmup=warmup, runs=runs, device=device)
+        decode_ms, decode_extra = profile_time(
+            decode_fn, warmup=warmup, runs=runs, device=device
+        )
+        decode_std = decode_extra.get("std_ms", 0.0)
 
     # Profile posthoc encoder
     def encoder_fn():
         with torch.inference_mode():
             posthoc_encoder(images)
 
-    encoder_ms, extra = profile_time(
+    encoder_ms, encoder_extra = profile_time(
         encoder_fn, warmup=warmup, runs=runs, device=device
     )
+    encoder_std = encoder_extra.get("std_ms", 0.0)
 
+    # Compute total and combined CI
+    # For sum of independent measurements: Var(X+Y) = Var(X) + Var(Y)
     total_ms = decode_ms + encoder_ms
-    extra["vae_decode_ms"] = float(decode_ms)
-    extra["posthoc_encoder_ms"] = float(encoder_ms)
-    extra["include_vae_decode"] = include_vae_decode
+    total_std = math.sqrt(decode_std**2 + encoder_std**2)
+
+    # Compute CI for total (same approach as profile_time)
+    if runs >= 30:
+        t_crit = 1.96
+    else:
+        t_crit = 2.0 + 3.0 / runs
+    ci_margin = t_crit * total_std / math.sqrt(runs)
+
+    extra = {
+        "timing_method": encoder_extra.get("timing_method", "cuda_event"),
+        "timing_warmup": encoder_extra.get("timing_warmup", warmup),
+        "timing_runs": encoder_extra.get("timing_runs", runs),
+        "peak_mem_allocated_bytes": encoder_extra.get("peak_mem_allocated_bytes", 0),
+        "vae_decode_ms": float(decode_ms),
+        "vae_decode_std_ms": float(decode_std),
+        "posthoc_encoder_ms": float(encoder_ms),
+        "posthoc_encoder_std_ms": float(encoder_std),
+        "include_vae_decode": include_vae_decode,
+        "std_ms": float(total_std),
+        "ci_lower_ms": float(total_ms - ci_margin),
+        "ci_upper_ms": float(total_ms + ci_margin),
+    }
 
     return total_ms, encoder_ms, extra
 
