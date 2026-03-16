@@ -46,8 +46,6 @@ from faithful_cond_gen.eval.trust_eval.diagnostics import (
 from faithful_cond_gen.eval.trust_eval.eval_layers import (
     create_realism_faithfulness_grids,
     evaluate_alaa_correlation,
-    evaluate_celltype_classification,
-    evaluate_controlled_perturbation_classification,
     evaluate_decile_binning,
     evaluate_downstream_bin_selection_from_scores,
     evaluate_failure_detection,
@@ -57,6 +55,7 @@ from faithful_cond_gen.eval.trust_eval.eval_layers import (
     evaluate_multi_backbone,
     evaluate_ranking_validity,
     evaluate_rxrx1_decomposed_classification,
+    evaluate_rxrx1_downstream_bin_selection,
     evaluate_sample_ood_detection,
     evaluate_seen_vs_unseen_detection,
     get_effective_kid_mode,
@@ -508,6 +507,22 @@ Examples:
                 config_key=config_key,
                 dataset=args.dataset,
             )
+
+            # RxRx1 downstream bin-selection (Task 5 analog, celltype and 100pairs modes)
+            if first_result is not None:
+                for rxrx1_bin_mode in ["celltype", "100pairs"]:
+                    print(f"  RxRx1 downstream bin-selection ({rxrx1_bin_mode})...")
+                    evaluate_rxrx1_downstream_bin_selection(
+                        trust_results=first_result,
+                        gen_feats=gen_feats,
+                        gen_meta=gen_meta,
+                        real_feats=real_feats,
+                        real_meta=real_meta,
+                        output_dir=output_dir,
+                        config_key=config_key,
+                        mode=rxrx1_bin_mode,
+                        dataset=args.dataset,
+                    )
 
     # Create report
     print("\nGenerating report...")

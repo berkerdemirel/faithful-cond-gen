@@ -35,6 +35,7 @@ from faithful_cond_gen.eval.trust_eval.eval_layers.binning import (
 )
 from faithful_cond_gen.eval.trust_eval.eval_layers.downstream import (
     evaluate_downstream_bin_selection_from_scores,
+    evaluate_rxrx1_downstream_bin_selection,
     evaluate_celltype_classification,
     evaluate_controlled_perturbation_classification,
     evaluate_rxrx1_decomposed_classification,
@@ -67,6 +68,7 @@ __all__ = [
     "evaluate_decile_binning",
     # Downstream
     "evaluate_downstream_bin_selection_from_scores",
+    "evaluate_rxrx1_downstream_bin_selection",
     "evaluate_celltype_classification",
     "evaluate_controlled_perturbation_classification",
     "evaluate_rxrx1_decomposed_classification",

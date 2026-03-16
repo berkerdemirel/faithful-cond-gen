@@ -41,6 +41,32 @@ FEATURE_CONFIGS: Dict[Tuple[str, str, str], Tuple[str, str]] = {
         "celeba_repa_marginal",
         "aligned_mean_features.pt",
     ),
+    # Pre-MLP hidden state ablation (raw SiT hidden at encoder_depth, before projector MLP)
+    ("celeba", "repa_full", "pre_mlp"): (
+        "celeba_repa_full_preMLP",
+        "aligned_mean_features.pt",
+    ),
+    ("celeba", "repa_marginal", "pre_mlp"): (
+        "celeba_repa_marginal_preMLP",
+        "aligned_mean_features.pt",
+    ),
+    # CelebA SigLIP teacher (alternative teacher ablation)
+    (("celeba", "repa_siglip_full", "dinov3")): (
+        "celeba_repa_siglip_full",
+        "dinov3_meanpatch_features.pt",
+    ),
+    (("celeba", "repa_siglip_marginal", "dinov3")): (
+        "celeba_repa_siglip_marginal",
+        "dinov3_meanpatch_features.pt",
+    ),
+    (("celeba", "repa_siglip_full", "aligned_mean")): (
+        "celeba_repa_siglip_full",
+        "aligned_mean_features.pt",
+    ),
+    (("celeba", "repa_siglip_marginal", "aligned_mean")): (
+        "celeba_repa_siglip_marginal",
+        "aligned_mean_features.pt",
+    ),
     # RxRx1 DINOv3 meanpatch features
     ("rxrx1", "vanilla_full", "dinov3"): (
         "rxrx1_vanilla_full",
@@ -84,6 +110,12 @@ REAL_FEATURE_PATHS_BY_MODEL: Dict[Tuple[str, str, str], str] = {
     # RxRx1 aligned features
     ("rxrx1", "repa_full", "aligned_mean"): "outputs/real_rxrx1_aligned/rxrx1_repa_full_v1/train_features.pt",
     ("rxrx1", "repa_marginal", "aligned_mean"): "outputs/real_rxrx1_aligned/rxrx1_repa_marginal_v1/train_features.pt",
+    # CelebA SigLIP real aligned features
+    ("celeba", "repa_siglip_full", "aligned_mean"): "outputs/real_celeba_aligned/celeba_repa_siglip_full_v1/train_features.pt",
+    ("celeba", "repa_siglip_marginal", "aligned_mean"): "outputs/real_celeba_aligned/celeba_repa_siglip_marginal_v1/train_features.pt",
+    # CelebA pre-MLP hidden state ablation
+    ("celeba", "repa_full", "pre_mlp"): "outputs/real_celeba_preMLP/celeba_repa_full_v1/train_features.pt",
+    ("celeba", "repa_marginal", "pre_mlp"): "outputs/real_celeba_preMLP/celeba_repa_marginal_v1/train_features.pt",
 }
 
 # NOTE: For consistent KID computation, all features should use the same extraction method:

@@ -99,6 +99,51 @@ checkpoints:
     paper_ready: true
     notes: "REPA RxRx1 pair-heldout (rFID=1.9897, DINOv3 aligned)"
 
+  # ============ REPA Alternative Teacher Models ============
+  celeba_repa_siglip_full_v1:
+    dataset: celeba
+    setting: full_support
+    model: repa
+    regularizers: [repa_siglip]
+    ckpt_path: outputs/faithful-cond-gen/lx9sz4ua/checkpoints/epoch_090-step_115661-rfid_1.1151.ckpt
+    train_config: config_celeba
+    gen_config: generate_samples_celeba
+    paper_ready: true
+    notes: "REPA CelebA full-support (rFID=1.1151, SigLIP aligned)"
+
+  celeba_repa_siglip_marginal_v1:
+    dataset: celeba
+    setting: support_shift
+    model: repa
+    regularizers: [repa_siglip]
+    ckpt_path: outputs/faithful-cond-gen/cmzxdebi/checkpoints/epoch_194-step_175305-rfid_1.2706.ckpt
+    train_config: config_celeba_marginal
+    gen_config: generate_samples_celeba
+    paper_ready: true
+    notes: "REPA CelebA stress-test (rFID=1.2706, SigLIP aligned)"
+
+  rxrx1_repa_openphenom_full_v1:
+    dataset: rxrx1
+    setting: full_support
+    model: repa
+    regularizers: [repa_openphenom]
+    ckpt_path: outputs/faithful-cond-gen/iy4jeuto/checkpoints/epoch_067-step_310692-rfid_1.0844.ckpt
+    train_config: config_rxrx1
+    gen_config: generate_samples_rxrx1
+    paper_ready: true
+    notes: "REPA RxRx1 full-support (rFID=1.0844, OpenPhenom aligned)"
+
+  rxrx1_repa_openphenom_marginal_v1:
+    dataset: rxrx1
+    setting: support_shift
+    model: repa
+    regularizers: [repa_openphenom]
+    ckpt_path: outputs/faithful-cond-gen/g9lehxsn/checkpoints/epoch_050-step_210936-rfid_1.9801.ckpt
+    train_config: config_rxrx1_marginal
+    gen_config: generate_samples_rxrx1
+    paper_ready: true
+    notes: "REPA RxRx1 pair-heldout (rFID=1.9801, OpenPhenom aligned)"
+
   # ============ Regularized Variants (placeholder) ============
   # celeba_relational_marginal_v1:
   #   dataset: celeba

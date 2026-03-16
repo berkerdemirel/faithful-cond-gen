@@ -296,6 +296,256 @@ def evaluate_downstream_bin_selection_from_scores(
     return df
 
 
+def evaluate_rxrx1_downstream_bin_selection(
+    trust_results: Dict,
+    gen_feats: torch.Tensor,
+    gen_meta: Dict,
+    real_feats: torch.Tensor,
+    real_meta: Dict,
+    output_dir: Path,
+    config_key: str,
+    mode: str = "celltype",
+    n_bins: int = 10,
+    n_seeds: int = 5,
+    seed: int = 0,
+    dataset: str = "rxrx1",
+) -> pd.DataFrame:
+    """
+    RxRx1 Task 5 analog: downstream bin-selection evaluation.
+
+    Mirrors evaluate_downstream_bin_selection_from_scores for RxRx1.
+    Two modes:
+    - "celltype": 4 conditions (one per cell type), 4-way classifier, bin within cell type
+    - "100pairs": 100 (cell_type_id, sirna_id) pairs (25 per cell type, include heldout), 100-way classifier
+
+    Args:
+        trust_results: Dict with scores and true_conditions (from compute_trust_results_from_features)
+        gen_feats: Generated features (N, D) — used as training set for classifier
+        gen_meta: Generated metadata with 'cell_type_id', 'sirna_id'
+        real_feats: Real features (M, D) — used as test set
+        real_meta: Real metadata with 'cell_type_id', 'sirna_id'
+        output_dir: Output directory for CSV and plots
+        config_key: Configuration key for output naming
+        mode: "celltype" or "100pairs"
+        n_bins: Number of bins (default 10)
+        n_seeds: Number of seeds for classifier training
+        seed: Base random seed
+        dataset: Dataset name for output prefix
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    trust_scores = trust_results["trust_updated"]
+    realism_scores = trust_results["realism_global_z"]
+    faithfulness_scores = trust_results["faithfulness_margin_z"]
+    true_conditions = trust_results["true_conditions"]  # list of (cell_type_id, sirna_id) tuples
+
+    n_gen = len(trust_scores)
+    assert len(gen_feats) == n_gen
+
+    rng = np.random.default_rng(seed)
+
+    # ---- Select conditions and build index mappings ----
+    if mode == "celltype":
+        # Collapse to cell_type_id only
+        working_conditions = [tuple([cond[0]]) for cond in true_conditions]
+        working_indices = list(range(n_gen))
+
+        # Real: group by cell_type_id
+        real_by_cond: Dict[Tuple, List[int]] = {}
+        for i in range(len(real_feats)):
+            ct = int(real_meta["cell_type_id"][i].item()
+                     if isinstance(real_meta["cell_type_id"][i], torch.Tensor)
+                     else real_meta["cell_type_id"][i])
+            real_by_cond.setdefault((ct,), []).append(i)
+
+    elif mode == "100pairs":
+        # Select 100 (cell_type, sirna) pairs: 25/cell type, include heldout
+        gen_by_cond: Dict[Tuple[int, int], List[int]] = {}
+        for i in range(n_gen):
+            cond = true_conditions[i]  # already (ct, sirna)
+            gen_by_cond.setdefault(cond, []).append(i)
+
+        real_by_cond_full: Dict[Tuple[int, int], List[int]] = {}
+        for i in range(len(real_feats)):
+            ct = int(real_meta["cell_type_id"][i].item()
+                     if isinstance(real_meta["cell_type_id"][i], torch.Tensor)
+                     else real_meta["cell_type_id"][i])
+            sirna = int(real_meta["sirna_id"][i].item()
+                        if isinstance(real_meta["sirna_id"][i], torch.Tensor)
+                        else real_meta["sirna_id"][i])
+            real_by_cond_full.setdefault((ct, sirna), []).append(i)
+
+        cell_types = sorted(set(c[0] for c in gen_by_cond.keys()))
+        n_per_cell = 100 // max(len(cell_types), 1)
+
+        selected: Set[Tuple[int, int]] = set()
+        for ct in cell_types:
+            # Heldout pairs available for this cell type
+            ct_heldout = [(ct, s) for (c, s) in RXRX1_HELDOUT_PAIRS
+                          if c == ct and (ct, s) in gen_by_cond and (ct, s) in real_by_cond_full]
+            selected.update(ct_heldout)
+            # Fill remaining slots with seen pairs by support size
+            ct_seen = [(ct, sirna, len(gen_by_cond[(ct, sirna)]))
+                       for sirna in set(c[1] for c in gen_by_cond if c[0] == ct)
+                       if (ct, sirna) not in selected and (ct, sirna) in real_by_cond_full]
+            ct_seen.sort(key=lambda x: x[2], reverse=True)
+            n_already = sum(1 for c in selected if c[0] == ct)
+            for pair_ct, sirna, _ in ct_seen[:max(0, n_per_cell - n_already)]:
+                selected.add((pair_ct, sirna))
+
+        print(f"    Selected {len(selected)} pairs ({len([c for c in selected if c in RXRX1_HELDOUT_PAIRS])} heldout)")
+
+        # Filter gen samples to selected pairs
+        working_indices = [i for i, cond in enumerate(true_conditions) if cond in selected]
+        working_conditions = [true_conditions[i] for i in working_indices]
+
+        # Real: group by (ct, sirna) for selected pairs only
+        real_by_cond = {cond: real_by_cond_full[cond]
+                        for cond in selected if cond in real_by_cond_full}
+    else:
+        raise ValueError(f"Unknown mode: {mode!r}. Expected 'celltype' or '100pairs'.")
+
+    working_gen_feats = gen_feats[working_indices]
+    n_working = len(working_indices)
+
+    # Build class mapping
+    cond_to_class, class_to_cond = build_condition_class_map(working_conditions)
+    n_classes = len(class_to_cond)
+    print(f"    Mode={mode!r}: {n_classes}-way classification, {n_working} gen samples")
+
+    # Build real test set (30% per condition)
+    test_indices = []
+    for cond in class_to_cond:
+        cond_indices = real_by_cond.get(cond, [])
+        if not cond_indices:
+            continue
+        n_test = max(1, int(len(cond_indices) * 0.3))
+        test_idx = rng.choice(cond_indices, size=n_test, replace=False)
+        test_indices.extend(test_idx)
+
+    test_indices = np.array(test_indices, dtype=int)
+    X_test = real_feats[test_indices].numpy()
+
+    if mode == "celltype":
+        y_test = np.array([
+            cond_to_class[tuple([int(real_meta["cell_type_id"][i].item()
+                                     if isinstance(real_meta["cell_type_id"][i], torch.Tensor)
+                                     else real_meta["cell_type_id"][i])])]
+            for i in test_indices
+        ], dtype=int)
+    else:
+        y_test = np.array([
+            cond_to_class[tuple([
+                int(real_meta["cell_type_id"][i].item()
+                    if isinstance(real_meta["cell_type_id"][i], torch.Tensor)
+                    else real_meta["cell_type_id"][i]),
+                int(real_meta["sirna_id"][i].item()
+                    if isinstance(real_meta["sirna_id"][i], torch.Tensor)
+                    else real_meta["sirna_id"][i]),
+            ])]
+            for i in test_indices
+        ], dtype=int)
+
+    print(f"    Test set: {len(test_indices)} real samples")
+
+    # Score arrays for working subset
+    trust_w = np.asarray(trust_scores)[working_indices]
+    realism_w = np.asarray(realism_scores)[working_indices]
+    faithfulness_w = np.asarray(faithfulness_scores)[working_indices]
+    random_w = rng.random(n_working)
+
+    ranking_modes = {
+        "trust": trust_w,
+        "realism": realism_w,
+        "faithfulness": faithfulness_w,
+        "random": random_w,
+    }
+
+    all_results = []
+    gen_feats_np = working_gen_feats.numpy() if isinstance(working_gen_feats, torch.Tensor) else working_gen_feats
+
+    for mode_name, scores_w in ranking_modes.items():
+        binned = bin_samples_within_conditioning(working_conditions, scores_w, n_bins, ascending=True)
+        total_binned = sum(sum(len(b) for b in bins) for bins in binned.values())
+        assert total_binned == n_working, f"Binning lost samples: {total_binned} vs {n_working}"
+
+        for bin_idx in range(n_bins):
+            bin_indices = []
+            bin_labels = []
+            for cond in class_to_cond:
+                if cond in binned and bin_idx < len(binned[cond]):
+                    idxs = binned[cond][bin_idx]
+                    bin_indices.extend(idxs)
+                    bin_labels.extend([cond_to_class[cond]] * len(idxs))
+
+            if not bin_indices:
+                continue
+
+            X_train = gen_feats_np[bin_indices]
+            y_train = np.array(bin_labels, dtype=int)
+
+            for s in range(n_seeds):
+                clf_seed = seed + s * 1000 + bin_idx * 100
+                try:
+                    clf = LogisticRegression(solver="lbfgs", max_iter=2000, random_state=clf_seed)
+                    clf.fit(X_train, y_train)
+                    accuracy = clf.score(X_test, y_test)
+                except Exception as e:
+                    print(f"    WARNING: Classifier failed for {mode_name} bin {bin_idx} seed {s}: {e}")
+                    accuracy = np.nan
+
+                all_results.append({
+                    "config_key": config_key,
+                    "mode": mode,
+                    "ranking_mode": mode_name,
+                    "bin_idx": bin_idx,
+                    "seed": s,
+                    "n_train": len(bin_indices),
+                    "n_test": len(test_indices),
+                    "accuracy": accuracy,
+                    "n_conditions": n_classes,
+                })
+
+    df = pd.DataFrame(all_results)
+
+    # Save CSV
+    dataset_prefix = f"{dataset}_" if dataset else ""
+    csv_path = output_dir / f"{dataset_prefix}downstream_bin_{mode}_{config_key.replace('/', '_')}.csv"
+    df.to_csv(csv_path, index=False)
+
+    summary = (
+        df.groupby(["ranking_mode", "bin_idx"])
+        .agg(accuracy=("accuracy", "mean"), accuracy_std=("accuracy", "std"), n_train=("n_train", "first"))
+        .reset_index()
+    )
+    summary_path = output_dir / f"{dataset_prefix}downstream_bin_{mode}_{config_key.replace('/', '_')}_summary.csv"
+    summary.to_csv(summary_path, index=False)
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    colors = {"trust": "C0", "realism": "C1", "faithfulness": "C2", "random": "gray"}
+    linestyles = {"trust": "-", "realism": "--", "faithfulness": ":", "random": "-."}
+    for mode_name in ["trust", "realism", "faithfulness", "random"]:
+        row = summary[summary["ranking_mode"] == mode_name]
+        if len(row) == 0:
+            continue
+        ax.errorbar(row["bin_idx"], row["accuracy"], yerr=row["accuracy_std"],
+                    label=mode_name.capitalize(), marker="o", capsize=4, alpha=0.8,
+                    color=colors.get(mode_name, "C0"), linestyle=linestyles.get(mode_name, "-"))
+    ax.set_xlabel("Bin Index (0=best scores, 9=worst scores)")
+    ax.set_ylabel(f"{n_classes}-way Classification Accuracy")
+    ax.set_title(f"RxRx1 Downstream Bin-Selection ({mode})\n{config_key}")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    ax.set_xticks(range(n_bins))
+    plot_path = output_dir / f"{dataset_prefix}downstream_bin_{mode}_{config_key.replace('/', '_')}.png"
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"    Saved: {csv_path.name}, {summary_path.name}, {plot_path.name}")
+    return df
+
+
 def evaluate_celltype_classification(
     gen_feats: torch.Tensor,
     gen_meta: Dict,
