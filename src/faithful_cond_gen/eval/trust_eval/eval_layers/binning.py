@@ -299,36 +299,4 @@ def evaluate_decile_binning(
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    # Plot z-KID if available
-    if has_kid_z:
-        fig, ax = plt.subplots(figsize=(10, 6))
-
-        for mode_name in ["trust", "realism", "faithfulness"]:
-            mode_df = df[df["ranking_mode"] == mode_name]
-            mode_df = mode_df[mode_df["kid_z"].notna()]
-            if len(mode_df) == 0:
-                continue
-
-            x = mode_df["bin_idx"]
-            y = mode_df["kid_z"]
-
-            ax.plot(
-                x,
-                y,
-                label=mode_name.capitalize(),
-                marker="o",
-                alpha=0.8,
-            )
-
-        ax.set_xlabel("Bin Index (0=best, 9=worst)")
-        ax.set_ylabel("z-KID (z-normalized, higher = worse)")
-        ax.set_title(f"Decile Binning: z-KID vs Ranking Mode - {config_key}")
-        ax.axhline(y=0, color="gray", linestyle="--", alpha=0.5, label="Real baseline (z=0)")
-        ax.legend()
-        ax.grid(alpha=0.3)
-
-        plot_path_z = output_dir / f"{dataset_prefix}decile_binning_zkid_{config_key.replace('/', '_')}.png"
-        fig.savefig(plot_path_z, dpi=150, bbox_inches="tight")
-        plt.close(fig)
-
     return df
