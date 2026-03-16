@@ -32,5 +32,9 @@ cfg_scale: 1.0
 # - true: Automatic per-condition scaling (rare conditions get higher CFG)
 adaptive_cfg: false
 
+# Feature extraction options (for generate_samples_repa.py)
+feature_capture_idx: null  # null=final step; int=specific step; list=multiple steps; "all"=every step
+use_raw_hidden: false  # If true, capture pre-MLP diffusion hidden state instead of projected features
+
 # DDP
 num_gpus: 8

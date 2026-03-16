@@ -70,6 +70,7 @@ def extract_aligned_features_from_model(
     timestep: float = 0.01,
     device: torch.device = None,
     condition_keys: List[str] = None,
+    return_raw_hidden: bool = False,
 ) -> Dict:
     """
     Extract aligned features from REPA model for real samples.
@@ -146,9 +147,11 @@ def extract_aligned_features_from_model(
                 else:
                     cond_ids = torch.zeros((B, 1), device=device, dtype=torch.long)
 
-                # Forward pass through diffusion backbone to get projected features
+                # Forward pass through diffusion backbone to get projected features (or raw hidden)
                 _, zs_tilde = model.generator.velocity_prediction(
-                    noisy_latents, t_tensor, cond_ids, return_projected=True
+                    noisy_latents, t_tensor, cond_ids,
+                    return_projected=True,
+                    return_raw_hidden=return_raw_hidden,
                 )
 
                 # zs_tilde is a list of projected features from each projector
@@ -182,10 +185,11 @@ def extract_aligned_features_from_model(
         if v:
             metadata[k] = torch.tensor(v, dtype=torch.long)
 
+    encoder_name = "sit_raw_hidden_real" if return_raw_hidden else "dinov3-vit-l_meanpatch_aligned_real"
     return {
         "features": features,
         "metadata": metadata,
-        "encoder_name": "dinov3-vit-l_meanpatch_aligned_real",
+        "encoder_name": encoder_name,
         "timestep": timestep,
         "n_samples": features.shape[0],
         "feature_dim": features.shape[1],
@@ -256,12 +260,14 @@ def main(cfg: DictConfig):
     device = torch.device(f"cuda:{cfg.get('device', 0)}" if torch.cuda.is_available() else "cpu")
     log.info(f"Using device: {device}")
 
+    return_raw_hidden = cfg.get("return_raw_hidden", False)
     result = extract_aligned_features_from_model(
         model=model,
         dataloader=dataloader,
         timestep=timestep,
         device=device,
         condition_keys=condition_keys,
+        return_raw_hidden=return_raw_hidden,
     )
 
     # Save

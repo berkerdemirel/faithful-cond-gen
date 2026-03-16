@@ -456,6 +456,7 @@ class SiT(nn.Module):
         return_logvar=False,
         force_drop_ids=None,
         return_zs=True,
+        return_raw_hidden: bool = False,
     ):
         """
         Forward pass of SiT.
@@ -465,6 +466,8 @@ class SiT(nn.Module):
         return_logvar: (unused) for compatibility
         force_drop_ids: (N,) tensor of 0/1 to force conditional/unconditional (for CFG)
         return_zs: whether to return intermediate features for REPA; if False, returns None instead of List[Tensor]
+        return_raw_hidden: if True, return the raw hidden state at encoder_depth (before projector MLP)
+                           as zs=[x_raw]; works for both REPA and vanilla models
         """
         x = (
             self.x_embedder(x) + self.pos_embed
@@ -499,21 +502,19 @@ class SiT(nn.Module):
                 x = block(
                     x, c=None, t_emb=t_embed, attr_embs_list=attr_embs_list
                 )  # (N, T, D)
-                # Extract features at encoder_depth for REPA
-                if (
-                    self.use_repa
-                    and self.projectors is not None
-                    and (i + 1) == self.encoder_depth
-                    and return_zs
-                ):
-                    if self.use_global_alignment:
-                        x_pooled = x.mean(dim=1)  # (N, D)
-                        zs = [projector(x_pooled) for projector in self.projectors]
-                    else:
-                        zs = [
-                            projector(x.reshape(-1, D)).reshape(N, T, -1)
-                            for projector in self.projectors
-                        ]
+                # Extract features at encoder_depth for REPA (or raw hidden ablation)
+                if (i + 1) == self.encoder_depth and (return_zs or return_raw_hidden):
+                    if return_raw_hidden:
+                        zs = [x.clone()]
+                    elif self.use_repa and self.projectors is not None:
+                        if self.use_global_alignment:
+                            x_pooled = x.mean(dim=1)  # (N, D)
+                            zs = [projector(x_pooled) for projector in self.projectors]
+                        else:
+                            zs = [
+                                projector(x.reshape(-1, D)).reshape(N, T, -1)
+                                for projector in self.projectors
+                            ]
         else:
             # Shared modulation mode (original): combine into single conditioning vector
             c = t_embed
@@ -537,21 +538,19 @@ class SiT(nn.Module):
             zs = None
             for i, block in enumerate(self.blocks):
                 x = block(x, c)  # (N, T, D)
-                # Extract features at encoder_depth for REPA
-                if (
-                    self.use_repa
-                    and self.projectors is not None
-                    and (i + 1) == self.encoder_depth
-                    and return_zs
-                ):
-                    if self.use_global_alignment:
-                        x_pooled = x.mean(dim=1)  # (N, D)
-                        zs = [projector(x_pooled) for projector in self.projectors]
-                    else:
-                        zs = [
-                            projector(x.reshape(-1, D)).reshape(N, T, -1)
-                            for projector in self.projectors
-                        ]
+                # Extract features at encoder_depth for REPA (or raw hidden ablation)
+                if (i + 1) == self.encoder_depth and (return_zs or return_raw_hidden):
+                    if return_raw_hidden:
+                        zs = [x.clone()]
+                    elif self.use_repa and self.projectors is not None:
+                        if self.use_global_alignment:
+                            x_pooled = x.mean(dim=1)  # (N, D)
+                            zs = [projector(x_pooled) for projector in self.projectors]
+                        else:
+                            zs = [
+                                projector(x.reshape(-1, D)).reshape(N, T, -1)
+                                for projector in self.projectors
+                            ]
 
         # Final layer call - use appropriate mode
         if self.use_per_attr_modulation:

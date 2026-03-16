@@ -11,6 +11,7 @@ checkpoint_key: celeba_repa_full_v1  # celeba_repa_full_v1, celeba_repa_marginal
 output_dir: outputs/real_celeba_aligned
 batch_size: 32
 noise_timestep: 0.01  # Minimal noise level
+return_raw_hidden: false  # If true, capture pre-MLP diffusion hidden state instead of projected features
 split: train  # train or val
 num_workers: 4
 device: 0

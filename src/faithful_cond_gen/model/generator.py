@@ -316,6 +316,7 @@ class GeneratorWrapper(nn.Module):
         cond_ids: torch.Tensor,  # (B,K) long OR (B,) long
         force_drop_ids: torch.Tensor = None,  # (B,) 0/1 for CFG
         return_projected: bool = False,  # Return projected features for REPA
+        return_raw_hidden: bool = False,  # Return raw hidden state at encoder_depth (pre-MLP)
     ) -> torch.Tensor:
         """Predict latent velocity v(x_t, t, cond). No noising, no loss, no VAE.
 
@@ -338,6 +339,7 @@ class GeneratorWrapper(nn.Module):
             t,
             attr_ids=cond_ids.to(device=x_t.device, dtype=torch.long),
             force_drop_ids=force_drop_ids,
+            return_raw_hidden=return_raw_hidden,
         )
 
         # If your SiT ever returns extra channels, keep the first C
@@ -526,6 +528,7 @@ class GeneratorWrapper(nn.Module):
         cond_ids: torch.Tensor,
         cfg_scale: torch.Tensor,
         return_features: bool = False,
+        return_raw_hidden: bool = False,
     ):
         """Apply classifier-free guidance to velocity prediction.
 
@@ -551,20 +554,21 @@ class GeneratorWrapper(nn.Module):
         # Check if we need CFG
         needs_cfg = (cfg_scale != 1.0).any()
 
+        capture = return_features or return_raw_hidden
         if not needs_cfg:
             # No guidance needed, just predict conditional
             v_cond, zs_tilde = self.diffusion_backbone(
-                x, t, cond_ids, return_zs=return_features
+                x, t, cond_ids, return_zs=capture, return_raw_hidden=return_raw_hidden
             )
             if v_cond.shape[1] > x.shape[1]:
                 v_cond = v_cond[:, : x.shape[1]]
-            if return_features:
+            if capture:
                 return v_cond, zs_tilde
             return v_cond
 
         # Predict conditional velocity
         v_cond, zs_tilde = self.diffusion_backbone(
-            x, t, cond_ids, return_zs=return_features
+            x, t, cond_ids, return_zs=capture, return_raw_hidden=return_raw_hidden
         )
         if v_cond.shape[1] > x.shape[1]:
             v_cond = v_cond[:, : x.shape[1]]
@@ -582,7 +586,7 @@ class GeneratorWrapper(nn.Module):
         cfg_scale_expanded = cfg_scale.view(b, 1, 1, 1)  # (B, 1, 1, 1) for broadcasting
         v_guided = v_uncond + cfg_scale_expanded * (v_cond - v_uncond)
 
-        if return_features:
+        if capture:
             return v_guided, zs_tilde
         return v_guided
 
@@ -680,6 +684,7 @@ class GeneratorWrapper(nn.Module):
         return_aligned_features: bool = False,
         feature_capture_idx: Optional[Union[int, List[int], str]] = None,
         capture_at_t0: bool = False,
+        return_raw_hidden: bool = False,
     ):
         """REPA-style two-stage sampling (default sampler).
 
@@ -815,7 +820,7 @@ class GeneratorWrapper(nn.Module):
 
             if should_capture:
                 v, zs_tilde = self.apply_cfg(
-                    x, t_in, cond_ids, cfg_scale_tensor, return_features=True
+                    x, t_in, cond_ids, cfg_scale_tensor, return_features=True, return_raw_hidden=return_raw_hidden
                 )
 
                 # Validate REPA features are available
@@ -867,7 +872,7 @@ class GeneratorWrapper(nn.Module):
 
         if should_capture_final:
             v_final, zs_tilde = self.apply_cfg(
-                x, t_final, cond_ids, cfg_scale_tensor, return_features=True
+                x, t_final, cond_ids, cfg_scale_tensor, return_features=True, return_raw_hidden=return_raw_hidden
             )
 
             # Validate REPA features are available
@@ -901,7 +906,7 @@ class GeneratorWrapper(nn.Module):
         if return_aligned_features and capture_at_t0 and capture_mode == "all":
             t_zero = torch.zeros(b, device=device, dtype=model_dtype)
             _, zs_tilde_t0 = self.apply_cfg(
-                x, t_zero, cond_ids, cfg_scale_tensor, return_features=True
+                x, t_zero, cond_ids, cfg_scale_tensor, return_features=True, return_raw_hidden=return_raw_hidden
             )
             if zs_tilde_t0 is not None and len(zs_tilde_t0) > 0:
                 pooled_t0 = zs_tilde_t0[0].mean(dim=1).cpu()

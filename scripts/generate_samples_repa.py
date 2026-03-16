@@ -332,6 +332,7 @@ def main(cfg: DictConfig):
     samples_per_cond = cfg.samples_per_condition
     batch_size = cfg.batch_size
     feature_capture_idx = cfg.get("feature_capture_idx", None)  # None = final step (index num_inference_steps-1)
+    use_raw_hidden = cfg.get("use_raw_hidden", False)  # If True, capture pre-MLP diffusion hidden state
 
     # Resume support: check for existing aligned features
     resume = cfg.get("resume", False)
@@ -370,6 +371,7 @@ def main(cfg: DictConfig):
                     adaptive_cfg=cfg.get("adaptive_cfg", False),
                     return_aligned_features=True,
                     feature_capture_idx=feature_capture_idx,
+                    return_raw_hidden=use_raw_hidden,
                 )
                 images = torch.clamp(images, 0, 1)
 
