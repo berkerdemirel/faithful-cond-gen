@@ -50,6 +50,40 @@ FEATURE_CONFIGS: Dict[Tuple[str, str, str], Tuple[str, str]] = {
         "celeba_repa_marginal_preMLP",
         "aligned_mean_features.pt",
     ),
+    # CelebA REPA timestep ablation (aligned features at different denoising steps)
+    # Uses separate model keys (_ts) so DINOv3 KID features come from same generated images
+    ("celeba", "repa_full_ts", "dinov3"): (
+        "celeba_repa_full_timesteps",
+        "dinov3_meanpatch_features.pt",
+    ),
+    ("celeba", "repa_full_ts", "aligned_step0"): (
+        "celeba_repa_full_timesteps",
+        "aligned_mean_features_step0.pt",
+    ),
+    ("celeba", "repa_full_ts", "aligned_step83"): (
+        "celeba_repa_full_timesteps",
+        "aligned_mean_features_step83.pt",
+    ),
+    ("celeba", "repa_full_ts", "aligned_step166"): (
+        "celeba_repa_full_timesteps",
+        "aligned_mean_features_step166.pt",
+    ),
+    ("celeba", "repa_marginal_ts", "dinov3"): (
+        "celeba_repa_marginal_timesteps",
+        "dinov3_meanpatch_features.pt",
+    ),
+    ("celeba", "repa_marginal_ts", "aligned_step0"): (
+        "celeba_repa_marginal_timesteps",
+        "aligned_mean_features_step0.pt",
+    ),
+    ("celeba", "repa_marginal_ts", "aligned_step83"): (
+        "celeba_repa_marginal_timesteps",
+        "aligned_mean_features_step83.pt",
+    ),
+    ("celeba", "repa_marginal_ts", "aligned_step166"): (
+        "celeba_repa_marginal_timesteps",
+        "aligned_mean_features_step166.pt",
+    ),
     # CelebA SigLIP teacher (alternative teacher ablation)
     (("celeba", "repa_siglip_full", "dinov3")): (
         "celeba_repa_siglip_full",
@@ -93,6 +127,40 @@ FEATURE_CONFIGS: Dict[Tuple[str, str, str], Tuple[str, str]] = {
         "rxrx1_repa_marginal",
         "aligned_mean_features.pt",
     ),
+    # RxRx1 OpenPhenom teacher (alternative teacher ablation)
+    ("rxrx1", "repa_openphenom_full", "dinov3"): (
+        "rxrx1_repa_openphenom_full",
+        "dinov3_meanpatch_features.pt",
+    ),
+    ("rxrx1", "repa_openphenom_marginal", "dinov3"): (
+        "rxrx1_repa_openphenom_marginal",
+        "dinov3_meanpatch_features.pt",
+    ),
+    ("rxrx1", "repa_openphenom_full", "aligned_mean"): (
+        "rxrx1_repa_openphenom_full",
+        "aligned_mean_features.pt",
+    ),
+    ("rxrx1", "repa_openphenom_marginal", "aligned_mean"): (
+        "rxrx1_repa_openphenom_marginal",
+        "aligned_mean_features.pt",
+    ),
+    # RxRx1 SigLIP teacher (alternative teacher ablation)
+    ("rxrx1", "repa_siglip_full", "dinov3"): (
+        "rxrx1_repa_siglip_full",
+        "dinov3_meanpatch_features.pt",
+    ),
+    ("rxrx1", "repa_siglip_marginal", "dinov3"): (
+        "rxrx1_repa_siglip_marginal",
+        "dinov3_meanpatch_features.pt",
+    ),
+    ("rxrx1", "repa_siglip_full", "aligned_mean"): (
+        "rxrx1_repa_siglip_full",
+        "aligned_mean_features.pt",
+    ),
+    ("rxrx1", "repa_siglip_marginal", "aligned_mean"): (
+        "rxrx1_repa_siglip_marginal",
+        "aligned_mean_features.pt",
+    ),
 }
 
 # Real feature paths - use meanpatch for dinov3 comparisons
@@ -116,6 +184,19 @@ REAL_FEATURE_PATHS_BY_MODEL: Dict[Tuple[str, str, str], str] = {
     # CelebA pre-MLP hidden state ablation
     ("celeba", "repa_full", "pre_mlp"): "outputs/real_celeba_preMLP/celeba_repa_full_v1/train_features.pt",
     ("celeba", "repa_marginal", "pre_mlp"): "outputs/real_celeba_preMLP/celeba_repa_marginal_v1/train_features.pt",
+    # RxRx1 OpenPhenom real aligned features
+    ("rxrx1", "repa_openphenom_full", "aligned_mean"): "outputs/real_rxrx1_aligned/rxrx1_repa_openphenom_full_v1/train_features.pt",
+    ("rxrx1", "repa_openphenom_marginal", "aligned_mean"): "outputs/real_rxrx1_aligned/rxrx1_repa_openphenom_marginal_v1/train_features.pt",
+    # RxRx1 SigLIP real aligned features
+    ("rxrx1", "repa_siglip_full", "aligned_mean"): "outputs/real_rxrx1_aligned/rxrx1_repa_siglip_full_v1/train_features.pt",
+    ("rxrx1", "repa_siglip_marginal", "aligned_mean"): "outputs/real_rxrx1_aligned/rxrx1_repa_siglip_marginal_v1/train_features.pt",
+    # CelebA timestep ablation — reuse same real features (same projector, different capture step)
+    ("celeba", "repa_full_ts", "aligned_step0"): "outputs/real_celeba_aligned/celeba_repa_full_v1/train_features.pt",
+    ("celeba", "repa_full_ts", "aligned_step83"): "outputs/real_celeba_aligned/celeba_repa_full_v1/train_features.pt",
+    ("celeba", "repa_full_ts", "aligned_step166"): "outputs/real_celeba_aligned/celeba_repa_full_v1/train_features.pt",
+    ("celeba", "repa_marginal_ts", "aligned_step0"): "outputs/real_celeba_aligned/celeba_repa_marginal_v1/train_features.pt",
+    ("celeba", "repa_marginal_ts", "aligned_step83"): "outputs/real_celeba_aligned/celeba_repa_marginal_v1/train_features.pt",
+    ("celeba", "repa_marginal_ts", "aligned_step166"): "outputs/real_celeba_aligned/celeba_repa_marginal_v1/train_features.pt",
 }
 
 # NOTE: For consistent KID computation, all features should use the same extraction method:

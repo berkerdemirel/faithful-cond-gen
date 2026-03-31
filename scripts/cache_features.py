@@ -230,7 +230,15 @@ class GeneratedDatasetRaw(Dataset):
             img_pil = Image.open(fpath).convert("RGB")
             img = self.transform(img_pil)
 
-        cond = self._parse_celeba_filename(fpath) if "celeba" in self.dataset_type else {}
+        if "celeba" in self.dataset_type:
+            cond = self._parse_celeba_filename(fpath)
+        elif "rxrx1" in self.dataset_type:
+            basename = os.path.basename(fpath)
+            m = re.match(r"cell(\d+)_sirna(\d+)_", basename)
+            cond = {"cell_type_id": torch.tensor(int(m.group(1)), dtype=torch.long),
+                    "sirna_id": torch.tensor(int(m.group(2)), dtype=torch.long)} if m else {}
+        else:
+            cond = {}
         return img, {"cond": cond}
 
 

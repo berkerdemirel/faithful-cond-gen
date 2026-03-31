@@ -41,7 +41,7 @@ def get_effective_kid_mode(normalize_mode: str, feature_type: str) -> str:
         return "cosine"
     else:
         # Use feature-type-based logic
-        if feature_type == "aligned_mean":
+        if feature_type == "aligned_mean" or feature_type.startswith("aligned_"):
             return "cosine"  # Norms weren't optimized, normalize internally
         else:
             return "standard"  # Use raw features with dimension scaling

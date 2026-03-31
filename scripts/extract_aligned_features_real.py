@@ -236,6 +236,10 @@ def main(cfg: DictConfig):
         strict=False,
         map_location="cpu",
     )
+    # Apply EMA weights to match generation (generate_samples_repa.py applies EMA)
+    if hasattr(model, "ema"):
+        log.info("Applying EMA weights (matching generation pipeline)")
+        model.ema.apply()
     model.eval()
 
     # Setup data module

@@ -144,6 +144,28 @@ checkpoints:
     paper_ready: true
     notes: "REPA RxRx1 pair-heldout (rFID=1.9801, OpenPhenom aligned)"
 
+  rxrx1_repa_siglip_full_v1:
+    dataset: rxrx1
+    setting: full_support
+    model: repa
+    regularizers: [repa_siglip]
+    ckpt_path: outputs/faithful-cond-gen/9evs50m1/checkpoints/epoch_039-step_182760-rfid_1.0732.ckpt
+    train_config: config_rxrx1
+    gen_config: generate_samples_rxrx1
+    paper_ready: true
+    notes: "REPA RxRx1 full-support (rFID=1.0732, SigLIP aligned)"
+
+  rxrx1_repa_siglip_marginal_v1:
+    dataset: rxrx1
+    setting: support_shift
+    model: repa
+    regularizers: [repa_siglip]
+    ckpt_path: outputs/faithful-cond-gen/dsb5pdm0/checkpoints/epoch_050-step_210936-rfid_1.9875.ckpt
+    train_config: config_rxrx1_marginal
+    gen_config: generate_samples_rxrx1
+    paper_ready: true
+    notes: "REPA RxRx1 pair-heldout (rFID=1.9875, SigLIP aligned)"
+
   # ============ Regularized Variants (placeholder) ============
   # celeba_relational_marginal_v1:
   #   dataset: celeba

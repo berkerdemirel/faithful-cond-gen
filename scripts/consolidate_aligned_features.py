@@ -160,17 +160,13 @@ def load_shard_with_indices(
             # Fall back to sequential
             local_indices = list(range(features.shape[0]))
 
-        # Try to get condition from shard metadata
-        condition = data.get("condition", None)
     else:
         # Legacy format: raw tensor
         features = data
         local_indices = list(range(features.shape[0]))
-        condition = None
 
-    # If no condition in shard, parse from signature
-    if condition is None:
-        condition = parse_condition_from_signature(signature)
+    # Always parse condition from signature (stored condition dict may use wrong keys)
+    condition = parse_condition_from_signature(signature)
 
     return features, local_indices, condition
 

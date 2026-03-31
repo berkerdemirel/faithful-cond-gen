@@ -477,18 +477,20 @@ Examples:
         # FPR@95 selection evaluation
         if real_feats is not None and gen_feats is not None:
             print("  FPR@95 selection evaluation...")
-            # Use DINO features for KID computation (ground truth metric)
+            # Scoring-space features for threshold, DINO features for KID
             fpr95_results[config_key] = evaluate_fpr95_selection(
                 trust_results=first_result,
-                real_feats=kid_real_feats,
-                real_meta=kid_real_meta,
-                gen_feats=kid_gen_feats,
+                real_feats=real_feats,
+                real_meta=real_meta,
+                gen_feats=gen_feats,
                 gen_meta=gen_meta,
                 condition_keys=condition_keys,
                 dataset=args.dataset,
                 model=model,
                 output_dir=output_dir,
                 config_key=config_key,
+                kid_real_feats=kid_real_feats,
+                kid_gen_feats=kid_gen_feats,
                 kid_mode=kid_effective_mode,
                 feature_type=kid_feature_type,
                 scoring_method=scoring_method,

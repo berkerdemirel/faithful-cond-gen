@@ -35,6 +35,12 @@ log = logging.getLogger(__name__)
 
 def parse_condition_from_signature(signature: str) -> Dict[str, int]:
     """Parse condition values from signature string."""
+    import re
+    # RxRx1 format: cell{X}_sirna{Y}
+    m = re.match(r"^cell(\d+)_sirna(\d+)$", signature)
+    if m:
+        return {"cell_type_id": int(m.group(1)), "sirna_id": int(m.group(2))}
+    # CelebA format: binary attributes ending in 0 or 1
     parts = signature.split("_")
     cond_dict = {}
     buffer = []
@@ -61,6 +67,7 @@ def consolidate_aligned_features(
     out_dir: str,
     pooling: str = "mean",
     condition_keys: List[str] = None,
+    aligned_dir_override: str = None,
 ) -> Dict:
     """
     Consolidate aligned feature shards into a single file using index-based joining.
@@ -77,7 +84,7 @@ def consolidate_aligned_features(
         Dict with features, metadata, indices
     """
     images_dir = Path(out_dir) / "images"
-    aligned_dir = Path(out_dir) / "aligned_features"
+    aligned_dir = Path(out_dir) / (aligned_dir_override or "aligned_features")
 
     # Step 1: Build global index mapping from images
     log.info("Consolidating: Building global index mapping...")
@@ -332,7 +339,10 @@ def main(cfg: DictConfig):
     samples_per_cond = cfg.samples_per_condition
     batch_size = cfg.batch_size
     feature_capture_idx = cfg.get("feature_capture_idx", None)  # None = final step (index num_inference_steps-1)
+    if feature_capture_idx is not None and not isinstance(feature_capture_idx, (int, str)):
+        feature_capture_idx = [int(x) for x in feature_capture_idx]  # OmegaConf ListConfig -> Python list of ints
     use_raw_hidden = cfg.get("use_raw_hidden", False)  # If True, capture pre-MLP diffusion hidden state
+    is_multi_capture = isinstance(feature_capture_idx, list)
 
     # Resume support: check for existing aligned features
     resume = cfg.get("resume", False)
@@ -352,7 +362,7 @@ def main(cfg: DictConfig):
 
         generated_count = 0
         batch_idx = 0
-        all_features_for_cond = []
+        all_features_for_cond = {k: [] for k in feature_capture_idx} if is_multi_capture else []
 
         while generated_count < samples_per_cond:
             current_bs = min(batch_size, samples_per_cond - generated_count)
@@ -377,10 +387,14 @@ def main(cfg: DictConfig):
 
             # Collect aligned features (if available)
             if aligned_features is not None and len(aligned_features) > 0:
-                # aligned_features is List[Tensor], take first projector
-                # Shape: (B, num_patches, embed_dim)
-                feats = aligned_features[0].cpu()
-                all_features_for_cond.append(feats)
+                if is_multi_capture:
+                    # aligned_features is List[(k_idx, t_val, Tensor(B, D))] — already pooled
+                    for k_idx, t_val, feats in aligned_features:
+                        all_features_for_cond[k_idx].append(feats.cpu())
+                else:
+                    # Single capture: List[Tensor(B, num_patches, D)], take first projector
+                    feats = aligned_features[0].cpu()
+                    all_features_for_cond.append(feats)
 
             # Save images
             if data_type == "celeba":
@@ -404,20 +418,31 @@ def main(cfg: DictConfig):
 
         # Save aligned features for this condition with metadata
         if all_features_for_cond:
-            cond_features = torch.cat(all_features_for_cond, dim=0)
+            cond_dict = parse_condition_from_signature(signature)
             feat_fname = f"{signature}_aligned_feats.pt"
 
-            # Parse condition from signature for metadata
-            cond_dict = parse_condition_from_signature(signature)
-
-            # Save with metadata for robust consolidation
-            shard_data = {
-                "aligned_features": cond_features,
-                "indices": list(range(cond_features.shape[0])),  # Local indices within condition
-                "condition": cond_dict,
-                "signature": signature,
-            }
-            torch.save(shard_data, os.path.join(feat_dir, feat_fname))
+            if is_multi_capture:
+                # Save a separate shard per captured step
+                for k_idx, feat_list in all_features_for_cond.items():
+                    step_feat_dir = os.path.join(out_dir, f"aligned_features_step{k_idx}")
+                    os.makedirs(step_feat_dir, exist_ok=True)
+                    step_feats = torch.cat(feat_list, dim=0)  # already pooled (N, D)
+                    shard_data = {
+                        "aligned_features": step_feats,
+                        "indices": list(range(step_feats.shape[0])),
+                        "condition": cond_dict,
+                        "signature": signature,
+                    }
+                    torch.save(shard_data, os.path.join(step_feat_dir, feat_fname))
+            else:
+                cond_features = torch.cat(all_features_for_cond, dim=0)
+                shard_data = {
+                    "aligned_features": cond_features,
+                    "indices": list(range(cond_features.shape[0])),
+                    "condition": cond_dict,
+                    "signature": signature,
+                }
+                torch.save(shard_data, os.path.join(feat_dir, feat_fname))
 
     if resume and skipped > 0:
         log.info(f"[Rank {rank}] Skipped {skipped} conditions (already completed).")
@@ -429,13 +454,26 @@ def main(cfg: DictConfig):
 
     if rank == 0:
         log.info("Consolidating aligned features...")
-        try:
-            result = consolidate_aligned_features(out_dir, pooling="mean")
-            output_path = os.path.join(out_dir, "aligned_mean_features.pt")
-            torch.save(result, output_path)
-            log.info(f"Saved consolidated features to {output_path}")
-        except Exception as e:
-            log.error(f"Consolidation failed: {e}")
+        if is_multi_capture:
+            for k_idx in feature_capture_idx:
+                try:
+                    result = consolidate_aligned_features(
+                        out_dir, pooling=None,
+                        aligned_dir_override=f"aligned_features_step{k_idx}",
+                    )
+                    output_path = os.path.join(out_dir, f"aligned_mean_features_step{k_idx}.pt")
+                    torch.save(result, output_path)
+                    log.info(f"Saved step {k_idx} features to {output_path}")
+                except Exception as e:
+                    log.error(f"Consolidation failed for step {k_idx}: {e}")
+        else:
+            try:
+                result = consolidate_aligned_features(out_dir, pooling="mean")
+                output_path = os.path.join(out_dir, "aligned_mean_features.pt")
+                torch.save(result, output_path)
+                log.info(f"Saved consolidated features to {output_path}")
+            except Exception as e:
+                log.error(f"Consolidation failed: {e}")
 
     if is_ddp:
         dist.destroy_process_group()

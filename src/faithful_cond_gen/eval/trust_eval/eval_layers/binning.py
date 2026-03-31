@@ -74,7 +74,7 @@ def evaluate_decile_binning(
     """
     # Determine effective KID mode
     if kid_mode == "auto":
-        effective_cosine = feature_type == "aligned_mean"
+        effective_cosine = feature_type == "aligned_mean" or feature_type.startswith("aligned_")
     elif kid_mode == "cosine":
         effective_cosine = True
     else:  # "standard"
