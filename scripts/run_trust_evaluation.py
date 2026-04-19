@@ -39,6 +39,7 @@ from faithful_cond_gen.eval.trust_eval.config import (
     CONDITION_ATTRS,
     FEATURE_CONFIGS,
     MARGINAL_SEEN_COMBOS,
+    RXRX1_HELDOUT_PAIRS,
 )
 from faithful_cond_gen.eval.trust_eval.diagnostics import (
     print_cosine_kid_transitivity_checks,
@@ -62,6 +63,7 @@ from faithful_cond_gen.eval.trust_eval.eval_layers import (
 )
 from faithful_cond_gen.eval.trust_eval.feature_io import (
     load_features_for_dataset,
+    load_posthoc_kid_features,
     verify_feature_ordering,
 )
 from faithful_cond_gen.eval.trust_eval.reporting import create_report
@@ -117,16 +119,9 @@ Examples:
     parser.add_argument(
         "--scoring-method",
         type=str,
-        choices=["mahalanobis", "knn"],
+        choices=["mahalanobis"],
         default="mahalanobis",
-        help="Scoring method for realism/faithfulness. 'mahalanobis': Mahalanobis distance (default). "
-        "'knn': kNN radius-based scoring (sanity check alternative).",
-    )
-    parser.add_argument(
-        "--knn-k",
-        type=int,
-        default=10,
-        help="Number of neighbors for kNN scoring (only used if --scoring-method=knn). Default: 10.",
+        help="Scoring method for realism/faithfulness. Currently only 'mahalanobis' is supported.",
     )
     parser.add_argument(
         "--use-zkid",
@@ -145,7 +140,6 @@ Examples:
     condition_keys = CONDITION_ATTRS.get(args.dataset, [])
     normalize_mode = args.normalize_features
     scoring_method = args.scoring_method
-    knn_k = args.knn_k
     use_kid_z = args.use_zkid
     within_condition_binning = not args.global_binning
 
@@ -153,12 +147,23 @@ Examples:
     print("TRUST SCORE EVALUATION")
     print("=" * 60)
     print(f"Dataset: {args.dataset}")
+    if args.dataset == "rxrx1":
+        from faithful_cond_gen.eval.trust_eval.subset_io import (
+            load_rxrx1_subset,
+            load_rxrx1_subset_arms,
+        )
+        rxrx1_subset = load_rxrx1_subset()
+        rxrx1_arms = load_rxrx1_subset_arms()
+        print(
+            f"RxRx1 eval subset loaded: N={len(rxrx1_subset)} "
+            f"(seen={len(rxrx1_arms['seen'])}, unseen={len(rxrx1_arms['unseen'])})"
+        )
+        print(f"  seen:   {sorted(rxrx1_arms['seen'])}")
+        print(f"  unseen: {sorted(rxrx1_arms['unseen'])}")
     print(f"Normalize features: {normalize_mode}")
     print(f"Scoring method: {scoring_method}")
     print(f"KID metric: {'z-normalized (experimental)' if use_kid_z else 'ΔKID'}")
     print(f"Binning mode: {'within-condition' if within_condition_binning else 'global'}")
-    if scoring_method == "knn":
-        print(f"  kNN k: {knn_k}")
     if normalize_mode == "l2":
         logger.info(
             "L2 normalization enabled: ALL feature vectors will be normalized after loading"
@@ -198,18 +203,39 @@ Examples:
 
         # For KID ground truth, always use DINO features (not aligned)
         # This ensures ΔKID is computed in a consistent, meaningful space
-        if feature_type != "dinov3" and model not in kid_feature_cache:
-            print(f"    Loading DINO features for KID ground truth ({model})...")
-            dino_real, dino_real_meta, dino_gen, dino_gen_meta = load_features_for_dataset(
-                args.dataset, model, "dinov3", normalize_mode=normalize_mode
-            )
+        kid_cache_key = (model, feature_type) if feature_type == "posthoc_mapped" else (model, "dinov3")
+        if feature_type != "dinov3" and kid_cache_key not in kid_feature_cache:
+            print(f"    Loading DINO features for KID ground truth ({model}/{feature_type})...")
+            if feature_type == "posthoc_mapped":
+                # posthoc_mapped gen samples come from gen_cache, need matching DINO features
+                dino_real, dino_real_meta, dino_gen, dino_gen_meta = load_posthoc_kid_features(
+                    args.dataset, model, normalize_mode=normalize_mode
+                )
+            else:
+                dino_real, dino_real_meta, dino_gen, dino_gen_meta = load_features_for_dataset(
+                    args.dataset, model, "dinov3", normalize_mode=normalize_mode
+                )
             if dino_real is not None and dino_gen is not None:
-                kid_feature_cache[model] = (dino_real, dino_real_meta, dino_gen, dino_gen_meta)
-                print(f"    ✓ DINO features loaded for KID: real={dino_real.shape}, gen={dino_gen.shape}")
+                kid_feature_cache[kid_cache_key] = (dino_real, dino_real_meta, dino_gen, dino_gen_meta)
+                print(f"    DINO features loaded for KID: real={dino_real.shape}, gen={dino_gen.shape}")
 
         # For marginal models, restrict real calibration to seen combos
-        filter_by_seen = "marginal" in model and args.dataset == "celeba"
-        seen_combos = MARGINAL_SEEN_COMBOS if filter_by_seen else None
+        if "marginal" in model and args.dataset == "celeba":
+            seen_combos = MARGINAL_SEEN_COMBOS
+        elif "marginal" in model and args.dataset == "rxrx1":
+            # Seen = all real combos minus heldout pairs
+            all_combos = set()
+            for i in range(len(real_feats)):
+                c = tuple(
+                    int(real_meta[k][i].item() if isinstance(real_meta[k][i], torch.Tensor) else real_meta[k][i])
+                    for k in condition_keys
+                )
+                all_combos.add(c)
+            seen_combos = all_combos - RXRX1_HELDOUT_PAIRS
+            logger.info(f"  RxRx1 marginal: {len(all_combos)} total combos, {len(RXRX1_HELDOUT_PAIRS)} heldout, {len(seen_combos)} seen")
+        else:
+            seen_combos = None
+        filter_by_seen = seen_combos is not None
 
         trust_res = compute_trust_results_from_features(
             dataset=args.dataset,
@@ -222,8 +248,6 @@ Examples:
             condition_keys=condition_keys,
             filter_by_seen=filter_by_seen,
             seen_combos=seen_combos,
-            scoring_method=scoring_method,
-            knn_k=knn_k,
         )
         all_results.append(trust_res)
 
@@ -279,21 +303,34 @@ Examples:
         # For KID computation, always use DINO features (ground truth metric)
         # Trust scores are computed in the feature space (aligned or dino)
         # but KID should always be in DINO space for valid quality measurement
-        if feature_type != "dinov3" and model in kid_feature_cache:
-            kid_real_feats, kid_real_meta, kid_gen_feats, kid_gen_meta = kid_feature_cache[model]
+        kid_cache_key = (model, feature_type) if feature_type == "posthoc_mapped" else (model, "dinov3")
+        if feature_type != "dinov3" and kid_cache_key in kid_feature_cache:
+            kid_real_feats, kid_real_meta, kid_gen_feats, kid_gen_meta = kid_feature_cache[kid_cache_key]
             kid_feature_type = "dinov3"
             print(f"  Using DINO features for KID ground truth (scoring in {feature_type} space)")
             # Verify ordering between scoring and KID features (abort if unverifiable)
             try:
-                verified = verify_feature_ordering(
+                verified_gen = verify_feature_ordering(
                     gen_meta, kid_gen_meta, f"scoring_{feature_type}", "kid_dinov3"
                 )
-                if not verified:
-                    logger.error(f"FATAL: Cannot verify KID feature ordering (missing metadata)")
-                    raise ValueError("KID feature ordering unverifiable - missing filename metadata")
-                print(f"    ✓ Verified: scoring and KID features have matching sample order")
+                if not verified_gen:
+                    logger.error(f"FATAL: Cannot verify KID gen feature ordering (missing metadata)")
+                    raise ValueError("KID gen feature ordering unverifiable - missing filename metadata")
+                print(f"    ✓ Verified: scoring and KID gen features have matching sample order")
+                # For posthoc_mapped, real features come from different sources
+                # (raw_hidden vs standard DINO) so size mismatch is expected
+                if feature_type == "posthoc_mapped":
+                    logger.info(f"  Skipping real verification for posthoc_mapped (different real sources)")
+                else:
+                    verified_real = verify_feature_ordering(
+                        real_meta, kid_real_meta, f"real_{feature_type}", "real_kid_dinov3"
+                    )
+                    if not verified_real:
+                        logger.warning(f"Cannot verify real feature ordering between {feature_type} and dinov3 (missing metadata)")
+                    else:
+                        print(f"    ✓ Verified: scoring and KID real features have matching sample order")
             except ValueError as e:
-                logger.error(f"FATAL: KID feature ordering mismatch - {e}")
+                logger.error(f"FATAL: Feature ordering mismatch - {e}")
                 raise
         else:
             kid_real_feats, kid_real_meta, kid_gen_feats = real_feats, real_meta, gen_feats
@@ -383,8 +420,6 @@ Examples:
                 model,
                 output_dir,
                 config_key,
-                scoring_method=scoring_method,
-                knn_k=knn_k,
             )
 
         # Task 4: Decile binning with ablations (after Layer 3)
@@ -477,6 +512,20 @@ Examples:
         # FPR@95 selection evaluation
         if real_feats is not None and gen_feats is not None:
             print("  FPR@95 selection evaluation...")
+            # For marginal models, use seen-combo filtering (matching gen_scores calibration)
+            if "marginal" in model and args.dataset == "celeba":
+                fpr95_seen_combos = MARGINAL_SEEN_COMBOS
+            elif "marginal" in model and args.dataset == "rxrx1":
+                all_combos = set()
+                for i in range(len(real_feats)):
+                    c = tuple(
+                        int(real_meta[k][i].item() if isinstance(real_meta[k][i], torch.Tensor) else real_meta[k][i])
+                        for k in condition_keys
+                    )
+                    all_combos.add(c)
+                fpr95_seen_combos = all_combos - RXRX1_HELDOUT_PAIRS
+            else:
+                fpr95_seen_combos = None
             # Scoring-space features for threshold, DINO features for KID
             fpr95_results[config_key] = evaluate_fpr95_selection(
                 trust_results=first_result,
@@ -491,10 +540,11 @@ Examples:
                 config_key=config_key,
                 kid_real_feats=kid_real_feats,
                 kid_gen_feats=kid_gen_feats,
+                kid_real_meta=kid_real_meta if feature_type != "dinov3" else None,
                 kid_mode=kid_effective_mode,
                 feature_type=kid_feature_type,
-                scoring_method=scoring_method,
                 use_kid_z=use_kid_z,
+                seen_combos=fpr95_seen_combos,
             )
 
         # RxRx1 decomposed classification (rxrx1 only)
@@ -510,21 +560,42 @@ Examples:
                 dataset=args.dataset,
             )
 
-            # RxRx1 downstream bin-selection (Task 5 analog, celltype and 100pairs modes)
+            # RxRx1 downstream bin-selection (Task 5 analog, celltype and subset modes)
+            # Always use dinov3 features for classifier (scoring determines binning only)
             if first_result is not None:
-                for rxrx1_bin_mode in ["celltype", "100pairs"]:
-                    print(f"  RxRx1 downstream bin-selection ({rxrx1_bin_mode})...")
-                    evaluate_rxrx1_downstream_bin_selection(
-                        trust_results=first_result,
-                        gen_feats=gen_feats,
-                        gen_meta=gen_meta,
-                        real_feats=real_feats,
-                        real_meta=real_meta,
-                        output_dir=output_dir,
-                        config_key=config_key,
-                        mode=rxrx1_bin_mode,
-                        dataset=args.dataset,
-                    )
+                if feature_type == "dinov3":
+                    ds_real, ds_real_meta, ds_gen, ds_gen_meta = real_feats, real_meta, gen_feats, gen_meta
+                elif feature_type == "posthoc_mapped" and kid_cache_key in kid_feature_cache:
+                    # posthoc_mapped gen rows come from the subset cache; the matching
+                    # dinov3 lives in kid_feature_cache (load_posthoc_kid_features).
+                    ds_real, ds_real_meta, ds_gen, ds_gen_meta = kid_feature_cache[kid_cache_key]
+                else:
+                    cache_key_downstream = (model, "dinov3")
+                    if cache_key_downstream in feature_cache:
+                        ds_real, ds_real_meta, ds_gen, ds_gen_meta = feature_cache[cache_key_downstream]
+                    else:
+                        ds_real, ds_real_meta, ds_gen, ds_gen_meta = load_features_for_dataset(
+                            args.dataset, model, "dinov3", normalize_mode=normalize_mode
+                        )
+
+                n_trust = len(first_result["trust_updated"])
+                if ds_gen is not None and len(ds_gen) != n_trust:
+                    print(f"  Skipping RxRx1 downstream bin-selection: gen count mismatch "
+                          f"(trust_results={n_trust}, dinov3={len(ds_gen)})")
+                elif ds_gen is not None:
+                    for rxrx1_bin_mode in ["celltype", "subset"]:
+                        print(f"  RxRx1 downstream bin-selection ({rxrx1_bin_mode})...")
+                        evaluate_rxrx1_downstream_bin_selection(
+                            trust_results=first_result,
+                            gen_feats=ds_gen,
+                            gen_meta=ds_gen_meta,
+                            real_feats=ds_real,
+                            real_meta=ds_real_meta,
+                            output_dir=output_dir,
+                            config_key=config_key,
+                            mode=rxrx1_bin_mode,
+                            dataset=args.dataset,
+                        )
 
     # Create report
     print("\nGenerating report...")

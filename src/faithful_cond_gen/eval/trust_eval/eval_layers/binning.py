@@ -189,11 +189,27 @@ def evaluate_decile_binning(
                 # Compute average z-KID across conditions
                 avg_kid_z = np.mean(kid_z_values) if kid_z_values else np.nan
 
-                # Also compute raw KID for the merged bin
+                # Build condition-matched real subset for this bin
+                rng_bin = np.random.default_rng(42 + bin_idx)
+                matched_real_indices = []
+                for cond in conds_in_bin:
+                    n_gen_cond = len(within_cond_bins[cond].get(bin_idx, []))
+                    real_cond_idx = real_by_cond.get(cond, [])
+                    if len(real_cond_idx) >= n_gen_cond and n_gen_cond > 0:
+                        matched_real_indices.extend(
+                            rng_bin.choice(real_cond_idx, size=n_gen_cond, replace=False)
+                        )
+                    elif real_cond_idx:
+                        matched_real_indices.extend(
+                            rng_bin.choice(real_cond_idx, size=n_gen_cond, replace=True)
+                        )
+
+                # Compute raw KID against condition-matched real
                 gen_merged = gen_feats_np[merged_indices]
+                real_matched = real_feats_np[matched_real_indices] if matched_real_indices else real_feats_np
                 kid_stats = bootstrap_kid_for_bin(
                     gen_merged,
-                    real_feats_np,
+                    real_matched,
                     n_bootstrap=n_bootstrap,
                     use_cosine=effective_cosine,
                 )

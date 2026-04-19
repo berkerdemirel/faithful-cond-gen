@@ -161,6 +161,70 @@ FEATURE_CONFIGS: Dict[Tuple[str, str, str], Tuple[str, str]] = {
         "rxrx1_repa_siglip_marginal",
         "aligned_mean_features.pt",
     ),
+    # Posthoc mapped features (SiT hidden -> SigLIP via trained mapper)
+    # For marginal models only: vanilla and REPA SigLIP
+    ("celeba", "vanilla_marginal", "posthoc_mapped"): (
+        "celeba_vanilla_marginal_v1",
+        "posthoc_mapped",
+    ),
+    ("celeba", "repa_siglip_marginal", "posthoc_mapped"): (
+        "celeba_repa_siglip_marginal_v1",
+        "posthoc_mapped",
+    ),
+    ("rxrx1", "vanilla_marginal", "posthoc_mapped"): (
+        "rxrx1_vanilla_marginal_v1",
+        "posthoc_mapped",
+    ),
+    ("rxrx1", "repa_siglip_marginal", "posthoc_mapped"): (
+        "rxrx1_repa_siglip_marginal_v1",
+        "posthoc_mapped",
+    ),
+    # Posthoc mapped — newly trained whitened mappers (full + DINOv3 marginals)
+    ("celeba", "vanilla_full", "posthoc_mapped"): (
+        "celeba_vanilla_full_v1",
+        "posthoc_mapped",
+    ),
+    ("celeba", "repa_full", "posthoc_mapped"): (
+        "celeba_repa_full_v1",
+        "posthoc_mapped",
+    ),
+    ("celeba", "repa_marginal", "posthoc_mapped"): (
+        "celeba_repa_marginal_v1",
+        "posthoc_mapped",
+    ),
+    ("celeba", "repa_siglip_full", "posthoc_mapped"): (
+        "celeba_repa_siglip_full_v1",
+        "posthoc_mapped",
+    ),
+    ("rxrx1", "vanilla_full", "posthoc_mapped"): (
+        "rxrx1_vanilla_full_v1",
+        "posthoc_mapped",
+    ),
+    ("rxrx1", "repa_full", "posthoc_mapped"): (
+        "rxrx1_repa_full_v1",
+        "posthoc_mapped",
+    ),
+    ("rxrx1", "repa_marginal", "posthoc_mapped"): (
+        "rxrx1_repa_marginal_v1",
+        "posthoc_mapped",
+    ),
+    ("rxrx1", "repa_siglip_full", "posthoc_mapped"): (
+        "rxrx1_repa_siglip_full_v1",
+        "posthoc_mapped",
+    ),
+}
+
+# TEMPORARY: restrict this run to the posthoc_mapped rollout plus the
+# postgen dinov3 baseline for the 6 core rxrx1 models (openphenom excluded).
+# Revert by deleting this block to re-enable all baselines.
+_CORE_RXRX1 = {
+    "vanilla_full", "vanilla_marginal",
+    "repa_full", "repa_marginal",
+    "repa_siglip_full", "repa_siglip_marginal",
+}
+FEATURE_CONFIGS = {
+    k: v for k, v in FEATURE_CONFIGS.items()
+    if k[2] == "posthoc_mapped"
 }
 
 # Real feature paths - use meanpatch for dinov3 comparisons
@@ -197,6 +261,23 @@ REAL_FEATURE_PATHS_BY_MODEL: Dict[Tuple[str, str, str], str] = {
     ("celeba", "repa_marginal_ts", "aligned_step0"): "outputs/real_celeba_aligned/celeba_repa_marginal_v1/train_features.pt",
     ("celeba", "repa_marginal_ts", "aligned_step83"): "outputs/real_celeba_aligned/celeba_repa_marginal_v1/train_features.pt",
     ("celeba", "repa_marginal_ts", "aligned_step166"): "outputs/real_celeba_aligned/celeba_repa_marginal_v1/train_features.pt",
+}
+
+# Posthoc alignment model key mapping
+# Maps (dataset, model) -> full checkpoint key for posthoc mapper/hidden paths
+POSTHOC_MODEL_KEYS: Dict[Tuple[str, str], str] = {
+    ("celeba", "vanilla_marginal"): "celeba_vanilla_marginal_v1",
+    ("celeba", "repa_siglip_marginal"): "celeba_repa_siglip_marginal_v1",
+    ("rxrx1", "vanilla_marginal"): "rxrx1_vanilla_marginal_v1",
+    ("rxrx1", "repa_siglip_marginal"): "rxrx1_repa_siglip_marginal_v1",
+    ("celeba", "vanilla_full"): "celeba_vanilla_full_v1",
+    ("celeba", "repa_full"): "celeba_repa_full_v1",
+    ("celeba", "repa_marginal"): "celeba_repa_marginal_v1",
+    ("celeba", "repa_siglip_full"): "celeba_repa_siglip_full_v1",
+    ("rxrx1", "vanilla_full"): "rxrx1_vanilla_full_v1",
+    ("rxrx1", "repa_full"): "rxrx1_repa_full_v1",
+    ("rxrx1", "repa_marginal"): "rxrx1_repa_marginal_v1",
+    ("rxrx1", "repa_siglip_full"): "rxrx1_repa_siglip_full_v1",
 }
 
 # NOTE: For consistent KID computation, all features should use the same extraction method:
@@ -238,6 +319,22 @@ def load_rxrx1_heldout_pairs() -> Set[Tuple[int, int]]:
 
 # RxRx1 heldout pairs (cell_type_id, sirna_id) - loaded from yaml
 RXRX1_HELDOUT_PAIRS: Set[Tuple[int, int]] = load_rxrx1_heldout_pairs()
+
+# Canonical 50-condition RxRx1 eval subset (built by
+# scripts/posthoc_alignment/finalize_rxrx1_subset.py). Re-exported from
+# subset_io so that every eval path can filter via a single module-level call.
+from faithful_cond_gen.eval.trust_eval.subset_io import (  # noqa: E402
+    filter_rxrx1_real_to_scoring_pool,
+    filter_rxrx1_to_subset,
+    load_rxrx1_subset,
+    load_rxrx1_subset_arms,
+    load_rxrx1_subset_sirnas,
+)
+
+
+def get_rxrx1_eval_subset() -> Set[Tuple[int, int]]:
+    """Lazy accessor for the canonical RxRx1 eval subset pairs."""
+    return load_rxrx1_subset()
 
 # Mixture realism component configurations
 # Maps (dataset, model_type) to component grouping strategy

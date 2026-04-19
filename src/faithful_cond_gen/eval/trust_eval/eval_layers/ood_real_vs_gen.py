@@ -105,8 +105,6 @@ def evaluate_sample_ood_detection(
     max_real: int = 10000,
     n_resamples: int = 3,
     fit_fraction: float = 0.5,
-    scoring_method: str = "mahalanobis",
-    knn_k: int = 10,
 ) -> Dict:
     """
     Task 3: Sample-based OOD detection (real vs generated).
@@ -133,8 +131,6 @@ def evaluate_sample_ood_detection(
         max_real: Maximum real samples to use (stratified subsample if exceeded)
         n_resamples: Number of resamples for CI computation
         fit_fraction: Fraction of real samples used for fitting (rest for scoring)
-        scoring_method: "mahalanobis" (default) or "knn"
-        knn_k: Number of neighbors for kNN scoring
     """
     # Check if resampling is needed
     n_total_real = len(real_feats)
@@ -253,8 +249,6 @@ def evaluate_sample_ood_detection(
                 condition_keys,
                 regularization=1e-5,
                 use_shared_cov=True,
-                scoring_method=scoring_method,
-                knn_k=knn_k,
             )
 
             # Score held-out real samples using fitted components

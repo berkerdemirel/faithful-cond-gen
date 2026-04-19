@@ -18,14 +18,14 @@ Examples:
   PYTHONPATH=src uv run python scripts/profile_flops.py \
     --checkpoint_key celeba_repa_full_v1 \
     --output outputs/flops/repa.yaml \
-    --num_inference_steps 50
+    --num_inference_steps 250
 
   # E2E wall-clock profiling
   PYTHONPATH=src uv run python scripts/profile_flops.py \
     --checkpoint_key celeba_repa_full_v1 \
     --mode e2e \
     --output outputs/flops/repa_e2e.yaml \
-    --num_inference_steps 50
+    --num_inference_steps 250
 
   # Compare vanilla with REPA (needs posthoc encoder for vanilla)
   PYTHONPATH=src uv run python scripts/profile_flops.py \
@@ -495,7 +495,7 @@ def main():
         help="Compare two FLOPs YAML profiles (expects one REPA and one vanilla)",
     )
 
-    parser.add_argument("--num_inference_steps", type=int, default=50)
+    parser.add_argument("--num_inference_steps", type=int, default=250)
     parser.add_argument("--cfg_scale", type=float, default=1.0)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations (e2e mode only)")

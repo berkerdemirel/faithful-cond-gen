@@ -848,526 +848,62 @@ def compute_authenticity_scores(
 
 
 # ============================================================================
-# kNN-Based Scoring (Alternative to Mahalanobis)
-# ============================================================================
-
-
-def fit_knn_global_stats(
-    features: torch.Tensor,
-    k: int = 10,
-    metric: str = "cosine",
-) -> Dict:
-    """
-    Fit global kNN model on real features for realism scoring.
-
-    Args:
-        features: Real features (N, D)
-        k: Number of neighbors for kNN
-        metric: Distance metric ("cosine" or "euclidean")
-
-    Returns:
-        Dict with:
-        - nn_model: Fitted NearestNeighbors model
-        - k: Number of neighbors
-        - metric: Distance metric used
-        - n_samples: Number of samples fitted
-    """
-    features_norm = normalize_features(features).numpy().astype(np.float64)
-    nn_model = NearestNeighbors(n_neighbors=k, metric=metric, algorithm="auto")
-    nn_model.fit(features_norm)
-
-    return {
-        "nn_model": nn_model,
-        "k": k,
-        "metric": metric,
-        "n_samples": len(features),
-    }
-
-
-def compute_real_calibration_for_global_knn(
-    real_feats: torch.Tensor,
-    knn_stats: Dict,
-    batch_size: int = 2000,
-) -> Tuple[float, float]:
-    """
-    Compute mean/std of kNN radius on real samples (leave-one-out).
-
-    For each real sample, compute distance to k-th nearest neighbor
-    (excluding self), then return mean and std for z-scoring.
-    """
-    real_norm = normalize_features(real_feats).numpy().astype(np.float64)
-    N = len(real_norm)
-    k = knn_stats["k"]
-
-    # Leave-one-out: query k+1 neighbors and skip self
-    nn_model = NearestNeighbors(
-        n_neighbors=k + 1, metric=knn_stats["metric"], algorithm="auto"
-    )
-    nn_model.fit(real_norm)
-
-    radii = np.zeros(N, dtype=np.float64)
-    for start in range(0, N, batch_size):
-        end = min(start + batch_size, N)
-        dists, _ = nn_model.kneighbors(real_norm[start:end])
-        # Skip self (index 0), take k-th neighbor (index k)
-        radii[start:end] = dists[:, k]
-
-    mean = float(np.mean(radii))
-    std = float(np.std(radii, ddof=1) if N > 1 else 1.0)
-    return mean, std
-
-
-def compute_global_realism_knn_z(
-    feats: torch.Tensor,
-    real_feats: torch.Tensor,
-    knn_stats: Dict,
-    real_knn_mean: float,
-    real_knn_std: float,
-    batch_size: int = 2000,
-    two_sided: bool = False,
-) -> np.ndarray:
-    """
-    kNN-based realism z-score.
-
-    R_knn(x) = z(knn_radius(x; real)) using real calibration.
-
-    Args:
-        feats: Features to score (N, D)
-        real_feats: Real features for kNN lookup (M, D)
-        knn_stats: Dict with k, metric from fit_knn_global_stats
-        real_knn_mean, real_knn_std: Calibration from compute_real_calibration_for_global_knn
-        two_sided: If True, return z² (penalize both too close and too far)
-
-    Returns:
-        Array of shape (N,) with z-scores
-    """
-    feats_norm = normalize_features(feats).numpy().astype(np.float64)
-    real_norm = normalize_features(real_feats).numpy().astype(np.float64)
-    N = len(feats_norm)
-    k = knn_stats["k"]
-
-    # Fit on real, query with gen
-    nn_model = NearestNeighbors(
-        n_neighbors=k, metric=knn_stats["metric"], algorithm="auto"
-    )
-    nn_model.fit(real_norm)
-
-    out = np.zeros(N, dtype=np.float64)
-    for start in range(0, N, batch_size):
-        end = min(start + batch_size, N)
-        dists, _ = nn_model.kneighbors(feats_norm[start:end])
-        # Take k-th neighbor distance (index k-1)
-        radii = dists[:, k - 1]
-        z = zscore(radii, real_knn_mean, real_knn_std)
-        if two_sided:
-            out[start:end] = z**2
-        else:
-            out[start:end] = z
-    return out
-
-
-def fit_knn_factorized_stats(
-    features: torch.Tensor,
-    metadata: Dict,
-    condition_keys: List[str],
-    k: int = 10,
-    metric: str = "cosine",
-    min_samples: int = 10,
-) -> Dict[str, Dict[int, Dict]]:
-    """
-    Fit per-attribute kNN models for faithfulness scoring.
-
-    For each attribute value, fit a kNN model on the subset of real samples
-    with that attribute value.
-
-    Args:
-        features: Real features (N, D)
-        metadata: Dict with attribute values
-        condition_keys: List of attribute names
-        k: Number of neighbors for kNN
-        metric: Distance metric
-        min_samples: Minimum samples per class to fit
-
-    Returns:
-        Dict[attr_key][value] = {nn_model, k, metric, n_samples}
-    """
-    features_norm = normalize_features(features).numpy().astype(np.float64)
-    N = len(features_norm)
-
-    # Group samples by attribute value
-    attr_groups = {key: {} for key in condition_keys}
-    for i in range(N):
-        for key in condition_keys:
-            val = int(
-                metadata[key][i].item()
-                if isinstance(metadata[key][i], torch.Tensor)
-                else metadata[key][i]
-            )
-            attr_groups[key].setdefault(val, []).append(i)
-
-    stats = {}
-    for attr_key in condition_keys:
-        stats[attr_key] = {}
-        for val, idx_list in attr_groups[attr_key].items():
-            idx = np.array(idx_list, dtype=int)
-            n = len(idx)
-
-            if n >= min_samples:
-                subset = features_norm[idx]
-                nn_model = NearestNeighbors(
-                    n_neighbors=min(k, n - 1), metric=metric, algorithm="auto"
-                )
-                nn_model.fit(subset)
-                stats[attr_key][val] = {
-                    "nn_model": nn_model,
-                    "indices": idx,  # For leave-one-out
-                    "k": min(k, n - 1),
-                    "metric": metric,
-                    "n_samples": n,
-                }
-            else:
-                stats[attr_key][val] = {
-                    "nn_model": None,
-                    "indices": idx,
-                    "k": k,
-                    "metric": metric,
-                    "n_samples": n,
-                }
-
-    return stats
-
-
-def _iter_batches(n: int, bs: int):
-    """Batch iterator helper - extracted to module level to avoid duplication."""
-    for s in range(0, n, bs):
-        yield s, min(s + bs, n)
-
-
-def compute_real_calibration_for_factorized_knn_margins(
-    real_feats: torch.Tensor,
-    real_meta: Dict,
-    knn_factorized_stats: Dict[str, Dict[int, Dict]],
-    condition_keys: List[str],
-    batch_size: int = 2000,
-) -> Dict[str, Tuple[float, float]]:
-    """
-    Compute mean/std of kNN margin on real samples for each attribute.
-
-    kNN margin = knn_dist(x; true_class) - knn_dist(x; nearest_other_class)
-
-    Smaller margin = closer to true class than other classes = good.
-
-    NOTE:
-        This implementation is exact but avoids rebuilding a leave-one-out kNN
-        graph for every sample. For each (attribute, value) class, it fits one
-        kNN model on the class subset, queries the subset against itself with
-        k+1 neighbors, and removes each sample's self-match by index. This is
-        equivalent to per-sample leave-one-out for the k-th neighbor distance.
-    """
-    real_norm = normalize_features(real_feats).numpy().astype(np.float64)
-    N = len(real_norm)
-
-    calib: Dict[str, Tuple[float, float]] = {}
-
-    for attr_key in condition_keys:
-        values = sorted(knn_factorized_stats[attr_key].keys())
-        V = len(values)
-
-        if V < 2:
-            calib[attr_key] = (0.0, 1.0)
-            continue
-
-        # Precompute true attribute value for each real sample once.
-        true_vals = np.empty(N, dtype=np.int64)
-        for i in range(N):
-            true_vals[i] = int(
-                real_meta[attr_key][i].item()
-                if isinstance(real_meta[attr_key][i], torch.Tensor)
-                else real_meta[attr_key][i]
-            )
-
-        margins = np.full(N, np.nan, dtype=np.float64)
-
-        # Group global indices by their true attribute value (only values present in stats).
-        rows_by_val: Dict[int, np.ndarray] = {}
-        for v in values:
-            rows = np.where(true_vals == v)[0]
-            if rows.size > 0:
-                rows_by_val[v] = rows
-
-        for true_val in values:
-            true_stats = knn_factorized_stats[attr_key][true_val]
-            rows = rows_by_val.get(true_val)
-            if rows is None or rows.size == 0:
-                continue
-            if true_stats["nn_model"] is None:
-                continue
-
-            true_idx = np.asarray(true_stats["indices"], dtype=int)
-            k_true = int(true_stats["k"])
-            if k_true <= 0:
-                continue
-
-            # Map global index -> local row within the class subset.
-            local_pos = {gi: li for li, gi in enumerate(true_idx.tolist())}
-            local_rows = np.array(
-                [local_pos.get(int(gi), -1) for gi in rows], dtype=int
-            )
-            valid_rows_mask = local_rows >= 0
-            if not np.any(valid_rows_mask):
-                continue
-
-            rows = rows[valid_rows_mask]
-            local_rows = local_rows[valid_rows_mask]
-            subset = real_norm[true_idx]
-            n_subset = subset.shape[0]
-
-            # Need at least k_true+1 points in the class subset to exclude self and still
-            # have k_true neighbors. This should normally hold when nn_model is present,
-            # but keep the check for robustness.
-            if n_subset <= k_true:
-                continue
-
-            # Exact leave-one-out kth radius for all needed rows in this class using one fit.
-            n_query = min(k_true + 1, n_subset)
-            nn_self = NearestNeighbors(
-                n_neighbors=n_query,
-                metric=true_stats["metric"],
-                algorithm="auto",
-            )
-            nn_self.fit(subset)
-
-            d_true = np.full(rows.shape[0], np.nan, dtype=np.float64)
-            # Query only the rows we need (usually all rows in this class for calibration).
-            for start, end in _iter_batches(len(rows), batch_size):
-                q = subset[local_rows[start:end]]
-                dists, inds = nn_self.kneighbors(q, return_distance=True)
-                # Remove self-match by identity (index in subset), not by distance,
-                # to remain exact even when duplicate vectors exist.
-                for bi in range(end - start):
-                    row_local = int(local_rows[start + bi])
-                    keep = inds[bi] != row_local
-                    if np.count_nonzero(keep) < k_true:
-                        continue
-                    d_true[start + bi] = float(dists[bi][keep][k_true - 1])
-
-            # Distances to other classes: batch query each other class once, then take min.
-            min_other = np.full(rows.shape[0], np.inf, dtype=np.float64)
-            q_all = subset[local_rows]
-            for other_val in values:
-                if other_val == true_val:
-                    continue
-                other_stats = knn_factorized_stats[attr_key][other_val]
-                if other_stats["nn_model"] is None:
-                    continue
-
-                k_other = int(other_stats["k"])
-                if k_other <= 0:
-                    continue
-
-                d_other_vec = np.empty(rows.shape[0], dtype=np.float64)
-                for start, end in _iter_batches(len(rows), batch_size):
-                    d_other, _ = other_stats["nn_model"].kneighbors(
-                        q_all[start:end], return_distance=True
-                    )
-                    d_other_vec[start:end] = d_other[:, k_other - 1]
-                min_other = np.minimum(min_other, d_other_vec)
-
-            valid = np.isfinite(d_true) & np.isfinite(min_other)
-            if np.any(valid):
-                margins[rows[valid]] = d_true[valid] - min_other[valid]
-
-        m = margins[np.isfinite(margins)]
-        if len(m) == 0:
-            calib[attr_key] = (0.0, 1.0)
-        else:
-            calib[attr_key] = (
-                float(m.mean()),
-                float(m.std(ddof=1) if len(m) > 1 else 1.0),
-            )
-
-    return calib
-
-
-def compute_factorized_faithfulness_knn_margin_z(
-    feats: torch.Tensor,
-    metadata: Dict,
-    real_feats: torch.Tensor,
-    real_meta: Dict,
-    knn_factorized_stats: Dict[str, Dict[int, Dict]],
-    condition_keys: List[str],
-    margin_calib: Dict[str, Tuple[float, float]],
-    k: int = 10,
-    metric: str = "cosine",
-    batch_size: int = 1000,
-) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-    """
-    kNN-based faithfulness margin z-score.
-
-    For each sample and attribute:
-      margin_k(x) = knn_dist(x; true_class) - knn_dist(x; nearest_other_class)
-      zmargin_k(x) = z(margin_k(x)) using real calibration
-
-    Faithfulness = (1/K) * sum_k zmargin_k(x)
-
-    Returns:
-        - F: (N,) faithfulness z-scores
-        - per_attr_margin: raw margin arrays per attribute
-
-    NOTE:
-        Exact implementation using batched kNN queries. It avoids the previous
-        O(N * V) Python-level sample loop by querying each class model on whole
-        batches and assembling margins from those distances.
-    """
-    feats_norm = normalize_features(feats).numpy().astype(np.float64)
-    # Keep normalization for parity with the existing API (real_feats/real_meta are unused
-    # for scoring but kept in the signature for compatibility).
-    _ = normalize_features(real_feats).numpy().astype(np.float64)
-    N = len(feats_norm)
-    K = len(condition_keys)
-
-    zsum = np.zeros(N, dtype=np.float64)
-    per_attr_margin: Dict[str, np.ndarray] = {}
-
-    for attr_key in condition_keys:
-        values = sorted(knn_factorized_stats[attr_key].keys())
-        V = len(values)
-
-        margins = np.zeros(N, dtype=np.float64)
-
-        if V < 2:
-            per_attr_margin[attr_key] = margins
-            continue
-
-        value_to_col = {v: j for j, v in enumerate(values)}
-
-        # True class per sample for this attribute.
-        true_idx = np.full(N, -1, dtype=np.int64)
-        for i in range(N):
-            v = int(
-                metadata[attr_key][i].item()
-                if isinstance(metadata[attr_key][i], torch.Tensor)
-                else metadata[attr_key][i]
-            )
-            true_idx[i] = value_to_col.get(v, -1)
-
-        # Distances to each class model (k-th NN radius wrt that class), computed in batches.
-        dmat = np.full((N, V), np.inf, dtype=np.float64)
-        for col, v in enumerate(values):
-            stats_v = knn_factorized_stats[attr_key][v]
-            nn_model = stats_v["nn_model"]
-            k_v = int(stats_v.get("k", 0))
-            if nn_model is None or k_v <= 0:
-                continue
-
-            for start, end in _iter_batches(N, batch_size):
-                dists, _ = nn_model.kneighbors(
-                    feats_norm[start:end], return_distance=True
-                )
-                dmat[start:end, col] = dists[:, k_v - 1]
-
-        valid_true = true_idx >= 0
-        if np.any(valid_true):
-            rows = np.where(valid_true)[0]
-            cols = true_idx[rows]
-            d_true = dmat[rows, cols]
-
-            d_other = dmat[rows].copy()
-            d_other[np.arange(len(rows)), cols] = np.inf
-            min_other = d_other.min(axis=1)
-
-            valid_margin = np.isfinite(d_true) & np.isfinite(min_other)
-            margins[rows[valid_margin]] = d_true[valid_margin] - min_other[valid_margin]
-            # Invalid margins remain 0.0 (backward-compatible behavior).
-
-        m_mean, m_std = margin_calib.get(attr_key, (0.0, 1.0))
-        zsum += zscore(margins, m_mean, m_std)
-        per_attr_margin[attr_key] = margins
-
-    F = zsum / max(1, K)
-    return F, per_attr_margin
-
-
-def fit_knn_scoring_components(
-    calib_feats: torch.Tensor,
-    calib_meta: Dict,
-    condition_keys: List[str],
-    k: int = 10,
-    metric: str = "cosine",
-) -> Dict[str, Any]:
-    """
-    Fit all kNN-based components for trust scoring.
-
-    Analogous to fit_trust_scoring_components but using kNN instead of Mahalanobis.
-    """
-    knn_global_stats = fit_knn_global_stats(calib_feats, k=k, metric=metric)
-    knn_factorized_stats = fit_knn_factorized_stats(
-        calib_feats, calib_meta, condition_keys, k=k, metric=metric
-    )
-    real_knn_mean, real_knn_std = compute_real_calibration_for_global_knn(
-        calib_feats, knn_global_stats
-    )
-    margin_calib = compute_real_calibration_for_factorized_knn_margins(
-        calib_feats, calib_meta, knn_factorized_stats, condition_keys
-    )
-
-    return {
-        "scoring_method": "knn",
-        "knn_global_stats": knn_global_stats,
-        "knn_factorized_stats": knn_factorized_stats,
-        "real_knn_mean": real_knn_mean,
-        "real_knn_std": real_knn_std,
-        "margin_calib": margin_calib,
-        "condition_keys": condition_keys,
-        "calib_feats": calib_feats,  # Needed for kNN queries
-        "calib_meta": calib_meta,
-        "k": k,
-        "metric": metric,
-    }
-
-
-def score_trust_from_knn_components(
-    feats: torch.Tensor,
-    meta: Dict,
-    components: Dict[str, Any],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Score features using pre-fit kNN-based trust scoring components.
-
-    Returns:
-        Tuple of (realism_z, faithfulness_z, trust_z) arrays of shape (N,)
-    """
-    knn_global_stats = components["knn_global_stats"]
-    knn_factorized_stats = components["knn_factorized_stats"]
-    real_knn_mean = components["real_knn_mean"]
-    real_knn_std = components["real_knn_std"]
-    margin_calib = components["margin_calib"]
-    condition_keys = components["condition_keys"]
-    calib_feats = components["calib_feats"]
-    calib_meta = components["calib_meta"]
-
-    realism_z = compute_global_realism_knn_z(
-        feats, calib_feats, knn_global_stats, real_knn_mean, real_knn_std
-    )
-    faithfulness_z, _ = compute_factorized_faithfulness_knn_margin_z(
-        feats,
-        meta,
-        calib_feats,
-        calib_meta,
-        knn_factorized_stats,
-        condition_keys,
-        margin_calib,
-        k=components["k"],
-        metric=components["metric"],
-    )
-    trust_z = realism_z + faithfulness_z
-
-    return realism_z, faithfulness_z, trust_z
-
-
-# ============================================================================
 # Main Trust Scoring API
 # ============================================================================
+
+
+def _compute_scores_mahalanobis(
+    real_used_feats: torch.Tensor,
+    real_used_meta: Dict,
+    gen_feats: torch.Tensor,
+    gen_meta: Dict,
+    condition_keys: List[str],
+    dataset: str,
+    use_shared_cov: bool = True,
+    **_: Any,
+) -> Dict[str, Any]:
+    """Mahalanobis scoring: realism = global energy z, faithfulness = factorized margin z."""
+    factorized_stats = fit_factorized_stats(
+        real_used_feats,
+        real_used_meta,
+        condition_keys,
+        regularization=1e-5,
+        use_shared_cov=bool(use_shared_cov),
+    )
+    global_stats = fit_global_stats(real_used_feats, regularization=1e-5)
+    real_E_mean, real_E_std = compute_real_calibration_for_global_energy(
+        real_used_feats, global_stats
+    )
+    margin_calib = compute_real_calibration_for_factorized_margins(
+        real_used_feats, real_used_meta, factorized_stats, condition_keys
+    )
+
+    realism_z = compute_global_realism_z(
+        gen_feats, global_stats, real_E_mean, real_E_std, two_sided=False
+    )
+    faithfulness_z, _ = compute_factorized_faithfulness_margin_z(
+        gen_feats, gen_meta, factorized_stats, condition_keys, margin_calib
+    )
+    trust_updated = realism_z + faithfulness_z
+
+    return {
+        "realism_global_z": realism_z,
+        "faithfulness_margin_z": faithfulness_z,
+        "trust_updated": trust_updated,
+        "margin_calib": margin_calib,
+        "global_stats_summary": {
+            "n_samples": global_stats["n_samples"],
+            "scoring_method": "mahalanobis",
+            "shrinkage": global_stats.get("shrinkage", float("nan")),
+            "real_E_mean": real_E_mean,
+            "real_E_std": real_E_std,
+        },
+    }
+
+
+_SCORERS = {
+    "mahalanobis": _compute_scores_mahalanobis,
+}
 
 
 def compute_trust_results_from_features(
@@ -1383,17 +919,10 @@ def compute_trust_results_from_features(
     seen_combos: Optional[Set[Tuple[int, ...]]] = None,
     use_shared_cov: Optional[bool] = None,
     scoring_method: str = "mahalanobis",
-    knn_k: int = 10,
+    **method_kwargs: Any,
 ) -> Dict:
-    """
-    Compute the full trust_results dict (same schema as outputs/trust_scores/*.pt), without any I/O.
-
-    Args:
-        scoring_method: "mahalanobis" (default) or "knn"
-        knn_k: Number of neighbors for kNN scoring (only used if scoring_method="knn")
-    """
+    """Compute the full trust_results dict for the chosen scorer."""
     if use_shared_cov is None:
-        # Default to LDA-style shared covariance for fair margin comparison
         use_shared_cov = True
 
     # Optionally restrict real stats/calibration to the model's seen training support (marginal models).
@@ -1401,84 +930,20 @@ def compute_trust_results_from_features(
         real_feats, real_meta, condition_keys, seen_combos if filter_by_seen else None
     )
 
-    if scoring_method == "knn":
-        # kNN-based scoring
-        knn_global_stats = fit_knn_global_stats(
-            real_used_feats, k=knn_k, metric="cosine"
+    if scoring_method not in _SCORERS:
+        raise ValueError(
+            f"Unknown scoring_method={scoring_method!r}. Available: {sorted(_SCORERS)}"
         )
-        knn_factorized_stats = fit_knn_factorized_stats(
-            real_used_feats, real_used_meta, condition_keys, k=knn_k, metric="cosine"
-        )
-        real_knn_mean, real_knn_std = compute_real_calibration_for_global_knn(
-            real_used_feats, knn_global_stats
-        )
-        margin_calib = compute_real_calibration_for_factorized_knn_margins(
-            real_used_feats, real_used_meta, knn_factorized_stats, condition_keys
-        )
-
-        # Score generated samples using kNN
-        realism_global_z = compute_global_realism_knn_z(
-            gen_feats,
-            real_used_feats,
-            knn_global_stats,
-            real_knn_mean,
-            real_knn_std,
-            two_sided=False,
-        )
-        faithfulness_margin_z, _ = compute_factorized_faithfulness_knn_margin_z(
-            gen_feats,
-            gen_meta,
-            real_used_feats,
-            real_used_meta,
-            knn_factorized_stats,
-            condition_keys,
-            margin_calib,
-            k=knn_k,
-            metric="cosine",
-        )
-        trust_updated = realism_global_z + faithfulness_margin_z
-
-        # Store kNN-specific stats for summary
-        global_stats_summary = {
-            "n_samples": knn_global_stats["n_samples"],
-            "scoring_method": "knn",
-            "knn_k": knn_k,
-            "real_knn_mean": real_knn_mean,
-            "real_knn_std": real_knn_std,
-        }
-    else:
-        # Mahalanobis-based scoring (default)
-        factorized_stats = fit_factorized_stats(
-            real_used_feats,
-            real_used_meta,
-            condition_keys,
-            regularization=1e-5,
-            use_shared_cov=bool(use_shared_cov),
-        )
-        global_stats = fit_global_stats(real_used_feats, regularization=1e-5)
-        real_E_mean, real_E_std = compute_real_calibration_for_global_energy(
-            real_used_feats, global_stats
-        )
-        margin_calib = compute_real_calibration_for_factorized_margins(
-            real_used_feats, real_used_meta, factorized_stats, condition_keys
-        )
-
-        # Score generated samples using Mahalanobis
-        realism_global_z = compute_global_realism_z(
-            gen_feats, global_stats, real_E_mean, real_E_std, two_sided=False
-        )
-        faithfulness_margin_z, _ = compute_factorized_faithfulness_margin_z(
-            gen_feats, gen_meta, factorized_stats, condition_keys, margin_calib
-        )
-        trust_updated = realism_global_z + faithfulness_margin_z
-
-        global_stats_summary = {
-            "n_samples": global_stats["n_samples"],
-            "scoring_method": "mahalanobis",
-            "shrinkage": global_stats.get("shrinkage", float("nan")),
-            "real_E_mean": real_E_mean,
-            "real_E_std": real_E_std,
-        }
+    method_out = _SCORERS[scoring_method](
+        real_used_feats=real_used_feats,
+        real_used_meta=real_used_meta,
+        gen_feats=gen_feats,
+        gen_meta=gen_meta,
+        condition_keys=condition_keys,
+        dataset=dataset,
+        use_shared_cov=use_shared_cov,
+        **method_kwargs,
+    )
 
     # Alaa et al. metrics (computed in the same feature space)
     alpha_res = compute_alpha_precision_scores(
@@ -1493,7 +958,7 @@ def compute_trust_results_from_features(
         get_condition_key(gen_meta, condition_keys, i) for i in range(len(gen_feats))
     ]
 
-    return {
+    out: Dict[str, Any] = {
         "dataset": dataset,
         "model": model,
         "feature_type": feature_type,
@@ -1511,12 +976,9 @@ def compute_trust_results_from_features(
         "gen_center_dist_gen": beta_res["gen_center_dist"],
         "authenticity": authenticity,
         "true_conditions": true_conditions,
-        "realism_global_z": realism_global_z,
-        "faithfulness_margin_z": faithfulness_margin_z,
-        "trust_updated": trust_updated,
-        "global_stats_summary": global_stats_summary,
-        "margin_calib": margin_calib,
     }
+    out.update(method_out)
+    return out
 
 
 def fit_trust_scoring_components(
@@ -1525,35 +987,8 @@ def fit_trust_scoring_components(
     condition_keys: List[str],
     regularization: float = 1e-5,
     use_shared_cov: bool = True,
-    scoring_method: str = "mahalanobis",
-    knn_k: int = 10,
 ) -> Dict[str, Any]:
-    """
-    Fit all components needed for trust scoring: Gaussian stats + calibration.
-
-    This function fits:
-    - Global Gaussian (mu, precision) for realism scoring
-    - Per-attribute Gaussians for faithfulness margin scoring
-    - Calibration mean/std for z-scoring (computed on the same calib set)
-
-    Args:
-        calib_feats: Features to fit on (N, D)
-        calib_meta: Metadata dict with condition keys
-        condition_keys: List of attribute names
-        regularization: Regularization for covariance
-        use_shared_cov: Use shared covariance across attribute values
-        scoring_method: "mahalanobis" (default) or "knn"
-        knn_k: Number of neighbors for kNN scoring
-
-    Returns:
-        Dict with all fitted components
-    """
-    if scoring_method == "knn":
-        return fit_knn_scoring_components(
-            calib_feats, calib_meta, condition_keys, k=knn_k, metric="cosine"
-        )
-
-    # Mahalanobis-based (default)
+    """Fit Mahalanobis scoring components (global + factorized stats + calibration)."""
     factorized_stats = fit_factorized_stats(
         calib_feats,
         calib_meta,
@@ -1596,12 +1031,6 @@ def score_trust_from_components(
     Returns:
         Tuple of (realism_z, faithfulness_z, trust_z) arrays of shape (N,)
     """
-    scoring_method = components.get("scoring_method", "mahalanobis")
-
-    if scoring_method == "knn":
-        return score_trust_from_knn_components(feats, meta, components)
-
-    # Mahalanobis-based (default)
     global_stats = components["global_stats"]
     factorized_stats = components["factorized_stats"]
     real_E_mean = components["real_E_mean"]
@@ -1627,51 +1056,21 @@ def compute_real_sample_scores(
     filter_by_seen: bool = False,
     seen_combos: set = None,
     components: Optional[Dict[str, Any]] = None,
-    scoring_method: str = "mahalanobis",
-    knn_k: int = 10,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute realism_z, faithfulness_z, and trust_z for real samples.
-
-    This uses the exact same scoring pipeline as generated samples:
-      - pick a calibration real subset (optionally restricted to seen combos)
-      - fit global + factorized stats on that subset
-      - calibrate energy + margins on that subset
-      - score the provided real_feats/real_meta against that calibration
-
-    Args:
-        real_feats: Real features to score (N, D)
-        real_meta: Metadata dict with condition keys
-        condition_keys: List of attribute names
-        filter_by_seen: If True, only use seen combos for calibration
-        seen_combos: Set of seen condition tuples (for marginal models)
-        components: Optional pre-fit components. If provided, uses these
-                   instead of fitting on real_feats (avoids calibration bias).
-        scoring_method: "mahalanobis" (default) or "knn"
-        knn_k: Number of neighbors for kNN scoring
-
-    Returns:
-        (realism_z, faithfulness_z, trust_z) arrays of shape (N,)
-    """
+    """Compute realism_z, faithfulness_z, and trust_z for real samples (Mahalanobis)."""
     if components is not None:
-        # Use pre-fit components (cross-fit scenario)
         return score_trust_from_components(real_feats, real_meta, components)
 
-    # Fit on filtered subset (original behavior, has calibration bias)
     calib_feats, calib_meta = filter_feats_and_meta_by_seen_combos(
         real_feats, real_meta, condition_keys, seen_combos if filter_by_seen else None
     )
-
-    use_shared_cov = True  # LDA-style shared covariance for fair margin comparison
     components = fit_trust_scoring_components(
         calib_feats,
         calib_meta,
         condition_keys,
         regularization=1e-5,
-        use_shared_cov=use_shared_cov,
-        scoring_method=scoring_method,
-        knn_k=knn_k,
+        use_shared_cov=True,
     )
-
     return score_trust_from_components(real_feats, real_meta, components)
 
 

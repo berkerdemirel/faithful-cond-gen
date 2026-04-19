@@ -373,6 +373,7 @@ class CelebaDataModule(pl.LightningDataModule):
         split: str,
         batch_size: Optional[int] = None,
         shuffle: Optional[bool] = None,
+        drop_last: Optional[bool] = None,
         override_cfg: Optional[Dict] = None,
     ) -> DataLoader:
         ds = self.get_dataset(split=split, override_cfg=override_cfg)
@@ -383,13 +384,16 @@ class CelebaDataModule(pl.LightningDataModule):
         if shuffle is None:
             shuffle = split.lower() == "train"
 
+        if drop_last is None:
+            drop_last = split.lower() == "train"
+
         return DataLoader(
             ds,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=self.cfg.num_workers,
             pin_memory=True,
-            drop_last=(split.lower() == "train"),
+            drop_last=drop_last,
         )
 
     def available_conditions(self, split: str = "train") -> pd.DataFrame:

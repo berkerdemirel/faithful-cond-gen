@@ -574,6 +574,7 @@ class RxRx1DataModule(pl.LightningDataModule):
         perturbations: Optional[Sequence[int]] = None,
         batch_size: Optional[int] = None,
         shuffle: Optional[bool] = None,
+        drop_last: Optional[bool] = None,
         override_cfg: Optional[Dict] = None,
     ) -> DataLoader:
         dataset = self.get_dataset(
@@ -589,13 +590,16 @@ class RxRx1DataModule(pl.LightningDataModule):
         if shuffle is None:
             shuffle = split == "train"
 
+        if drop_last is None:
+            drop_last = split == "train"
+
         return DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=self.cfg.num_workers,
             pin_memory=True,
-            drop_last=(split == "train"),
+            drop_last=drop_last,
         )
 
     def available_conditions(self, split: str = "train") -> pd.DataFrame:

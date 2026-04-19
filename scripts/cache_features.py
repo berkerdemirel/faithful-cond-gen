@@ -33,10 +33,17 @@ CONFIG_MAP = {
     "dinov2": DINOV2_L14,
     "dinov3": DINOV3_L16,
     "dinov3_meanpatch": None,  # Special: uses REPAEncoder, not eval encoder
+    "siglip_meanpatch": None,  # Special: uses REPAEncoder with SigLIP, not eval encoder
     "mae": MAE_LARGE,
     "siglip": SIGLIP_SO400M,
     "bioclip": BIOCLIP,
     "openphenom": OPENPHENOM,
+}
+
+# Map from meanpatch encoder key to REPAEncoder name
+MEANPATCH_ENCODER_MAP = {
+    "dinov3_meanpatch": "dinov3-vit-l",
+    "siglip_meanpatch": "siglip",
 }
 
 # --- Utils for Generated Data ---
@@ -512,8 +519,8 @@ def main(cfg: DictConfig):
 
     enc_config = CONFIG_MAP[enc_name]
 
-    # Special case: dinov3_meanpatch uses REPAEncoder, not eval encoder
-    is_meanpatch = enc_name == "dinov3_meanpatch"
+    # Special case: *_meanpatch uses REPAEncoder, not eval encoder
+    is_meanpatch = enc_name in MEANPATCH_ENCODER_MAP
 
     if is_meanpatch:
         log.info(f"Selected Encoder: {enc_name} (REPAEncoder meanpatch mode)")
@@ -564,8 +571,9 @@ def main(cfg: DictConfig):
                 pin_memory=True,
                 persistent_workers=True,
             )
-            save_path_meanpatch = os.path.join(model_dir, "dinov3_meanpatch_features.pt")
-            extract_and_save_meanpatch(loader_raw, device, save_path_meanpatch, encoder_name="dinov3-vit-l", image_size=256)
+            meanpatch_enc = MEANPATCH_ENCODER_MAP[enc_name]
+            save_path_meanpatch = os.path.join(model_dir, f"{enc_name}_features.pt")
+            extract_and_save_meanpatch(loader_raw, device, save_path_meanpatch, encoder_name=meanpatch_enc, image_size=256)
         else:
             gen_dataset = GeneratedDataset(
                 root_dir=generated_path,
@@ -585,7 +593,7 @@ def main(cfg: DictConfig):
             save_path = os.path.join(model_dir, f"{enc_name}_features.pt")
             extract_and_save(loader, encoder, save_path, device)
 
-        # Also save meanpatch features if requested
+        # Also save dinov3 meanpatch features if requested
         if not is_meanpatch and cfg.get("also_save_meanpatch", False):
             # Create raw dataset (no encoder normalization)
             gen_dataset_raw = GeneratedDatasetRaw(
@@ -652,10 +660,10 @@ def main(cfg: DictConfig):
         os.makedirs(feature_cache_dir, exist_ok=True)
         log.info(f"Output Directory: {feature_cache_dir}")
 
+        # Use drop_last=False for feature caching — we want all samples
         loaders = {
-            "train": dm.train_dataloader(),
-            "val": dm.val_dataloader(),
-            # "test": dm.test_dataloader() # Optional
+            "train": dm.get_dataloader("train", shuffle=False, drop_last=False),
+            "val": dm.get_dataloader("val", shuffle=False, drop_last=False),
         }
 
         for split_name, loader in loaders.items():
@@ -664,7 +672,8 @@ def main(cfg: DictConfig):
             save_path = os.path.join(feature_cache_dir, f"{split_name}_features.pt")
             log.info(f"Processing split: {split_name}...")
             if is_meanpatch:
-                extract_and_save_meanpatch(loader, device, save_path, encoder_name="dinov3-vit-l", image_size=256)
+                meanpatch_enc = MEANPATCH_ENCODER_MAP[enc_name]
+                extract_and_save_meanpatch(loader, device, save_path, encoder_name=meanpatch_enc, image_size=256)
             else:
                 extract_and_save(loader, encoder, save_path, device)
 

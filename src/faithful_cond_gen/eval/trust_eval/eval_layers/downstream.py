@@ -316,7 +316,10 @@ def evaluate_rxrx1_downstream_bin_selection(
     Mirrors evaluate_downstream_bin_selection_from_scores for RxRx1.
     Two modes:
     - "celltype": 4 conditions (one per cell type), 4-way classifier, bin within cell type
-    - "100pairs": 100 (cell_type_id, sirna_id) pairs (25 per cell type, include heldout), 100-way classifier
+    - "subset":   canonical 50-condition eval subset (25 seen + 25 unseen) from
+                  load_rxrx1_subset(), 50-way classifier. The hand-rolled pair
+                  selection that used to live here was removed in favor of the
+                  subset loader.
 
     Args:
         trust_results: Dict with scores and true_conditions (from compute_trust_results_from_features)
@@ -358,14 +361,19 @@ def evaluate_rxrx1_downstream_bin_selection(
                      else real_meta["cell_type_id"][i])
             real_by_cond.setdefault((ct,), []).append(i)
 
-    elif mode == "100pairs":
-        # Select 100 (cell_type, sirna) pairs: 25/cell type, include heldout
-        gen_by_cond: Dict[Tuple[int, int], List[int]] = {}
-        for i in range(n_gen):
-            cond = true_conditions[i]  # already (ct, sirna)
-            gen_by_cond.setdefault(cond, []).append(i)
+    elif mode == "subset":
+        # Canonical 50-condition eval subset (25 seen + 25 unseen). The selection
+        # is fixed in outputs/posthoc_alignment/rxrx1_eval_subset_final.json; no
+        # random per-run picking. Inputs should already be subset-filtered by
+        # feature_io.py, but we filter again defensively.
+        from faithful_cond_gen.eval.trust_eval.subset_io import load_rxrx1_subset
 
-        real_by_cond_full: Dict[Tuple[int, int], List[int]] = {}
+        selected: Set[Tuple[int, int]] = load_rxrx1_subset()
+
+        working_indices = [i for i, cond in enumerate(true_conditions) if cond in selected]
+        working_conditions = [true_conditions[i] for i in working_indices]
+
+        real_by_cond: Dict[Tuple[int, int], List[int]] = {}
         for i in range(len(real_feats)):
             ct = int(real_meta["cell_type_id"][i].item()
                      if isinstance(real_meta["cell_type_id"][i], torch.Tensor)
@@ -373,37 +381,16 @@ def evaluate_rxrx1_downstream_bin_selection(
             sirna = int(real_meta["sirna_id"][i].item()
                         if isinstance(real_meta["sirna_id"][i], torch.Tensor)
                         else real_meta["sirna_id"][i])
-            real_by_cond_full.setdefault((ct, sirna), []).append(i)
+            cond = (ct, sirna)
+            if cond in selected:
+                real_by_cond.setdefault(cond, []).append(i)
 
-        cell_types = sorted(set(c[0] for c in gen_by_cond.keys()))
-        n_per_cell = 100 // max(len(cell_types), 1)
-
-        selected: Set[Tuple[int, int]] = set()
-        for ct in cell_types:
-            # Heldout pairs available for this cell type
-            ct_heldout = [(ct, s) for (c, s) in RXRX1_HELDOUT_PAIRS
-                          if c == ct and (ct, s) in gen_by_cond and (ct, s) in real_by_cond_full]
-            selected.update(ct_heldout)
-            # Fill remaining slots with seen pairs by support size
-            ct_seen = [(ct, sirna, len(gen_by_cond[(ct, sirna)]))
-                       for sirna in set(c[1] for c in gen_by_cond if c[0] == ct)
-                       if (ct, sirna) not in selected and (ct, sirna) in real_by_cond_full]
-            ct_seen.sort(key=lambda x: x[2], reverse=True)
-            n_already = sum(1 for c in selected if c[0] == ct)
-            for pair_ct, sirna, _ in ct_seen[:max(0, n_per_cell - n_already)]:
-                selected.add((pair_ct, sirna))
-
-        print(f"    Selected {len(selected)} pairs ({len([c for c in selected if c in RXRX1_HELDOUT_PAIRS])} heldout)")
-
-        # Filter gen samples to selected pairs
-        working_indices = [i for i, cond in enumerate(true_conditions) if cond in selected]
-        working_conditions = [true_conditions[i] for i in working_indices]
-
-        # Real: group by (ct, sirna) for selected pairs only
-        real_by_cond = {cond: real_by_cond_full[cond]
-                        for cond in selected if cond in real_by_cond_full}
+        n_heldout_selected = len([c for c in selected if c in RXRX1_HELDOUT_PAIRS])
+        per_ct = {ct: sum(1 for c in selected if c[0] == ct) for ct in sorted({c[0] for c in selected})}
+        print(f"    Subset: {len(selected)} conds ({n_heldout_selected} unseen, {len(selected) - n_heldout_selected} seen)")
+        print(f"    Per cell type: {per_ct}")
     else:
-        raise ValueError(f"Unknown mode: {mode!r}. Expected 'celltype' or '100pairs'.")
+        raise ValueError(f"Unknown mode: {mode!r}. Expected 'celltype' or 'subset'.")
 
     working_gen_feats = gen_feats[working_indices]
     n_working = len(working_indices)
@@ -690,44 +677,18 @@ def evaluate_controlled_perturbation_classification(
         cond = (cell_type, sirna)
         real_by_cond.setdefault(cond, []).append(i)
 
-    # Get unique cell types
-    cell_types = sorted(set(c[0] for c in gen_by_cond.keys()))
+    # Use the canonical 50-condition eval subset as the class set. Inputs are
+    # already subset-filtered upstream; we just intersect with what's actually
+    # present on both sides.
+    from faithful_cond_gen.eval.trust_eval.subset_io import load_rxrx1_subset
+
+    subset = load_rxrx1_subset()
+    selected_conditions: Set[Tuple[int, int]] = {
+        c for c in subset if c in gen_by_cond and c in real_by_cond
+    }
+
+    cell_types = sorted({c[0] for c in selected_conditions})
     print(f"    Found {len(cell_types)} cell types: {cell_types}")
-
-    # Separate heldout pairs per cell type
-    heldout_by_cell: Dict[int, Set[int]] = {ct: set() for ct in cell_types}
-    for cell_type, sirna in RXRX1_HELDOUT_PAIRS:
-        if cell_type in heldout_by_cell:
-            heldout_by_cell[cell_type].add(sirna)
-
-    # Select perturbations per cell type
-    # Strategy: pick top K by support size, but reserve some slots for heldout
-    selected_conditions: Set[Tuple[int, int]] = set()
-
-    # First, select some heldout pairs (distributed across cell types)
-    n_heldout_per_cell = n_heldout_per_experiment // len(cell_types)
-    for cell_type in cell_types:
-        cell_heldout = [(cell_type, s) for s in heldout_by_cell[cell_type]
-                        if (cell_type, s) in gen_by_cond and (cell_type, s) in real_by_cond]
-        n_to_select = min(n_heldout_per_cell, len(cell_heldout))
-        if n_to_select > 0:
-            selected_heldout = rng.choice(cell_heldout, size=n_to_select, replace=False)
-            selected_conditions.update(tuple(c) for c in selected_heldout)
-
-    # Then fill remaining slots with seen perturbations (by support size)
-    for cell_type in cell_types:
-        # Get perturbations for this cell type (not already selected)
-        cell_perts = [(cell_type, sirna, len(gen_by_cond.get((cell_type, sirna), [])))
-                      for sirna in set(c[1] for c in gen_by_cond.keys() if c[0] == cell_type)
-                      if (cell_type, sirna) not in selected_conditions
-                      and (cell_type, sirna) in real_by_cond]
-
-        # Sort by support size (descending) and select top K - already_selected
-        cell_perts.sort(key=lambda x: x[2], reverse=True)
-        n_already = sum(1 for c in selected_conditions if c[0] == cell_type)
-        n_to_add = max(0, n_perturbations_per_cell - n_already)
-        for ct, sirna, _ in cell_perts[:n_to_add]:
-            selected_conditions.add((ct, sirna))
 
     # Build class mapping
     selected_list = sorted(selected_conditions)
@@ -878,25 +839,15 @@ def evaluate_rxrx1_decomposed_classification(
     real_pairs = set(zip(real_ct, real_sirna))
     common_pairs = gen_pairs & real_pairs
 
-    # Separate heldout and seen
-    heldout_available = [p for p in RXRX1_HELDOUT_PAIRS if p in common_pairs]
-    seen_available = [p for p in common_pairs if p not in RXRX1_HELDOUT_PAIRS]
+    # Use the canonical 50-condition eval subset. `common_pairs` is the
+    # intersection that's actually present on both sides after subset filtering,
+    # so it should already coincide with the subset.
+    from faithful_cond_gen.eval.trust_eval.subset_io import load_rxrx1_subset
 
-    if len(heldout_available) < n_heldout:
-        print(f"    Warning: Only {len(heldout_available)} heldout pairs available (requested {n_heldout})")
-    if len(seen_available) < n_seen:
-        print(f"    Warning: Only {len(seen_available)} seen pairs available (requested {n_seen})")
-
-    selected_heldout = [tuple(p) for p in rng.choice(
-        heldout_available,
-        size=min(n_heldout, len(heldout_available)),
-        replace=False
-    )]
-    selected_seen = [tuple(p) for p in rng.choice(
-        seen_available,
-        size=min(n_seen, len(seen_available)),
-        replace=False
-    )]
+    subset = load_rxrx1_subset()
+    usable = [p for p in subset if p in common_pairs]
+    selected_heldout = sorted(p for p in usable if p in RXRX1_HELDOUT_PAIRS)
+    selected_seen = sorted(p for p in usable if p not in RXRX1_HELDOUT_PAIRS)
     all_selected = selected_heldout + selected_seen
     n_classes = len(all_selected)
 

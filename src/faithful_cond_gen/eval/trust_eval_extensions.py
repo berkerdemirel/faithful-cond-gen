@@ -45,15 +45,6 @@ from faithful_cond_gen.eval.trust_eval.scoring_core import (
     score_trust_from_components,
     compute_real_sample_scores,
     dedupe_generated,
-    # kNN scoring
-    fit_knn_global_stats,
-    compute_real_calibration_for_global_knn,
-    compute_global_realism_knn_z,
-    fit_knn_factorized_stats,
-    compute_real_calibration_for_factorized_knn_margins,
-    compute_factorized_faithfulness_knn_margin_z,
-    fit_knn_scoring_components,
-    score_trust_from_knn_components,
 )
 
 __all__ = [
@@ -87,13 +78,4 @@ __all__ = [
     "score_trust_from_components",
     "compute_real_sample_scores",
     "dedupe_generated",
-    # kNN scoring
-    "fit_knn_global_stats",
-    "compute_real_calibration_for_global_knn",
-    "compute_global_realism_knn_z",
-    "fit_knn_factorized_stats",
-    "compute_real_calibration_for_factorized_knn_margins",
-    "compute_factorized_faithfulness_knn_margin_z",
-    "fit_knn_scoring_components",
-    "score_trust_from_knn_components",
 ]
