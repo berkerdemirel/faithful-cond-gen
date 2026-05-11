@@ -901,9 +901,24 @@ def _compute_scores_mahalanobis(
     }
 
 
+def _get_ablation_scorers() -> Dict[str, Any]:
+    """Lazy import to avoid pulling sklearn/scipy/transformers at module import time."""
+    from faithful_cond_gen.eval.trust_eval.scorers_ablation import (
+        compute_scores_clip,
+        compute_scores_knn_per_attr,
+        compute_scores_linear_probe,
+    )
+    return {
+        "linear_probe": compute_scores_linear_probe,
+        "clip": compute_scores_clip,
+        "knn_per_attr": compute_scores_knn_per_attr,
+    }
+
+
 _SCORERS = {
     "mahalanobis": _compute_scores_mahalanobis,
 }
+_SCORERS.update(_get_ablation_scorers())
 
 
 def compute_trust_results_from_features(

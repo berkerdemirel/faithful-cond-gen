@@ -35,6 +35,8 @@ adaptive_cfg: false
 # Feature extraction options (for generate_samples_repa.py)
 feature_capture_idx: null  # null=final step; int=specific step; list=multiple steps; "all"=every step
 use_raw_hidden: false  # If true, capture pre-MLP diffusion hidden state instead of projected features
+return_x0hat: false  # If true, also save x0_hat latents at each capture step (for image-distance analysis)
+condition_subset_path: null  # If set, restrict gen to (cell_type_id, sirna_id) pairs in this JSON
 
 # DDP
 num_gpus: 8

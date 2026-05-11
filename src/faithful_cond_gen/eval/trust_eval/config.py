@@ -212,10 +212,37 @@ FEATURE_CONFIGS: Dict[Tuple[str, str, str], Tuple[str, str]] = {
         "rxrx1_repa_siglip_full_v1",
         "posthoc_mapped",
     ),
+    # CelebA vanilla_marginal timestep ablation — raw hidden captured at 10 denoising
+    # steps, mapped via the whit_geom posthoc mapper. Gen raw-hidden source is the
+    # consolidated aligned_mean_features_step{k}.pt written by generate_samples_repa.py
+    # with use_raw_hidden=true. Dinov3 row used for KID ground-truth + oracle.
+    ("celeba", "vanilla_marginal_ts", "dinov3"): (
+        "celeba_vanilla_marginal_timesteps",
+        "dinov3_meanpatch_features.pt",
+    ),
+    **{
+        ("celeba", "vanilla_marginal_ts", f"posthoc_step{_k}"): (
+            "celeba_vanilla_marginal_timesteps",
+            f"aligned_mean_features_step{_k}.pt",
+        )
+        for _k in [0, 27, 55, 83, 110, 138, 166, 193, 221, 248]
+    },
+    # RxRx1 vanilla_marginal timestep ablation — same recipe, restricted to the
+    # canonical 50-pair eval subset (rxrx1_eval_subset_final.json).
+    ("rxrx1", "vanilla_marginal_ts", "dinov3"): (
+        "rxrx1_vanilla_marginal_timesteps",
+        "dinov3_meanpatch_features.pt",
+    ),
+    **{
+        ("rxrx1", "vanilla_marginal_ts", f"posthoc_step{_k}"): (
+            "rxrx1_vanilla_marginal_timesteps",
+            f"aligned_mean_features_step{_k}.pt",
+        )
+        for _k in [0, 27, 55, 83, 110, 138, 166, 193, 221, 248]
+    },
 }
 
-# TEMPORARY: restrict this run to the posthoc_mapped rollout plus the
-# postgen dinov3 baseline for the 6 core rxrx1 models (openphenom excluded).
+# TEMPORARY: restrict this run to DINOv3 meanpatch for the scorer ablation sweep.
 # Revert by deleting this block to re-enable all baselines.
 _CORE_RXRX1 = {
     "vanilla_full", "vanilla_marginal",
@@ -224,7 +251,7 @@ _CORE_RXRX1 = {
 }
 FEATURE_CONFIGS = {
     k: v for k, v in FEATURE_CONFIGS.items()
-    if k[2] == "posthoc_mapped"
+    if k[2] == "dinov3" or k[2].startswith("posthoc_step")
 }
 
 # Real feature paths - use meanpatch for dinov3 comparisons
@@ -278,6 +305,9 @@ POSTHOC_MODEL_KEYS: Dict[Tuple[str, str], str] = {
     ("rxrx1", "repa_full"): "rxrx1_repa_full_v1",
     ("rxrx1", "repa_marginal"): "rxrx1_repa_marginal_v1",
     ("rxrx1", "repa_siglip_full"): "rxrx1_repa_siglip_full_v1",
+    # Timestep-ablation alias — same underlying checkpoint, different feature_type semantics
+    ("celeba", "vanilla_marginal_ts"): "celeba_vanilla_marginal_v1",
+    ("rxrx1", "vanilla_marginal_ts"): "rxrx1_vanilla_marginal_v1",
 }
 
 # NOTE: For consistent KID computation, all features should use the same extraction method:

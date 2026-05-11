@@ -14,6 +14,7 @@ from faithful_cond_gen.model.repa_encoder import REPAEncoder
 # Import Encoders
 from faithful_cond_gen.eval.configs.encoder_config import (
     BIOCLIP,
+    CLIP_VITB16,
     DINOV2_L14,
     DINOV3_L16,
     MAE_LARGE,
@@ -38,6 +39,7 @@ CONFIG_MAP = {
     "siglip": SIGLIP_SO400M,
     "bioclip": BIOCLIP,
     "openphenom": OPENPHENOM,
+    "clip-vitb16": CLIP_VITB16,
 }
 
 # Map from meanpatch encoder key to REPAEncoder name

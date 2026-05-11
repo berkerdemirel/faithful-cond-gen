@@ -265,7 +265,10 @@ def verify_consolidated_features(
 
 
 def _load_posthoc_mapped_features(
-    dataset: str, model: str, normalize_mode: str = "none"
+    dataset: str,
+    model: str,
+    normalize_mode: str = "none",
+    gen_override_path: Optional[Path] = None,
 ) -> Tuple[
     Optional[torch.Tensor], Optional[Dict], Optional[torch.Tensor], Optional[Dict]
 ]:
@@ -274,6 +277,10 @@ def _load_posthoc_mapped_features(
 
     Real: raw_hidden at t=0.01 -> mapper -> 1152-dim features
     Gen: gen_cache cond_*.pt raw_hidden -> mapper -> 1152-dim features
+
+    If gen_override_path is set, load gen raw hidden from a consolidated
+    {features, metadata} shard (as written by generate_samples_repa.py with
+    use_raw_hidden=true) instead of the diag/gen_cache/cond_*.pt pipeline.
     """
     from faithful_cond_gen.posthoc_alignment.mapper import ResidualAlignmentMapper
 
@@ -358,7 +365,24 @@ def _load_posthoc_mapped_features(
     #   - RxRx1: feature_cache_rxrx1_subset/{model_key}_encoded.pt (built by
     #            filter + Step-5 partial regen). It stores gen_hidden directly
     #            for the canonical 50-condition subset.
-    if dataset == "rxrx1":
+    if gen_override_path is not None:
+        if not gen_override_path.exists():
+            logger.warning(f"Posthoc gen override not found at {gen_override_path}")
+            return None, None, None, None
+        cache = torch.load(gen_override_path, map_location="cpu", weights_only=False)
+        gen_hidden = cache["features"]
+        cache_meta = cache.get("metadata", {})
+        gen_meta = {k: cache_meta[k] for k in condition_keys if k in cache_meta}
+        if dataset == "rxrx1":
+            gen_hidden, gen_meta = filter_rxrx1_to_subset(gen_hidden, gen_meta)
+        if src_mean is not None:
+            gen_hidden = l2_normalize_features(gen_hidden - src_mean)
+        with torch.no_grad():
+            gen_feats = mapper(gen_hidden)
+        logger.info(
+            f"  Posthoc gen (override): {gen_feats.shape} from {gen_override_path}"
+        )
+    elif dataset == "rxrx1":
         subset_cache = Path(
             f"outputs/posthoc_alignment/feature_cache_rxrx1_subset/{model_key}_encoded.pt"
         )
@@ -499,6 +523,20 @@ def load_features_for_dataset(
     # Posthoc mapped features use a completely different loading path
     if feature_type == "posthoc_mapped":
         return _load_posthoc_mapped_features(dataset, model, normalize_mode)
+
+    # Posthoc mapped at a specific denoising step (timestep ablation).
+    # Gen raw hidden comes from the consolidated aligned_mean_features_step{k}.pt
+    # produced by generate_samples_repa.py with use_raw_hidden=true.
+    if feature_type.startswith("posthoc_step"):
+        config_key = (dataset, model, feature_type)
+        if config_key not in FEATURE_CONFIGS:
+            logger.warning(f"No config for {config_key}")
+            return None, None, None, None
+        gen_dir, feature_file = FEATURE_CONFIGS[config_key]
+        gen_override = Path(f"outputs/gen/{gen_dir}/{feature_file}")
+        return _load_posthoc_mapped_features(
+            dataset, model, normalize_mode, gen_override_path=gen_override
+        )
 
     # Get feature config
     config_key = (dataset, model, feature_type)

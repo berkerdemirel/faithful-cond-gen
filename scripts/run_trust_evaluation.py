@@ -119,9 +119,26 @@ Examples:
     parser.add_argument(
         "--scoring-method",
         type=str,
-        choices=["mahalanobis"],
+        choices=["mahalanobis", "linear_probe", "clip", "knn_per_attr"],
         default="mahalanobis",
-        help="Scoring method for realism/faithfulness. Currently only 'mahalanobis' is supported.",
+        help="Scoring method. 'mahalanobis' (default): global energy + per-attribute "
+        "margin in feature space. 'linear_probe': per-attribute logistic-regression "
+        "energy summed over attributes. 'clip': CLIP image-text alignment vs. joint "
+        "combo prompts (CelebA only). 'knn_per_attr': cosine distance to k-th NN "
+        "within target-class real subset, summed across attributes. All: lower = better.",
+    )
+    parser.add_argument(
+        "--clip-cache-dir",
+        type=str,
+        default="outputs/real_celeba_clip-vitb16",
+        help="Directory holding cached real CLIP features (train_features.pt). "
+        "Per-model gen CLIP features are loaded from outputs/gen/{model_dir}/clip-vitb16_features.pt.",
+    )
+    parser.add_argument(
+        "--knn-k",
+        type=int,
+        default=5,
+        help="k for --scoring-method knn_per_attr (k-th nearest neighbour distance). Default: 5.",
     )
     parser.add_argument(
         "--use-zkid",
@@ -180,6 +197,11 @@ Examples:
         str, Tuple[torch.Tensor, Dict, torch.Tensor, Dict]
     ] = {}
 
+    if scoring_method == "clip" and args.dataset != "celeba":
+        raise SystemExit(
+            "--scoring-method clip is CelebA-only (requires per-condition text prompts)."
+        )
+
     for (cfg_dataset, model, feature_type), _cfg in FEATURE_CONFIGS.items():
         if cfg_dataset != args.dataset:
             continue
@@ -193,6 +215,28 @@ Examples:
         )
         if real_feats is None or gen_feats is None:
             continue
+
+        # CLIP scorer: swap the scoring features to cached CLIP image embeddings.
+        # gen_dir for posthoc configs is suffixed with "_v1" — strip it because
+        # CLIP features were extracted from the model's standard generation dir.
+        if scoring_method == "clip":
+            gen_dir, _filename = _cfg
+            base_dir = gen_dir[:-3] if gen_dir.endswith("_v1") else gen_dir
+            gen_clip_path = Path(f"outputs/gen/{base_dir}/clip-vitb16_features.pt")
+            real_clip_path = Path(args.clip_cache_dir) / "train_features.pt"
+            if not gen_clip_path.exists() or not real_clip_path.exists():
+                logger.warning(
+                    f"CLIP features missing (gen={gen_clip_path.exists()}, "
+                    f"real={real_clip_path.exists()}); skipping {config_key}"
+                )
+                continue
+            clip_real = torch.load(real_clip_path, map_location="cpu", weights_only=False)
+            clip_gen = torch.load(gen_clip_path, map_location="cpu", weights_only=False)
+            real_feats = clip_real["features"]
+            real_meta = clip_real.get("metadata", real_meta)
+            gen_feats = clip_gen["features"]
+            gen_meta = clip_gen.get("metadata", gen_meta)
+            print(f"    CLIP features loaded: real={real_feats.shape}, gen={gen_feats.shape}")
 
         feature_cache[(model, feature_type)] = (
             real_feats,
@@ -248,6 +292,8 @@ Examples:
             condition_keys=condition_keys,
             filter_by_seen=filter_by_seen,
             seen_combos=seen_combos,
+            scoring_method=scoring_method,
+            knn_k=args.knn_k,
         )
         all_results.append(trust_res)
 
@@ -317,10 +363,11 @@ Examples:
                     logger.error(f"FATAL: Cannot verify KID gen feature ordering (missing metadata)")
                     raise ValueError("KID gen feature ordering unverifiable - missing filename metadata")
                 print(f"    ✓ Verified: scoring and KID gen features have matching sample order")
-                # For posthoc_mapped, real features come from different sources
-                # (raw_hidden vs standard DINO) so size mismatch is expected
-                if feature_type == "posthoc_mapped":
-                    logger.info(f"  Skipping real verification for posthoc_mapped (different real sources)")
+                # For posthoc_mapped (and per-step posthoc_step{k}), real features
+                # come from different sources (raw_hidden vs standard DINO) so size
+                # mismatch is expected.
+                if feature_type == "posthoc_mapped" or feature_type.startswith("posthoc_step"):
+                    logger.info(f"  Skipping real verification for {feature_type} (different real sources)")
                 else:
                     verified_real = verify_feature_ordering(
                         real_meta, kid_real_meta, f"real_{feature_type}", "real_kid_dinov3"

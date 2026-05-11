@@ -685,6 +685,7 @@ class GeneratorWrapper(nn.Module):
         feature_capture_idx: Optional[Union[int, List[int], str]] = None,
         capture_at_t0: bool = False,
         return_raw_hidden: bool = False,
+        return_x0hat: bool = False,
     ):
         """REPA-style two-stage sampling (default sampler).
 
@@ -745,6 +746,7 @@ class GeneratorWrapper(nn.Module):
         # Feature capture setup
         capture_mode = None  # "single", "multiple", or "all"
         capture_list = []  # List of (k_idx, t_val, features) tuples for multiple capture
+        x0hat_capture_list = []  # Parallel list of (k_idx, t_val, x0_hat latent) when return_x0hat=True
         captured_features = None  # For single capture mode
         capture_indices_set = None
         final_idx = num_inference_steps - 1  # Index for Stage 2 capture
@@ -836,6 +838,10 @@ class GeneratorWrapper(nn.Module):
                     # Take first projector: (B, num_patches, D) -> (B, D)
                     pooled = zs_tilde[0].mean(dim=1).cpu()
                     capture_list.append((k, t_cur.item(), pooled))
+                    if return_x0hat:
+                        # Linear interpolant: x_0 = x_t - t*v
+                        x0_hat = (x - t_cur * v).detach().cpu()
+                        x0hat_capture_list.append((k, t_cur.item(), x0_hat))
                 else:  # single mode
                     captured_features = zs_tilde
             else:
@@ -886,6 +892,9 @@ class GeneratorWrapper(nn.Module):
             if capture_mode in ["all", "multiple"]:
                 pooled = zs_tilde[0].mean(dim=1).cpu()
                 capture_list.append((final_idx, t_cutoff, pooled))
+                if return_x0hat:
+                    x0_hat = (x - t_cutoff * v_final).detach().cpu()
+                    x0hat_capture_list.append((final_idx, t_cutoff, x0_hat))
             else:  # single mode
                 captured_features = zs_tilde
         else:
@@ -925,7 +934,11 @@ class GeneratorWrapper(nn.Module):
                         f"(capture_at_t0={capture_at_t0}), got {len(capture_list)}. "
                         f"This indicates a bug in feature capture logic."
                     )
+                if return_x0hat:
+                    return images, capture_list if capture_list else None, x0hat_capture_list if x0hat_capture_list else None
                 return images, capture_list if capture_list else None
             else:
+                if return_x0hat:
+                    return images, captured_features, None
                 return images, captured_features
         return images

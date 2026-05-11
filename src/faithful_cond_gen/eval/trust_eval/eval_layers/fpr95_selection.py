@@ -602,33 +602,38 @@ def evaluate_fpr95_selection(
         accept_indices = np.where(accept_mask)[0]
 
     if accept_indices is not None:
-        if cap_real_pool:
-            # Both gen and real proportionally downscaled so no real is reused.
-            g_acc_used, match_real_indices, cond_hist = _build_condmatched_capped(
-                accept_indices, gen_meta, kid_real_by_cond, condition_keys,
-                seed=seed + 700)
-        else:
-            # Legacy: real sampled (with replacement if needed) to match gen histogram.
-            match_real_indices, cond_hist = _build_condmatched_real(
-                accept_indices, gen_meta, kid_real_by_cond, condition_keys,
-                seed=seed + 700)
-            g_acc_used = accept_indices
-
-        # Global KID (accepted vs matched)
-        gen_accept_all = kid_gen_np[g_acc_used]
-        real_match_all = kid_real_np[match_real_indices]
-        kid_sample_size = min(len(gen_accept_all), len(real_match_all), 500)
-
+        # Mirror the random baseline protocol: redraw the condition-matched real
+        # pool inside the rep loop with a different seed each rep. This is the
+        # only source of variance when n_accept <= kid_sample_size, otherwise the
+        # permutation subsampling on the gen side adds further variance.
+        kid_sample_size_probe = min(len(accept_indices), 500)
         kid_accept_values = []
-        n_accept_repeats = n_random_repeats if len(gen_accept_all) > kid_sample_size else 1
+        cond_hist = {}
+        n_accept_repeats = n_random_repeats
         for rep in range(n_accept_repeats):
             rep_rng = np.random.default_rng(seed + 100 + rep)
-            perm_g = rep_rng.permutation(len(gen_accept_all))[:kid_sample_size]
-            perm_r = rep_rng.permutation(len(real_match_all))[:kid_sample_size]
-            if kid_sample_size >= 10:
-                kid_val = calculate_kid_same_m(gen_accept_all[perm_g], real_match_all[perm_r], use_cosine=True)
-                if np.isfinite(kid_val):
-                    kid_accept_values.append(kid_val)
+            if cap_real_pool:
+                g_acc_used, match_real_indices, cond_hist_rep = _build_condmatched_capped(
+                    accept_indices, gen_meta, kid_real_by_cond, condition_keys,
+                    seed=seed + 700 + rep)
+            else:
+                match_real_indices, cond_hist_rep = _build_condmatched_real(
+                    accept_indices, gen_meta, kid_real_by_cond, condition_keys,
+                    seed=seed + 700 + rep)
+                g_acc_used = accept_indices
+            if rep == 0:
+                cond_hist = cond_hist_rep
+            gen_accept_all = kid_gen_np[g_acc_used]
+            real_match_all = kid_real_np[match_real_indices]
+            ks = min(len(gen_accept_all), len(real_match_all), 500)
+            if ks < 10:
+                continue
+            perm_g = rep_rng.permutation(len(gen_accept_all))[:ks]
+            perm_r = rep_rng.permutation(len(real_match_all))[:ks]
+            kid_val = calculate_kid_same_m(gen_accept_all[perm_g], real_match_all[perm_r], use_cosine=True)
+            if np.isfinite(kid_val):
+                kid_accept_values.append(kid_val)
+        kid_sample_size = kid_sample_size_probe
 
         kid_accept = float(np.mean(kid_accept_values)) if kid_accept_values else np.nan
         kid_accept_std = float(np.std(kid_accept_values)) if len(kid_accept_values) > 1 else np.nan

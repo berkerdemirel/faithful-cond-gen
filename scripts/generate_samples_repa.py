@@ -212,6 +212,64 @@ def consolidate_aligned_features(
     }
 
 
+def consolidate_x0hat_shards(out_dir: str, shard_subdir: str) -> Dict:
+    """Consolidate per-condition x0hat shards into a single file aligned with the image index order."""
+    images_dir = Path(out_dir) / "images"
+    shard_dir = Path(out_dir) / shard_subdir
+
+    png_files = list(images_dir.glob("*.png"))
+    pt_files = list(images_dir.glob("*.pt"))
+    image_files = png_files if png_files else pt_files
+    if not image_files:
+        raise FileNotFoundError(f"No image files in {images_dir}")
+    sorted_filenames = [f.name for f in sorted(image_files, key=lambda p: p.name)]
+    N = len(sorted_filenames)
+
+    idx_mapping: Dict[Tuple[str, int], int] = {}
+    for gidx, fname in enumerate(sorted_filenames):
+        sig, local_idx = parse_filename(fname)
+        idx_mapping[(sig, local_idx)] = gidx
+
+    shard_files = sorted(shard_dir.glob("*_x0hat.pt"))
+    if not shard_files:
+        raise FileNotFoundError(f"No x0hat shards in {shard_dir}")
+
+    all_condition_keys = set()
+    idx_to_latent: Dict[int, torch.Tensor] = {}
+    idx_to_condition: Dict[int, Dict[str, int]] = {}
+    for shard_path in shard_files:
+        sig = shard_path.stem.replace("_x0hat", "")
+        data = torch.load(shard_path, map_location="cpu", weights_only=False)
+        latents = data["x0hat"]
+        local_indices = data.get("indices", list(range(latents.shape[0])))
+        if isinstance(local_indices, torch.Tensor):
+            local_indices = local_indices.tolist()
+        condition = data.get("condition", parse_condition_from_signature(sig))
+        all_condition_keys.update(condition.keys())
+        for i, local_idx in enumerate(local_indices):
+            key = (sig, local_idx)
+            if key not in idx_mapping:
+                continue
+            idx_to_latent[idx_mapping[key]] = latents[i]
+            idx_to_condition[idx_mapping[key]] = condition.copy()
+
+    condition_keys = sorted(all_condition_keys)
+    sorted_indices = sorted(idx_to_latent.keys())
+    latents_tensor = torch.stack([idx_to_latent[i] for i in sorted_indices], dim=0)
+    metadata = {
+        k: torch.tensor([idx_to_condition[i].get(k, 0) for i in sorted_indices], dtype=torch.long)
+        for k in condition_keys
+    }
+    filenames = [sorted_filenames[i] for i in sorted_indices]
+    return {
+        "x0hat": latents_tensor,
+        "metadata": metadata,
+        "indices": torch.tensor(sorted_indices, dtype=torch.long),
+        "filenames": filenames,
+        "n_samples": len(sorted_indices),
+    }
+
+
 # =============================================================================
 # DDP and generation utilities
 # =============================================================================
@@ -332,6 +390,26 @@ def main(cfg: DictConfig):
     else:
         dm = CelebaDataModule(dm_conf)
     all_conditions = get_conditions_list(cfg, dm)
+
+    # Optional subset filter (RxRx1 50-pair eval subset etc.)
+    subset_path = cfg.get("condition_subset_path", None)
+    if subset_path:
+        import json
+        with open(subset_path) as f:
+            payload = json.load(f)
+        rows = payload.get("seen", []) + payload.get("unseen", [])
+        subset = {(int(r["cell_type_id"]), int(r["sirna_id"])) for r in rows}
+        before = len(all_conditions)
+        all_conditions = [
+            c for c in all_conditions
+            if c["type"] == "rxrx1"
+            and (int(c["cond_ids"][0]), int(c["cond_ids"][1])) in subset
+        ]
+        log.info(
+            f"Condition subset filter: {before} -> {len(all_conditions)} "
+            f"(from {subset_path})"
+        )
+
     my_conditions = all_conditions[rank::world_size]
     log.info(f"[Rank {rank}] Assigned {len(my_conditions)} conditions.")
 
@@ -342,6 +420,7 @@ def main(cfg: DictConfig):
     if feature_capture_idx is not None and not isinstance(feature_capture_idx, (int, str)):
         feature_capture_idx = [int(x) for x in feature_capture_idx]  # OmegaConf ListConfig -> Python list of ints
     use_raw_hidden = cfg.get("use_raw_hidden", False)  # If True, capture pre-MLP diffusion hidden state
+    return_x0hat = cfg.get("return_x0hat", False)  # If True, also save x0_hat latent at each capture step
     is_multi_capture = isinstance(feature_capture_idx, list)
 
     # Resume support: check for existing aligned features
@@ -363,6 +442,9 @@ def main(cfg: DictConfig):
         generated_count = 0
         batch_idx = 0
         all_features_for_cond = {k: [] for k in feature_capture_idx} if is_multi_capture else []
+        all_x0hat_for_cond = (
+            {k: [] for k in feature_capture_idx} if (is_multi_capture and return_x0hat) else None
+        )
 
         while generated_count < samples_per_cond:
             current_bs = min(batch_size, samples_per_cond - generated_count)
@@ -373,7 +455,7 @@ def main(cfg: DictConfig):
 
             # Generate with aligned feature extraction
             with torch.no_grad():
-                images, aligned_features = pl_module.generator.sample(
+                sample_out = pl_module.generator.sample(
                     cond_ids=batch_cond_ids,
                     num_inference_steps=cfg.get("num_inference_steps", 250),
                     t_cutoff=cfg.get("t_cutoff", 0.04),
@@ -382,7 +464,13 @@ def main(cfg: DictConfig):
                     return_aligned_features=True,
                     feature_capture_idx=feature_capture_idx,
                     return_raw_hidden=use_raw_hidden,
+                    return_x0hat=return_x0hat,
                 )
+                if return_x0hat:
+                    images, aligned_features, x0hat_features = sample_out
+                else:
+                    images, aligned_features = sample_out
+                    x0hat_features = None
                 images = torch.clamp(images, 0, 1)
 
             # Collect aligned features (if available)
@@ -395,6 +483,11 @@ def main(cfg: DictConfig):
                     # Single capture: List[Tensor(B, num_patches, D)], take first projector
                     feats = aligned_features[0].cpu()
                     all_features_for_cond.append(feats)
+
+            # Collect x0_hat latents (multi-capture only)
+            if x0hat_features is not None and all_x0hat_for_cond is not None:
+                for k_idx, t_val, x0h in x0hat_features:
+                    all_x0hat_for_cond[k_idx].append(x0h)
 
             # Save images
             if data_type == "celeba":
@@ -434,6 +527,21 @@ def main(cfg: DictConfig):
                         "signature": signature,
                     }
                     torch.save(shard_data, os.path.join(step_feat_dir, feat_fname))
+                if all_x0hat_for_cond is not None:
+                    x0hat_fname = f"{signature}_x0hat.pt"
+                    for k_idx, x0h_list in all_x0hat_for_cond.items():
+                        step_x0_dir = os.path.join(out_dir, f"x0hat_features_step{k_idx}")
+                        os.makedirs(step_x0_dir, exist_ok=True)
+                        step_x0 = torch.cat(x0h_list, dim=0)  # (N, C, H, W)
+                        torch.save(
+                            {
+                                "x0hat": step_x0,
+                                "indices": list(range(step_x0.shape[0])),
+                                "condition": cond_dict,
+                                "signature": signature,
+                            },
+                            os.path.join(step_x0_dir, x0hat_fname),
+                        )
             else:
                 cond_features = torch.cat(all_features_for_cond, dim=0)
                 shard_data = {
@@ -466,6 +574,17 @@ def main(cfg: DictConfig):
                     log.info(f"Saved step {k_idx} features to {output_path}")
                 except Exception as e:
                     log.error(f"Consolidation failed for step {k_idx}: {e}")
+            if return_x0hat:
+                for k_idx in feature_capture_idx:
+                    try:
+                        result = consolidate_x0hat_shards(
+                            out_dir, shard_subdir=f"x0hat_features_step{k_idx}",
+                        )
+                        output_path = os.path.join(out_dir, f"x0hat_step{k_idx}.pt")
+                        torch.save(result, output_path)
+                        log.info(f"Saved step {k_idx} x0hat to {output_path}")
+                    except Exception as e:
+                        log.error(f"x0hat consolidation failed for step {k_idx}: {e}")
         else:
             try:
                 result = consolidate_aligned_features(out_dir, pooling="mean")
