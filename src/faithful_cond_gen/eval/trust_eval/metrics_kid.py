@@ -1,10 +1,4 @@
-"""
-KID (Kernel Inception Distance) computation utilities.
-
-This module consolidates KID computation from both run_trust_evaluation.py
-and trust_eval_extensions.py. The calculate_kid_same_m function preserves
-exact behavior from trust_eval_extensions.py (which has kid_mode parameter).
-"""
+"""KID (Kernel Inception Distance) computation utilities."""
 
 from typing import Dict, Tuple
 

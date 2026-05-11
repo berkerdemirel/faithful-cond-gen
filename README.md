@@ -61,7 +61,7 @@ PYTHONPATH=src uv run python scripts/posthoc_alignment/train_mapper.py \
 PYTHONPATH=src uv run python scripts/posthoc_alignment/eval_posthoc_alignment_rxrx1.py ...
 ```
 
-### 6. CellProfiler validation (RxRx1, Table 2 / Figure 2)
+### 6. CellProfiler validation (RxRx1)
 
 ```bash
 PYTHONPATH=src uv run python scripts/cp_morphology_validation.py
@@ -69,13 +69,10 @@ PYTHONPATH=src uv run python scripts/cp_decile_binning.py
 PYTHONPATH=src uv run python scripts/cp_decile_selection_plots.py
 ```
 
-### 7. Aggregate paper tables / figures
+### 7. Downstream classification (RxRx1)
 
 ```bash
-PYTHONPATH=src uv run python scripts/aggregate_fpr95_delta_kid.py
-PYTHONPATH=src uv run python scripts/aggregate_scorer_ablations.py
-PYTHONPATH=src uv run python scripts/plot_posthoc_timestep_story.py
-PYTHONPATH=src uv run python scripts/plot_trust_vs_kid_scatter.py
+PYTHONPATH=src uv run python scripts/run_rxrx1_downstream_isolated.py
 ```
 
 ## Checkpoints
@@ -96,8 +93,11 @@ src/faithful_cond_gen/
 ├── pl_modules/              # PyTorch Lightning wrapper
 ├── posthoc_alignment/       # during-gen translator (mapper, dataset, losses)
 ├── eval/
-│   ├── scoring/             # 9 scorers (cosine, knn, mahalanobis, ...)
-│   └── trust_eval/          # main evaluation pipeline + ablation
+│   ├── configs/             # encoder config dataclass
+│   ├── encoders/            # encoder registry (DINOv3, SigLIP, OpenPhenom, ...)
+│   └── trust_eval/          # main evaluation pipeline
+│       ├── scorers_ablation.py
+│       ├── subset_io.py
 │       └── eval_layers/     # ranking, binning, fpr95, failure detection, downstream, OOD
 └── utils/                   # config, checkpoints, metrics, flops
 
@@ -106,23 +106,25 @@ scripts/
 ├── generate_samples{,_repa}.py  # sample
 ├── cache_features.py            # feature extraction
 ├── run_trust_evaluation.py      # post-gen eval
+├── run_rxrx1_downstream_isolated.py  # downstream classification
 ├── posthoc_alignment/           # during-gen translator pipeline
 ├── cp_*.py                      # CellProfiler validation (RxRx1)
-├── aggregate_*.py               # table aggregation
-├── plot_*.py                    # figure generation
-├── analyze_*.py                 # analysis utilities
-├── diag_openphenom_*.py         # OpenPhenom failure diagnostic (appendix)
-└── diag_posthoc_*.py            # during-gen story diagnostics
+├── analyze_*.py                 # collapse trajectory, DINO alignment, KID sample size,
+│                                # perturbation bound, timestep image distance, CP features
+├── extract_{aligned_features_real,gen_features}.py
+├── consolidate_aligned_features.py, rebuild_dinov3_meanpatch_rxrx1.py
+└── train_linear_probe_{celeba,rxrx1}.py
 
 configs/
 ├── config_{celeba,rxrx1}{,_marginal}.yaml
 ├── generate_samples_{celeba,rxrx1}.yaml
 ├── cache_{celeba,rxrx1}.yaml
-├── extract_raw_hidden{,_rxrx1}.yaml
+├── extract_raw_hidden{,_rxrx1}.yaml, extract_aligned_real.yaml
 ├── checkpoints.yaml
 ├── variant/                 # vanilla, repa, repa_siglip, repa_openphenom, ...
 ├── dataset/                 # celeba, rxrx1, marginal variants
 ├── model/                   # generator + encoder configs
 ├── train/                   # training hyperparameters
+├── eval/                    # rfid, stress_test
 └── posthoc_alignment/       # 12 mapper training configs
 ```

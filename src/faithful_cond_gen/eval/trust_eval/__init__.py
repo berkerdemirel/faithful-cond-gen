@@ -4,7 +4,7 @@ Trust evaluation package.
 This package provides modular trust score computation and evaluation
 for conditional generative models.
 
-Public API (backward compatible with trust_eval_extensions.py):
+Public API:
 - condition_to_signature
 - get_image_path
 - create_image_grid
