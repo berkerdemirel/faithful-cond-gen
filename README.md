@@ -40,39 +40,18 @@ Use `scripts/generate_samples_repa.py` for REPA-aligned models.
 PYTHONPATH=src uv run python scripts/cache_features.py --config-name=cache_rxrx1
 ```
 
-### 4. Trust evaluation (post-generation)
+### 4. Trust evaluation
 
 ```bash
 PYTHONPATH=src uv run python scripts/run_trust_evaluation.py --help
 ```
 
-### 5. During-generation translator (post-hoc alignment)
-
-```bash
-# Extract raw hidden states across timesteps
-PYTHONPATH=src uv run python scripts/posthoc_alignment/extract_raw_hidden_rxrx1.py ...
-
-# Train mapper (whitened-geometry loss)
-PYTHONPATH=src uv run python scripts/posthoc_alignment/train_mapper.py \
-    --config-path=../../configs/posthoc_alignment \
-    --config-name=train_mapper_rxrx1_siglip_whitened
-
-# Evaluate
-PYTHONPATH=src uv run python scripts/posthoc_alignment/eval_posthoc_alignment_rxrx1.py ...
-```
-
-### 6. CellProfiler validation (RxRx1)
+### 5. CellProfiler validation (RxRx1)
 
 ```bash
 PYTHONPATH=src uv run python scripts/cp_morphology_validation.py
 PYTHONPATH=src uv run python scripts/cp_decile_binning.py
 PYTHONPATH=src uv run python scripts/cp_decile_selection_plots.py
-```
-
-### 7. Downstream classification (RxRx1)
-
-```bash
-PYTHONPATH=src uv run python scripts/run_rxrx1_downstream_isolated.py
 ```
 
 ## Checkpoints
