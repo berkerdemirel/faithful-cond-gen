@@ -1,0 +1,21 @@
+defaults:
+  - train_mapper
+  - _self_
+
+model_key: celeba_vanilla_full_v1
+hidden_dir: outputs/posthoc_alignment/raw_hidden/celeba_vanilla_full_v1
+siglip_path: outputs/real_celeba_siglip_meanpatch/train_features.pt
+output_dir: outputs/posthoc_alignment/mappers_whit_geom_anchor
+condition_keys: null
+
+loss:
+  kind: whit_geom_anchor
+  lambda_whit: 1.0
+  lambda_geom: 0.01
+  lambda_rel: 1.0
+  whit_gamma: 0.75
+  whit_cond: 1000.0
+  n_anchors: 256
+  anchor_seed: 0
+  anchor_variant: mse
+  anchor_tau: 0.1

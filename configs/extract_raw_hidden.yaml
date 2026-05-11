@@ -1,0 +1,17 @@
+defaults:
+  - dataset: celeba
+  - model: generator_celeba
+  - _self_
+
+checkpoint_key: celeba_vanilla_marginal_v1
+output_dir: outputs/posthoc_alignment/raw_hidden
+batch_size: 64
+timesteps: [0.01, 0.25, 0.5, 0.75, 1.0]
+num_workers: 4
+device: 0
+siglip_cache: outputs/real_celeba_siglip_meanpatch/train_features.pt
+
+dataset:
+  batch_size: 64
+  num_workers: 4
+  augment_train: false

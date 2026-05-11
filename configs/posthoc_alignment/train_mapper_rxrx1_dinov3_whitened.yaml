@@ -1,0 +1,22 @@
+defaults:
+  - train_mapper
+  - _self_
+
+model_key: rxrx1_repa_full_v1
+hidden_dir: outputs/posthoc_alignment/raw_hidden/rxrx1_repa_full_v1
+siglip_path: outputs/real_rxrx1_dinov3_meanpatch/train_features.pt
+output_dir: outputs/posthoc_alignment/mappers_whitened
+condition_keys: [cell_type_id, sirna_id]
+
+mapper:
+  in_dim: 768
+  out_dim: 1024
+  hidden_dim: 2048
+
+loss:
+  lambda_mse: 0.1
+  lambda_var: 1.0
+  lambda_cov: 0.04
+  var_thresh: auto
+  lambda_whit: 1.0
+  whit_cond: 1000.0

@@ -1,0 +1,24 @@
+model_key: celeba_vanilla_marginal_v1
+hidden_dir: outputs/posthoc_alignment/raw_hidden/celeba_vanilla_marginal_v1
+siglip_path: outputs/real_celeba_siglip_meanpatch/train_features.pt
+output_dir: outputs/posthoc_alignment/mappers
+condition_keys: null  # auto-detect from metadata; override for non-CelebA datasets
+
+mapper:
+  in_dim: 768
+  out_dim: 1152
+  hidden_dim: 2048
+
+training:
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  batch_size: 2048
+  epochs: 50
+  val_fraction: 0.05
+  seed: 42
+
+loss:
+  lambda_mse: 0.1
+  lambda_var: 1.0
+  lambda_cov: 0.04
+  var_thresh: auto  # auto-calibrate from target features

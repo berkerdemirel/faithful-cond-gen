@@ -1,0 +1,17 @@
+defaults:
+  - dataset: rxrx1_marginal
+  - model: generator_rxrx1
+  - _self_
+
+checkpoint_key: rxrx1_vanilla_marginal_v1
+output_dir: outputs/posthoc_alignment/raw_hidden
+batch_size: 8  # 6ch images use VAE channel-folding (6x effective batch), keep small
+timesteps: [0.01, 0.25, 0.5, 0.75, 1.0]
+num_workers: 4
+device: 0
+siglip_cache: outputs/real_rxrx1_siglip_meanpatch/train_features.pt
+
+dataset:
+  batch_size: 8
+  num_workers: 4
+  augment_train: false
