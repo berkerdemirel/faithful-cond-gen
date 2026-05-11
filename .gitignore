@@ -97,3 +97,44 @@ tb_logs/
 samples/
 generated/
 figures/
+feature_cache/
+
+# -------------------------
+# Local-only working files (kept on PVC, not pushed)
+# -------------------------
+# Claude Code / MCP session metadata
+.claude/
+.mcp.json
+mcp_kernel_server/
+
+# Paper draft, exploratory notebooks, figure-gen workspace
+notes/
+notebooks/
+paper_figs/
+
+# Internal planning / hypothesis notes
+PROJECT_SNAPSHOT.md
+H[0-9]_*.md
+*_SUMMARY.md
+neurips_plan*.md
+new_plan*.md
+new_runs*.md
+previous_plan*.md
+session_*.md
+ALIGNMENT_ANALYSIS_*.md
+
+# Debug scratch directories
+big_debug/
+debug_*/
+attic/
+
+# Local archive scratch (lives under /mnt/pvc/, not in repo)
+faithful-cond-gen-full-archive/
+supplementary_material/
+
+# Top-level PDFs (paper PDF lives under notes/)
+/*.pdf
+
+# Backup files
+*.bak
+*.backup
