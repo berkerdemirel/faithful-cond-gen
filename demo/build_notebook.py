@@ -303,21 +303,20 @@ cells.append(md(
 ))
 
 cells.append(md(
-    "## 5. Trust $T = R + F$ and the agreement region",
+    "## 5. The agreement region",
     "",
-    "A sample is trustworthy when **both** components are small. We thresholdat the real-sample 95th percentile on each component (so 95 % of real samples "
-    "from the calibration set sit inside the accepted region) and overlay the "
-    "intersection as a green contour on the trust panel.",
+    "A sample is trustworthy when **both** components are small. We threshold "
+    "at the real-sample 95th percentile on each component (so 95 % of real "
+    "samples from the calibration set sit inside the accepted region) and "
+    "overlay the intersection as a green contour on each panel below.",
 ))
 
 cells.append(code(
-    "T = R + F",
-    "",
     "R_thresh = np.percentile(R_real, 95)",
     "F_thresh = np.percentile(F_real, 95)",
     "accept = (R <= R_thresh) & (F <= F_thresh)",
     "",
-    "fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.8))",
+    "fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.8))",
     "",
     "im0 = axes[0].pcolormesh(XX, YY, R, cmap='RdBu_r', shading='auto',",
     "                          norm=Normalize(vmin=-2, vmax=4))",
@@ -329,20 +328,16 @@ cells.append(code(
     "axes[1].set_title(r'$F(y;\\,(1,1))$  (real-calibrated)')",
     "fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)",
     "",
-    "im2 = axes[2].pcolormesh(XX, YY, T, cmap='RdBu_r', shading='auto',",
-    "                          norm=Normalize(vmin=-3, vmax=6))",
-    "axes[2].contour(XX, YY, accept.astype(float), levels=[0.5],",
-    "                colors='lime', linewidths=2.5)",
-    "axes[2].set_title(r'$T(y;\\,(1,1)) = R + F$' + '\\n(green: both ≤ 95th pct on real)')",
-    "fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)",
-    "",
     "for ax in axes:",
+    "    ax.contour(XX, YY, accept.astype(float), levels=[0.5],",
+    "               colors='lime', linewidths=2.5)",
     "    ax.scatter(X[:, 0], X[:, 1], s=3, color='black', alpha=0.18)",
     "    ax.scatter(*TARGET, marker='X', s=160, color='yellow',",
     "               edgecolor='black', linewidth=1.4, zorder=5)",
     "    ax.set_xlim(-0.7, 1.7); ax.set_ylim(-0.7, 1.7)",
     "    ax.set_aspect('equal')",
     "    ax.set_xlabel(r'$a_1$'); ax.set_ylabel(r'$a_2$')",
+    "fig.suptitle('Green: both components ≤ 95th pct on real samples', y=1.02)",
     "plt.tight_layout()",
     "plt.show()",
 ))
