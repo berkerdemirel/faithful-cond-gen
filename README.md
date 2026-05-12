@@ -1,8 +1,12 @@
 # Faithfulness Estimation of Conditional Generative Models
 
+![Teaser](assets/teaser.png)
+
 Companion code for experiments on per-sample trust scoring and conditional generation under compositional shift.
 
 The trust score decomposes into a **global realism** term (Mahalanobis distance to real features) and an **attribute-wise faithfulness** term (per-attribute margin against competing values). It is post-hoc, requires no retraining, and works with any pretrained conditional diffusion model plus an external feature encoder. A during-generation variant maps internal denoising states into the same scoring space via a shallow translator, enabling early abstention.
+
+A self-contained pedagogical walkthrough on an L-shaped Gaussian toy is in [`demo/trust_score_l_shape.ipynb`](demo/trust_score_l_shape.ipynb) — it shows how realism and faithfulness disagree on a compositionally shifted request and visualizes the agreement region.
 
 ## Installation
 

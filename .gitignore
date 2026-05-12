@@ -138,3 +138,13 @@ supplementary_material/
 # Backup files
 *.bak
 *.backup
+
+# -------------------------
+# Re-include tracked paper/demo assets that would otherwise be swept
+# by the blanket *.png / *.pdf rules above
+# -------------------------
+!assets/
+!assets/*.png
+!assets/*.pdf
+!demo/
+!demo/*.ipynb
