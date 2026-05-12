@@ -67,6 +67,14 @@ cells.append(md(
     "the $(a_1, a_2)$ plane. The fourth condition $(1,1)$ is unseen — we ask "
     "what the trust score does for a generated sample claiming target $(1,1)$.",
     "",
+    "**Cluster spread.** The cluster width $\\sigma$ controls how far the L's "
+    "tails extend toward the unseen corner. With **$\\sigma$ small** ($\\approx "
+    "0.12$) the L is sharp, the pooled real distribution does not reach "
+    "$(1,1)$, and the score *abstains*. With **$\\sigma$ moderate** ($\\approx "
+    "0.30$, the default below), the tails reach far enough that both realism "
+    "and faithfulness *agree* on $(1,1)$. Tweak `sigma` at the top of the next "
+    "cell to switch between the two regimes.",
+    "",
     "**Note on L2 normalization.** The real pipeline operates on "
     "$y = \\Phi(x)/\\|\\Phi(x)\\|_2$. We skip the normalization here because "
     "L2-normalizing 2D position coordinates would collapse the cluster at the "
@@ -95,7 +103,7 @@ cells.append(code(
     "    (0, 1): np.array([0.0, 1.0]),",
     "    (1, 0): np.array([1.0, 0.0]),",
     "}",
-    "sigma = 0.12  # tight clusters so the L is clearly visible",
+    "sigma = 0.30  # try 0.12 for the 'abstain' regime; 0.30 brings (1,1) into agreement",
     "n_per = 400",
     "",
     "X_by_cond = {",
@@ -121,11 +129,11 @@ cells.append(code(
     "           linewidth=1.4, zorder=5, label='requested (1,1)')",
     "ax.set_xlabel(r'attribute $a_1$')",
     "ax.set_ylabel(r'attribute $a_2$')",
-    "ax.set_xlim(-0.5, 1.6); ax.set_ylim(-0.5, 1.6)",
+    "ax.set_xlim(-0.7, 1.7); ax.set_ylim(-0.7, 1.7)",
     "ax.set_aspect('equal')",
     "ax.grid(alpha=0.3)",
     "ax.legend(loc='upper right', frameon=True)",
-    "ax.set_title('Seen conditions form an L; (1,1) is unseen')",
+    "ax.set_title(f'Seen conditions form an L (sigma={sigma}); (1,1) is unseen')",
     "plt.show()",
 ))
 
@@ -152,8 +160,8 @@ cells.append(code(
     "",
     "# Energy grid",
     "grid_n = 240",
-    "x_g = np.linspace(-0.6, 1.7, grid_n)",
-    "y_g = np.linspace(-0.6, 1.7, grid_n)",
+    "x_g = np.linspace(-0.8, 1.8, grid_n)",
+    "y_g = np.linspace(-0.8, 1.8, grid_n)",
     "XX, YY = np.meshgrid(x_g, y_g)",
     "grid_pts = np.stack([XX.ravel(), YY.ravel()], axis=1)",
     "",
@@ -268,15 +276,15 @@ cells.append(code(
     "fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.8))",
     "",
     "for ax, field, title, vmin, vmax in [",
-    "    (axes[0], R, r'$R(y)$  — larger = less real', -2, 6),",
-    "    (axes[1], F, r'$F(y;\\,(1,1))$  — larger = less faithful', -3, 3),",
+    "    (axes[0], R, r'$R(y)$  — larger = less real', -2, 4),",
+    "    (axes[1], F, r'$F(y;\\,(1,1))$  — larger = less faithful', -2, 4),",
     "]:",
     "    im = ax.pcolormesh(XX, YY, field, cmap='RdBu_r', shading='auto',",
     "                       norm=Normalize(vmin=vmin, vmax=vmax))",
     "    ax.scatter(X[:, 0], X[:, 1], s=3, color='black', alpha=0.25)",
     "    ax.scatter(*TARGET, marker='X', s=160, color='yellow',",
     "               edgecolor='black', linewidth=1.4, zorder=5)",
-    "    ax.set_xlim(-0.5, 1.6); ax.set_ylim(-0.5, 1.6)",
+    "    ax.set_xlim(-0.7, 1.7); ax.set_ylim(-0.7, 1.7)",
     "    ax.set_aspect('equal')",
     "    ax.set_xlabel(r'$a_1$'); ax.set_ylabel(r'$a_2$')",
     "    ax.set_title(title)",
@@ -312,17 +320,17 @@ cells.append(code(
     "fig, axes = plt.subplots(1, 3, figsize=(15.5, 4.8))",
     "",
     "im0 = axes[0].pcolormesh(XX, YY, R, cmap='RdBu_r', shading='auto',",
-    "                          norm=Normalize(vmin=-2, vmax=6))",
+    "                          norm=Normalize(vmin=-2, vmax=4))",
     "axes[0].set_title(r'$R(y)$  (real-calibrated)')",
     "fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)",
     "",
     "im1 = axes[1].pcolormesh(XX, YY, F, cmap='RdBu_r', shading='auto',",
-    "                          norm=Normalize(vmin=-3, vmax=3))",
+    "                          norm=Normalize(vmin=-2, vmax=4))",
     "axes[1].set_title(r'$F(y;\\,(1,1))$  (real-calibrated)')",
     "fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)",
     "",
     "im2 = axes[2].pcolormesh(XX, YY, T, cmap='RdBu_r', shading='auto',",
-    "                          norm=Normalize(vmin=-3, vmax=7))",
+    "                          norm=Normalize(vmin=-3, vmax=6))",
     "axes[2].contour(XX, YY, accept.astype(float), levels=[0.5],",
     "                colors='lime', linewidths=2.5)",
     "axes[2].set_title(r'$T(y;\\,(1,1)) = R + F$' + '\\n(green: both ≤ 95th pct on real)')",
@@ -332,7 +340,7 @@ cells.append(code(
     "    ax.scatter(X[:, 0], X[:, 1], s=3, color='black', alpha=0.18)",
     "    ax.scatter(*TARGET, marker='X', s=160, color='yellow',",
     "               edgecolor='black', linewidth=1.4, zorder=5)",
-    "    ax.set_xlim(-0.5, 1.6); ax.set_ylim(-0.5, 1.6)",
+    "    ax.set_xlim(-0.7, 1.7); ax.set_ylim(-0.7, 1.7)",
     "    ax.set_aspect('equal')",
     "    ax.set_xlabel(r'$a_1$'); ax.set_ylabel(r'$a_2$')",
     "plt.tight_layout()",
@@ -346,13 +354,19 @@ cells.append(md(
     "trustworthy for the $(1,1)$ request — where realism *and* faithfulness "
     "are both below the real-sample 95th percentile.",
     "",
-    "On this L-shaped support the contour **does not include the requested "
-    "$(1,1)$ corner**: faithfulness peaks (i.e. is most negative) precisely "
-    "where the data is absent, and realism explodes there. That is the correct "
-    "behavior under compositional shift — the trust score abstains rather than "
-    "rubber-stamp the request.",
+    "With $\\sigma = 0.30$ the L's tails reach far enough toward $(1,1)$ that "
+    "both components agree: $R$ at the unseen corner is well within the real "
+    "calibration, $F$ for target $(1,1)$ is small, and the green region "
+    "**covers $(1,1)$**. The trust score accepts the compositionally shifted "
+    "request because the real-data geometry plausibly extends there.",
     "",
-    "On real data the picture is the same, in high dimension: realism uses the "
+    "Set `sigma = 0.12` at the top and re-run: the L collapses to its three "
+    "tight clusters, the pooled real distribution no longer reaches $(1,1)$, "
+    "and the agreement region pulls away from the corner. That is the "
+    "**compositional-shift abstention regime** — the score correctly refuses "
+    "to certify the request.",
+    "",
+    "On real data the picture is the same in high dimension: realism uses the "
     "Mahalanobis precision of the pooled real features in DINOv3 / SigLIP space, "
     "faithfulness uses per-attribute margins under a shared precision matrix "
     "$P_k$, and calibration is computed on a held-out real split. See "
