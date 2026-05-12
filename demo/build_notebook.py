@@ -41,39 +41,28 @@ def code(*lines):
 cells = []
 
 cells.append(md(
-    "# Trust score on an L-shaped toy: realism + faithfulness",
+    "# Realism and faithfulness on an L-shaped toy",
     "",
-    "Follows the exact formulation in the paper "
-    "(`notes/paper.tex`, §Method). The trust score has two components:",
+    "Visualizes the two components of the paper's trust score "
+    "(`notes/paper.tex`, §Method) on a 2D synthetic setting:",
     "",
     "$$R(y) = \\frac{E_{\\mathrm{real}}(y) - m_R}{s_R}, \\qquad "
     "E_{\\mathrm{real}}(y) = (y - \\mu_{\\mathrm{real}})^\\top "
     "\\Sigma_{\\mathrm{real}}^{-1}(y - \\mu_{\\mathrm{real}})$$",
     "",
     "$$F_k(y; t) = \\frac{M_k(y; t) - m_{k,t}}{s_{k,t}}, \\qquad "
-    "M_k(y; t) = d_k(y; t) - \\min_{v \\neq t} d_k(y; v)$$",
+    "M_k(y; t) = d_k(y; t) - \\min_{v \\neq t} d_k(y; v), \\qquad "
+    "d_k(y; v) = (y - \\eta_{k,v})^\\top P_k (y - \\eta_{k,v})$$",
     "",
-    "$$d_k(y; v) = (y - \\eta_{k,v})^\\top P_k (y - \\eta_{k,v}), \\qquad "
-    "T(y; a^\\star) = R(y) + \\frac{1}{K}\\sum_{k=1}^K F_k(y; a_k^\\star)$$",
-    "",
-    "By construction **larger $R$, $F$, or $T$ is *worse*** — $R$ measures "
-    "distance from the real distribution, $M_k$ is negative when $y$ is closer "
-    "to the requested value than to any competitor, and $F_k$ is calibrated "
-    "against real margins (with each real sample taking its own true value as "
+    "Larger $R$ means $y$ is far from the real distribution. Larger $F$ means "
+    "$y$ disagrees with the requested attribute values. $F_k$ is calibrated "
+    "against real margins (each real sample takes its own true value as "
     "target, matching `scoring_core.py`).",
     "",
     "**Setup.** Two binary attributes $(a_1, a_2)$. Three seen conditions "
     "$(0,0), (0,1), (1,0)$ are arranged so their union forms an **L shape** in "
-    "the $(a_1, a_2)$ plane. The fourth condition $(1,1)$ is unseen — we ask "
-    "what the trust score does for a generated sample claiming target $(1,1)$.",
-    "",
-    "**Cluster spread.** The cluster width $\\sigma$ controls how far the L's "
-    "tails extend toward the unseen corner. With **$\\sigma$ small** ($\\approx "
-    "0.12$) the L is sharp, the pooled real distribution does not reach "
-    "$(1,1)$, and the score *abstains*. With **$\\sigma$ moderate** ($\\approx "
-    "0.30$, the default below), the tails reach far enough that both realism "
-    "and faithfulness *agree* on $(1,1)$. Tweak `sigma` at the top of the next "
-    "cell to switch between the two regimes.",
+    "the $(a_1, a_2)$ plane. The fourth condition $(1,1)$ is unseen — we look "
+    "at how $R$ and $F$ behave there.",
     "",
     "**Note on L2 normalization.** The real pipeline operates on "
     "$y = \\Phi(x)/\\|\\Phi(x)\\|_2$. We skip the normalization here because "
@@ -265,57 +254,14 @@ cells.append(code(
 ))
 
 cells.append(md(
-    "## 4. The two components, side by side",
+    "## 4. The two components, real-calibrated",
     "",
-    "Both panels use the same orientation: **blue = small value (good), red = large "
-    "value (bad)**. The white-to-red transition tracks the contour where the "
-    "score equals its real-sample mean.",
+    "Both heatmaps share the same color convention: **blue = small (good), "
+    "red = large (bad)**. The white-to-red transition tracks the contour where "
+    "each score equals its real-sample mean.",
 ))
 
 cells.append(code(
-    "fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.8))",
-    "",
-    "for ax, field, title, vmin, vmax in [",
-    "    (axes[0], R, r'$R(y)$  — larger = less real', -2, 4),",
-    "    (axes[1], F, r'$F(y;\\,(1,1))$  — larger = less faithful', -2, 4),",
-    "]:",
-    "    im = ax.pcolormesh(XX, YY, field, cmap='RdBu_r', shading='auto',",
-    "                       norm=Normalize(vmin=vmin, vmax=vmax))",
-    "    ax.scatter(X[:, 0], X[:, 1], s=3, color='black', alpha=0.25)",
-    "    ax.scatter(*TARGET, marker='X', s=160, color='yellow',",
-    "               edgecolor='black', linewidth=1.4, zorder=5)",
-    "    ax.set_xlim(-0.7, 1.7); ax.set_ylim(-0.7, 1.7)",
-    "    ax.set_aspect('equal')",
-    "    ax.set_xlabel(r'$a_1$'); ax.set_ylabel(r'$a_2$')",
-    "    ax.set_title(title)",
-    "    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)",
-    "plt.tight_layout()",
-    "plt.show()",
-))
-
-cells.append(md(
-    "**Read the heatmaps.** $R$ is small (blue) along the L — the real support — "
-    "and grows as you leave it, including toward the requested $(1,1)$ corner. "
-    "$F$ for target $(1,1)$ is small (blue) in the upper-right quadrant, because "
-    "samples there are closer to the seen $a_1{=}1$ and $a_2{=}1$ prototypes "
-    "than to their respective $0$-competitors. The two components prefer "
-    "**opposite regions**.",
-))
-
-cells.append(md(
-    "## 5. The agreement region",
-    "",
-    "A sample is trustworthy when **both** components are small. We threshold "
-    "at the real-sample 95th percentile on each component (so 95 % of real "
-    "samples from the calibration set sit inside the accepted region) and "
-    "overlay the intersection as a green contour on each panel below.",
-))
-
-cells.append(code(
-    "R_thresh = np.percentile(R_real, 95)",
-    "F_thresh = np.percentile(F_real, 95)",
-    "accept = (R <= R_thresh) & (F <= F_thresh)",
-    "",
     "fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.8))",
     "",
     "im0 = axes[0].pcolormesh(XX, YY, R, cmap='RdBu_r', shading='auto',",
@@ -329,41 +275,33 @@ cells.append(code(
     "fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)",
     "",
     "for ax in axes:",
-    "    ax.contour(XX, YY, accept.astype(float), levels=[0.5],",
-    "               colors='lime', linewidths=2.5)",
     "    ax.scatter(X[:, 0], X[:, 1], s=3, color='black', alpha=0.18)",
     "    ax.scatter(*TARGET, marker='X', s=160, color='yellow',",
     "               edgecolor='black', linewidth=1.4, zorder=5)",
     "    ax.set_xlim(-0.7, 1.7); ax.set_ylim(-0.7, 1.7)",
     "    ax.set_aspect('equal')",
     "    ax.set_xlabel(r'$a_1$'); ax.set_ylabel(r'$a_2$')",
-    "fig.suptitle('Green: both components ≤ 95th pct on real samples', y=1.02)",
     "plt.tight_layout()",
     "plt.show()",
 ))
 
 cells.append(md(
-    "## 6. What the demo shows",
+    "## 5. Notes",
     "",
-    "The green contour encloses the region the trust score is willing to call "
-    "trustworthy for the $(1,1)$ request — where realism *and* faithfulness "
-    "are both below the real-sample 95th percentile.",
+    "This is a demonstrational attempt on a toy 2D setting; it is meant to "
+    "make the two components of the paper's score legible at a glance, not to "
+    "stand in for a real benchmark.",
     "",
-    "With $\\sigma = 0.30$ the L's tails reach far enough toward $(1,1)$ that "
-    "both components agree: $R$ at the unseen corner is well within the real "
-    "calibration, $F$ for target $(1,1)$ is small, and the green region "
-    "**covers $(1,1)$**. The trust score accepts the compositionally shifted "
-    "request because the real-data geometry plausibly extends there.",
+    "Two things are visible. $R$ is small (blue) along the L — the seen "
+    "support — and grows as $y$ moves away from it, including toward the "
+    "unseen $(1,1)$ corner. $F$ for target $(1,1)$ is small in the upper-right "
+    "quadrant, because samples there are closer to the seen $a_1{=}1$ and "
+    "$a_2{=}1$ prototypes than to their respective $0$-competitors. The two "
+    "heatmaps read the request from genuinely different angles.",
     "",
-    "Set `sigma = 0.12` at the top and re-run: the L collapses to its three "
-    "tight clusters, the pooled real distribution no longer reaches $(1,1)$, "
-    "and the agreement region pulls away from the corner. That is the "
-    "**compositional-shift abstention regime** — the score correctly refuses "
-    "to certify the request.",
-    "",
-    "On real data the picture is the same in high dimension: realism uses the "
-    "Mahalanobis precision of the pooled real features in DINOv3 / SigLIP space, "
-    "faithfulness uses per-attribute margins under a shared precision matrix "
+    "On real data the picture is the same in high dimension: $R$ uses the "
+    "Mahalanobis precision of the pooled real features in DINOv3 / SigLIP "
+    "space, $F$ uses per-attribute margins under a shared precision matrix "
     "$P_k$, and calibration is computed on a held-out real split. See "
     "`src/faithful_cond_gen/eval/trust_eval/scoring_core.py` for the full "
     "implementation.",
