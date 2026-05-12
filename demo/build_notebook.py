@@ -58,13 +58,20 @@ cells.append(md(
     "",
     "By construction **larger $R$, $F$, or $T$ is *worse*** — $R$ measures "
     "distance from the real distribution, $M_k$ is negative when $y$ is closer "
-    "to the requested value than to any competitor, and $F_k$ is calibrated on "
-    "real samples that actually have $a_k = t$.",
+    "to the requested value than to any competitor, and $F_k$ is calibrated "
+    "against real margins (with each real sample taking its own true value as "
+    "target, matching `scoring_core.py`).",
     "",
     "**Setup.** Two binary attributes $(a_1, a_2)$. Three seen conditions "
     "$(0,0), (0,1), (1,0)$ are arranged so their union forms an **L shape** in "
     "the $(a_1, a_2)$ plane. The fourth condition $(1,1)$ is unseen — we ask "
     "what the trust score does for a generated sample claiming target $(1,1)$.",
+    "",
+    "**Note on L2 normalization.** The real pipeline operates on "
+    "$y = \\Phi(x)/\\|\\Phi(x)\\|_2$. We skip the normalization here because "
+    "L2-normalizing 2D position coordinates would collapse the cluster at the "
+    "origin and destroy the L geometry. The decomposition itself is otherwise "
+    "identical to `src/faithful_cond_gen/eval/trust_eval/scoring_core.py`.",
 ))
 
 cells.append(code(
@@ -178,23 +185,22 @@ cells.append(md(
 
 cells.append(code(
     "def fit_attribute(X, a_k):",
-    "    \"\"\"Return prototypes {v: eta_{k,v}} and shared precision matrix P_k.\"\"\"",
-    "    values = np.unique(a_k)",
-    "    protos = {}",
-    "    pooled_cov = np.zeros((X.shape[1], X.shape[1]))",
-    "    total = 0",
-    "    for v in values:",
-    "        idx = (a_k == v)",
-    "        pts = X[idx]",
-    "        protos[int(v)] = pts.mean(axis=0)",
-    "        # within-value covariance, centered at the value's own prototype",
-    "        diffs = pts - protos[int(v)]",
-    "        pooled_cov += diffs.T @ diffs",
-    "        total += pts.shape[0]",
-    "    pooled_cov = pooled_cov / max(total - len(values), 1)",
-    "    # Small ridge to stay PD (the toy is 2D, very low rank-deficiency risk,",
-    "    # but the paper uses Ledoit-Wolf shrinkage; we mimic with a small ridge)",
-    "    pooled_cov += 1e-4 * np.eye(X.shape[1])",
+    "    \"\"\"Return prototypes {v: eta_{k,v}} and shared precision matrix P_k.",
+    "    Mirrors fit_factorized_stats(use_shared_cov=True) from scoring_core.py:",
+    "    pooled within-value scatter divided by total_samples, then Ledoit-Wolf",
+    "    shrinkage applied on residuals, plus a small 1e-5 ridge before inverse.",
+    "    \"\"\"",
+    "    D = X.shape[1]",
+    "    values = sorted(np.unique(a_k).tolist())",
+    "    protos = {int(v): X[a_k == v].mean(axis=0) for v in values}",
+    "",
+    "    residuals = np.concatenate([X[a_k == v] - protos[int(v)] for v in values], 0)",
+    "    pooled_cov = (residuals.T @ residuals) / residuals.shape[0]",
+    "    # Ledoit-Wolf shrinkage toward (tr(S)/D) * I, fit on the residuals",
+    "    lw_shrink = LedoitWolf().fit(residuals).shrinkage_",
+    "    trace_div_d = np.trace(pooled_cov) / D",
+    "    pooled_cov = (1 - lw_shrink) * pooled_cov + lw_shrink * trace_div_d * np.eye(D)",
+    "    pooled_cov = pooled_cov + 1e-5 * np.eye(D)  # matches scoring_core.py",
     "    P_k = np.linalg.inv(pooled_cov)",
     "    return protos, P_k",
     "",
@@ -222,17 +228,29 @@ cells.append(code(
     "M1_grid = margin_grid(1, protos_1, P1).reshape(XX.shape)",
     "M2_grid = margin_grid(1, protos_2, P2).reshape(XX.shape)",
     "",
-    "# Calibration: m_{k,t}, s_{k,t} on real samples with a_k = t",
-    "M1_calib = margin_real(1, protos_1, P1)[a1 == 1]",
-    "M2_calib = margin_real(1, protos_2, P2)[a2 == 1]",
-    "m_1, s_1 = M1_calib.mean(), M1_calib.std() + 1e-9",
-    "m_2, s_2 = M2_calib.mean(), M2_calib.std() + 1e-9",
+    "# Calibration mirrors compute_real_calibration_for_factorized_margins:",
+    "# for every real sample x_i we evaluate the margin M_k(x_i; t = a_k(x_i))",
+    "# (the sample's OWN true value as target), then pool across values to get",
+    "# one (m_k, s_k) per attribute. This is what scoring_core.py does.",
+    "def calib_pooled(X_real, a_k, protos, P):",
+    "    margins = np.empty(len(X_real))",
+    "    for v in sorted(protos):",
+    "        idx = np.where(a_k == v)[0]",
+    "        if idx.size == 0: continue",
+    "        margins[idx] = margin_real(v, protos, P)[idx]",
+    "    return float(margins.mean()), float(margins.std(ddof=1) + 1e-12), margins",
+    "",
+    "m_1, s_1, M1_real_calib = calib_pooled(X, a1, protos_1, P1)",
+    "m_2, s_2, M2_real_calib = calib_pooled(X, a2, protos_2, P2)",
     "",
     "F1 = (M1_grid - m_1) / s_1",
     "F2 = (M2_grid - m_2) / s_2",
     "F = 0.5 * (F1 + F2)",
     "",
-    "# Per-attribute F_k on every real sample (for calibration of F)",
+    "# F on every real sample (each evaluated for target (1,1) so the calibration",
+    "# threshold tracks 'how the score behaves on real data when the request is",
+    "# evaluated against a faithful real sample with a_k=1' — same convention as",
+    "# scoring_core.py.compute_real_sample_scores",
     "F1_real_all = (margin_real(1, protos_1, P1) - m_1) / s_1",
     "F2_real_all = (margin_real(1, protos_2, P2) - m_2) / s_2",
     "F_real = 0.5 * (F1_real_all + F2_real_all)",
