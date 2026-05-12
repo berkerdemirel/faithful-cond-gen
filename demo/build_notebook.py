@@ -92,7 +92,7 @@ cells.append(code(
     "    (0, 1): np.array([0.0, 1.0]),",
     "    (1, 0): np.array([1.0, 0.0]),",
     "}",
-    "sigma = 0.30  # try 0.12 for the 'abstain' regime; 0.30 brings (1,1) into agreement",
+    "sigma = 0.18  # cluster width",
     "n_per = 400",
     "",
     "X_by_cond = {",
